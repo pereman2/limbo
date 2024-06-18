@@ -9,6 +9,7 @@ use std::{
 
 pub trait File {
     fn pread(&self, pos: usize, c: Rc<Completion>) -> Result<()>;
+    fn write(&self, pos: usize, buffer: Rc<RefCell<Buffer>>, c: Rc<WriteCompletion>) -> Result<()>;
 }
 
 pub trait IO {
@@ -18,10 +19,15 @@ pub trait IO {
 }
 
 pub type Complete = dyn Fn(&Buffer);
+pub type WriteComplete = dyn Fn(usize);
 
 pub struct Completion {
     pub buf: RefCell<Buffer>,
     pub complete: Box<Complete>,
+}
+
+pub struct WriteCompletion {
+    pub complete: Box<WriteComplete>,
 }
 
 impl Completion {
@@ -44,6 +50,15 @@ impl Completion {
     }
 }
 
+impl WriteCompletion {
+    pub fn new(complete: Box<WriteComplete>) -> Self {
+        Self { complete }
+    }
+    pub fn complete(&self, bytes_written: usize) {
+        (self.complete)(bytes_written);
+    }
+}
+
 pub type BufferData = Pin<Vec<u8>>;
 
 pub type BufferDropFn = Rc<dyn Fn(BufferData)>;
@@ -51,6 +66,15 @@ pub type BufferDropFn = Rc<dyn Fn(BufferData)>;
 pub struct Buffer {
     data: ManuallyDrop<BufferData>,
     drop: BufferDropFn,
+}
+
+impl Clone for Buffer {
+    fn clone(&self) -> Self {
+        Self {
+            data: self.data.clone(),
+            drop: self.drop.clone(),
+        }
+    }
 }
 
 impl Drop for Buffer {
