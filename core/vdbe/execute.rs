@@ -5203,8 +5203,9 @@ fn insert_apply_view_change(
         insn
     );
     let schema = program.connection.schema.borrow();
-    let dependent_views = schema.get_dependent_materialized_views(table_name);
-    assert!(!dependent_views.is_empty());
+    let dependent_views = schema
+        .get_dependent_materialized_views_unnormalized(table_name)
+        .unwrap();
 
     let (key, values) = {
         let mut cursor = state.get_cursor(*cursor_id);
@@ -5296,8 +5297,8 @@ fn insert_update_last_rowid(
         program.n_change.set(prev_changes + 1);
     }
     let schema = program.connection.schema.borrow();
-    let dependent_views = schema.get_dependent_materialized_views(table_name);
-    if !dependent_views.is_empty() {
+    let dependent_views = schema.get_dependent_materialized_views_unnormalized(table_name);
+    if dependent_views.is_some() && !dependent_views.unwrap().is_empty() {
         state.op_insert_state.step_fn = Some(insert_apply_view_change);
     }
     Ok(IOResult::Done(()))
@@ -5358,8 +5359,8 @@ fn insert_insert(
         state.op_insert_state.step_fn = Some(insert_update_last_rowid);
     } else {
         let schema = program.connection.schema.borrow();
-        let dependent_views = schema.get_dependent_materialized_views(table_name);
-        if !dependent_views.is_empty() {
+        let dependent_views = schema.get_dependent_materialized_views_unnormalized(table_name);
+        if !dependent_views.is_none() {
             state.op_insert_state.step_fn = Some(insert_apply_view_change);
         }
     }
@@ -5420,8 +5421,8 @@ fn insert_maybe_capture_record(
         insn
     );
     let schema = program.connection.schema.borrow();
-    let dependent_views = schema.get_dependent_materialized_views(table_name);
-    if dependent_views.is_empty() || flag.has(InsertFlags::UPDATE_ROWID_CHANGE) {
+    let dependent_views = schema.get_dependent_materialized_views_unnormalized(table_name);
+    if dependent_views.is_none() || flag.has(InsertFlags::UPDATE_ROWID_CHANGE) {
         if flag.has(InsertFlags::REQUIRE_SEEK) {
             state.op_insert_state.step_fn = Some(insert_seek);
         } else {
