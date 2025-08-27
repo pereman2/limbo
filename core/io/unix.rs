@@ -219,15 +219,22 @@ impl File for UnixFile {
     #[instrument(err, skip_all, level = Level::TRACE)]
     fn pwrite(&self, pos: usize, buffer: Arc<crate::Buffer>, c: Completion) -> Result<Completion> {
         let file = self.file.lock();
-        let result = { rustix::io::pwrite(file.as_fd(), buffer.as_slice(), pos as u64) };
-        match result {
-            Ok(n) => {
-                trace!("pwrite n: {}", n);
-                // Read succeeded immediately
-                c.complete(n as i32);
-                Ok(c)
-            }
-            Err(e) => Err(e.into()),
+        let result = unsafe {
+            libc::pwrite(
+                file.as_raw_fd(),
+                buffer.as_slice().as_ptr() as *const libc::c_void,
+                buffer.len(),
+                pos as libc::off_t,
+            )
+        };
+        if result == -1 {
+            let e = std::io::Error::last_os_error();
+            Err(e.into())
+        } else {
+            trace!("pwrite n: {}", result);
+            // Read succeeded immediately
+            c.complete(result as i32);
+            Ok(c)
         }
     }
 
@@ -261,24 +268,21 @@ impl File for UnixFile {
         let file = self.file.lock();
 
         let result = unsafe {
-            
             #[cfg(not(any(target_os = "macos", target_os = "ios")))]
             {
-                libc::fsync(file.as_raw_fd())
+                libc::fdatasync(file.as_raw_fd())
             }
-            
+
             #[cfg(any(target_os = "macos", target_os = "ios"))]
             {
                 libc::fcntl(file.as_raw_fd(), libc::F_FULLFSYNC)
             }
-            
         };
-        
+
         if result == -1 {
             let e = std::io::Error::last_os_error();
             Err(e.into())
         } else {
-
             #[cfg(not(any(target_os = "macos", target_os = "ios")))]
             trace!("fsync");
 
