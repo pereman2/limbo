@@ -326,7 +326,7 @@ const MIN_AVG_RUN_FOR_FLUSH: f32 = 32.0;
 const MIN_BATCH_LEN_FOR_FLUSH: usize = 512;
 const MAX_INFLIGHT_WRITES: usize = 64;
 pub const MAX_INFLIGHT_READS: usize = 512;
-pub const IOV_MAX: usize = 1024;
+pub const IOV_MAX: usize = 1;
 
 type PageId = usize;
 struct InflightRead {
