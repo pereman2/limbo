@@ -1637,6 +1637,7 @@ pub fn read_entire_wal_dumb(file: &Arc<dyn File>) -> Result<Arc<UnsafeCell<WalFi
         write_lock: TursoRwLock::new(),
         loaded: AtomicBool::new(false),
         checkpoint_lock: TursoRwLock::new(),
+        size: AtomicU64::new(size),
     }));
     let wal_file_shared_for_completion = wal_file_shared_ret.clone();
 
