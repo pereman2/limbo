@@ -2619,7 +2619,13 @@ pub fn maybe_apply_affinity(col_type: Type, target_register: usize, program: &mu
 /// Sanitizes a string literal by removing single quote at front and back
 /// and escaping double single quotes
 pub fn sanitize_string(input: &str) -> String {
-    input[1..input.len() - 1].replace("''", "'").to_string()
+    let inner = &input[1..input.len() - 1];
+
+    // Fast path: if no double quotes, avoid allocation
+    if !inner.contains("''") {
+        return inner.to_string();
+    }
+    inner.replace("''", "'").to_string()
 }
 
 /// Sanitizes a double-quoted string literal by removing double quotes at front and back
