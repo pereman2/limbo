@@ -5,8 +5,10 @@ use crate::state_machine::StateTransition;
 use crate::state_machine::TransitionResult;
 use crate::storage::btree::BTreeCursor;
 use crate::storage::btree::BTreeKey;
+use crate::storage::wal::TursoRwLock;
 use crate::types::IOResult;
 use crate::types::ImmutableRecord;
+use crate::Completion;
 use crate::IOExt;
 use crate::LimboError;
 use crate::Result;
@@ -268,6 +270,7 @@ pub struct CommitStateMachine<Clock: LogicalClock> {
     write_set: Vec<RowID>,
     write_row_state_machine: Option<StateMachine<WriteRowStateMachine>>,
     delete_row_state_machine: Option<StateMachine<DeleteRowStateMachine>>,
+    current_committer: Arc<TursoRwLock>,
     _phantom: PhantomData<Clock>,
 }
 
@@ -307,7 +310,13 @@ pub struct DeleteRowStateMachine {
 }
 
 impl<Clock: LogicalClock> CommitStateMachine<Clock> {
-    fn new(state: CommitState, pager: Rc<Pager>, tx_id: TxID, connection: Arc<Connection>) -> Self {
+    fn new(
+        state: CommitState,
+        pager: Rc<Pager>,
+        tx_id: TxID,
+        connection: Arc<Connection>,
+        current_committer: Arc<TursoRwLock>,
+    ) -> Self {
         Self {
             state,
             is_finalized: false,
@@ -317,6 +326,7 @@ impl<Clock: LogicalClock> CommitStateMachine<Clock> {
             write_set: Vec::new(),
             write_row_state_machine: None,
             delete_row_state_machine: None,
+            current_committer,
             _phantom: PhantomData,
         }
     }
@@ -341,6 +351,7 @@ impl<Clock: LogicalClock> StateTransition for CommitStateMachine<Clock> {
 
     #[tracing::instrument(fields(state = ?self.state), skip(self, mvcc_store))]
     fn step(&mut self, mvcc_store: &Self::Context) -> Result<TransitionResult<Self::SMResult>> {
+        println!("step(tx_id={}, state={:?})", self.tx_id, self.state);
         match self.state {
             CommitState::Initial => {
                 let end_ts = mvcc_store.get_timestamp();
@@ -443,17 +454,24 @@ impl<Clock: LogicalClock> StateTransition for CommitStateMachine<Clock> {
                 Ok(TransitionResult::Continue)
             }
             CommitState::BeginPagerTxn { end_ts } => {
-                // FIXME: how do we deal with multiple concurrent writes?
-                // WAL requires a txn to be written sequentially. Either we:
-                // 1. Wait for currently writer to finish before second txn starts.
-                // 2. Choose a txn to write depending on some heuristics like amount of frames will be written.
-                // 3. ..
-                //
+                // Currently txns are queued without any heuristics whasoever. This is important because
+                // we need to ensure writes to disk happen sequentially.
+                // * We don't want txns to write to WAL in parallel.
+                // * We don't want BTree modifications to happen in parallel.
+                // If any of these were to happen, we would find ourselves in a bad corruption situation.
+
+                // NOTE: since we are blocking for `begin_write_tx` we do not care about re-entrancy right now.
+                let locked = self.current_committer.write();
+                if !locked {
+                    // FIXME: IOCompletions still needs a yield variant...
+                    return Ok(TransitionResult::Io(crate::types::IOCompletions::Single(
+                        Completion::new_dummy(),
+                    )));
+                }
+                println!("begin_write_tx(tx_id={})", self.tx_id);
                 let result = self.pager.io.block(|| self.pager.begin_write_tx())?;
                 if let crate::result::LimboResult::Busy = result {
-                    return Err(LimboError::InternalError(
-                        "Pager write transaction busy".to_string(),
-                    ));
+                    panic!("Pager write transaction busy, in mvcc this should never happen");
                 }
                 self.state = CommitState::WriteRow {
                     end_ts,
@@ -560,6 +578,8 @@ impl<Clock: LogicalClock> StateTransition for CommitStateMachine<Clock> {
                         .unwrap();
                     match result {
                         crate::types::IOResult::Done(_) => {
+                            println!("commit_pager_txn(tx_id={}) done", self.tx_id);
+                            self.current_committer.unlock();
                             break;
                         }
                         crate::types::IOResult::IO(io) => {
@@ -816,6 +836,7 @@ pub struct MvStore<Clock: LogicalClock> {
     clock: Clock,
     storage: Storage,
     loaded_tables: RwLock<HashSet<u64>>,
+    current_committer: Arc<TursoRwLock>,
 }
 
 impl<Clock: LogicalClock> MvStore<Clock> {
@@ -829,6 +850,7 @@ impl<Clock: LogicalClock> MvStore<Clock> {
             clock,
             storage,
             loaded_tables: RwLock::new(HashSet::new()),
+            current_committer: Arc::new(TursoRwLock::new()),
         }
     }
 
@@ -1112,6 +1134,7 @@ impl<Clock: LogicalClock> MvStore<Clock> {
         let begin_ts = self.get_timestamp();
         let tx = Transaction::new(tx_id, begin_ts);
         tracing::trace!("begin_tx(tx_id={})", tx_id);
+        println!("begin_tx(tx_id={})", tx_id);
         self.txs.insert(tx_id, RwLock::new(tx));
 
         // TODO: we need to tie a pager's read transaction to a transaction ID, so that future refactors to read
@@ -1135,12 +1158,16 @@ impl<Clock: LogicalClock> MvStore<Clock> {
         pager: Rc<Pager>,
         connection: &Arc<Connection>,
     ) -> Result<StateMachine<CommitStateMachine<Clock>>> {
+        println!("commit_tx(tx_id={})", tx_id);
         tracing::trace!("commit_tx(tx_id={})", tx_id);
-        let state_machine: StateMachine<CommitStateMachine<Clock>> = StateMachine::<
-            CommitStateMachine<Clock>,
-        >::new(
-            CommitStateMachine::new(CommitState::Initial, pager, tx_id, connection.clone()),
-        );
+        let state_machine: StateMachine<CommitStateMachine<Clock>> =
+            StateMachine::<CommitStateMachine<Clock>>::new(CommitStateMachine::new(
+                CommitState::Initial,
+                pager,
+                tx_id,
+                connection.clone(),
+                self.current_committer.clone(),
+            ));
         Ok(state_machine)
     }
 
