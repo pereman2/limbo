@@ -351,7 +351,6 @@ impl<Clock: LogicalClock> StateTransition for CommitStateMachine<Clock> {
 
     #[tracing::instrument(fields(state = ?self.state), skip(self, mvcc_store))]
     fn step(&mut self, mvcc_store: &Self::Context) -> Result<TransitionResult<Self::SMResult>> {
-        println!("step(tx_id={}, state={:?})", self.tx_id, self.state);
         match self.state {
             CommitState::Initial => {
                 let end_ts = mvcc_store.get_timestamp();
@@ -472,7 +471,6 @@ impl<Clock: LogicalClock> StateTransition for CommitStateMachine<Clock> {
                     let mut wal = self.pager.wal.as_ref().unwrap().borrow_mut();
                     wal.update_max_frame();
                 }
-                println!("begin_write_tx(tx_id={})", self.tx_id);
                 let result = self.pager.io.block(|| self.pager.begin_write_tx())?;
                 if let crate::result::LimboResult::Busy = result {
                     panic!("Pager write transaction busy, in mvcc this should never happen");
@@ -582,18 +580,15 @@ impl<Clock: LogicalClock> StateTransition for CommitStateMachine<Clock> {
                         .unwrap();
                     match result {
                         crate::types::IOResult::Done(_) => {
-                            println!("commit_pager_txn(tx_id={}) done", self.tx_id);
                             self.current_committer.unlock();
-                            break;
+                            self.state = CommitState::Commit { end_ts };
+                            return Ok(TransitionResult::Continue);
                         }
                         crate::types::IOResult::IO(io) => {
-                            io.wait(self.pager.io.as_ref())?;
-                            continue;
+                            return Ok(TransitionResult::Io(io));
                         }
                     }
                 }
-                self.state = CommitState::Commit { end_ts };
-                Ok(TransitionResult::Continue)
             }
             CommitState::Commit { end_ts } => {
                 let mut log_record = LogRecord::new(end_ts);
@@ -714,7 +709,7 @@ impl StateTransition for WriteRowStateMachine {
 
                 match cursor
                     .insert(&key)
-                    .map_err(|e| LimboError::InternalError(e.to_string()))?
+                    .map_err(|e: LimboError| LimboError::InternalError(e.to_string()))?
                 {
                     IOResult::Done(()) => {
                         tracing::trace!(
@@ -1138,7 +1133,6 @@ impl<Clock: LogicalClock> MvStore<Clock> {
         let begin_ts = self.get_timestamp();
         let tx = Transaction::new(tx_id, begin_ts);
         tracing::trace!("begin_tx(tx_id={})", tx_id);
-        println!("begin_tx(tx_id={})", tx_id);
         self.txs.insert(tx_id, RwLock::new(tx));
 
         // TODO: we need to tie a pager's read transaction to a transaction ID, so that future refactors to read
@@ -1162,7 +1156,6 @@ impl<Clock: LogicalClock> MvStore<Clock> {
         pager: Rc<Pager>,
         connection: &Arc<Connection>,
     ) -> Result<StateMachine<CommitStateMachine<Clock>>> {
-        println!("commit_tx(tx_id={})", tx_id);
         tracing::trace!("commit_tx(tx_id={})", tx_id);
         let state_machine: StateMachine<CommitStateMachine<Clock>> =
             StateMachine::<CommitStateMachine<Clock>>::new(CommitStateMachine::new(
