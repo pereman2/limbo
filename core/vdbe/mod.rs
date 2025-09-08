@@ -40,7 +40,7 @@ use crate::{
         },
         metrics::StatementMetrics,
     },
-     IOExt, RefValue,
+    IOExt, RefValue,
 };
 
 use crate::{
@@ -468,7 +468,7 @@ impl Program {
                 }
                 if let Some(err) = io.get_error() {
                     let err = err.into();
-                    handle_program_error(&pager, &self.connection, &err)?;
+                    handle_program_error(&pager, &self.connection, &err, mv_store.as_ref())?;
                     return Err(err);
                 }
                 state.io_completions = None;
@@ -509,7 +509,7 @@ impl Program {
                     return Ok(StepResult::Busy);
                 }
                 Err(err) => {
-                    handle_program_error(&pager, &self.connection, &err)?;
+                    handle_program_error(&pager, &self.connection, &err, mv_store.as_ref())?;
                     return Err(err);
                 }
             }
@@ -900,6 +900,7 @@ pub fn handle_program_error(
     pager: &Rc<Pager>,
     connection: &Connection,
     err: &LimboError,
+    mv_store: Option<&Arc<MvStore>>,
 ) -> Result<()> {
     if connection.is_nested_stmt.get() {
         // Errors from nested statements are handled by the parent statement.
@@ -911,12 +912,20 @@ pub fn handle_program_error(
         // Table locked errors, e.g. trying to checkpoint in an interactive transaction, do not cause a rollback.
         LimboError::TableLocked => {}
         _ => {
-            pager
-                .io
-                .block(|| pager.end_tx(true, connection))
-                .inspect_err(|e| {
-                    tracing::error!("end_tx failed: {e}");
-                })?;
+            if let Some(mv_store) = mv_store {
+                if let Some(tx_id) = connection.mv_tx_id.get() {
+                    // println!("rollback_tx(tx_id={})", tx_id);
+                    // println!("error: {err:?}");
+                    // mv_store.rollback_tx(tx_id, pager.clone());
+                }
+            } else {
+                pager
+                    .io
+                    .block(|| pager.end_tx(true, connection))
+                    .inspect_err(|e| {
+                        tracing::error!("end_tx failed: {e}");
+                    })?;
+            }
             connection.transaction_state.replace(TransactionState::None);
         }
     }
