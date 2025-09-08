@@ -6,6 +6,7 @@ use crate::state_machine::TransitionResult;
 use crate::storage::btree::BTreeCursor;
 use crate::storage::btree::BTreeKey;
 use crate::storage::btree::CursorValidState;
+use crate::storage::sqlite3_ondisk::DatabaseHeader;
 use crate::storage::wal::TursoRwLock;
 use crate::types::IOCompletions;
 use crate::types::IOResult;
@@ -290,6 +291,7 @@ pub struct CommitStateMachine<Clock: LogicalClock> {
     delete_row_state_machine: Option<StateMachine<DeleteRowStateMachine>>,
     commit_coordinator: Arc<CommitCoordinator>,
     cursors: HashMap<u64, Arc<RwLock<BTreeCursor>>>,
+    header: Arc<RwLock<Option<DatabaseHeader>>>,
     _phantom: PhantomData<Clock>,
 }
 
@@ -334,6 +336,7 @@ impl<Clock: LogicalClock> CommitStateMachine<Clock> {
         tx_id: TxID,
         connection: Arc<Connection>,
         commit_coordinator: Arc<CommitCoordinator>,
+        header: Arc<RwLock<Option<DatabaseHeader>>>,
     ) -> Self {
         Self {
             state,
@@ -346,6 +349,7 @@ impl<Clock: LogicalClock> CommitStateMachine<Clock> {
             delete_row_state_machine: None,
             commit_coordinator,
             cursors: HashMap::new(),
+            header,
             _phantom: PhantomData,
         }
     }
@@ -491,15 +495,20 @@ impl<Clock: LogicalClock> StateTransition for CommitStateMachine<Clock> {
                 }
                 {
                     let mut wal = self.pager.wal.as_ref().unwrap().borrow_mut();
-                    // we need to read the header again to get the latest schema cookie
-                    wal.end_read_tx();
-                    wal.begin_read_tx()?;
+                    // we need to update the max frame to the latest shared max frame in order to avoid snapshot staleness
+                    wal.update_max_frame();
                 }
-                // Force updated header?
-                self.pager
-                    .io
-                    .block(|| self.pager.with_header_mut(|header| {}))
-                    .unwrap();
+                // TODO: Force updated header?
+                {
+                    if let Some(last_commited_header) = self.header.read().as_ref() {
+                        self.pager.io.block(|| {
+                            self.pager.with_header_mut(|header_in_pager| {
+                                header_in_pager.database_size = last_commited_header.database_size;
+                                // TODO: deal with other fields
+                            })
+                        })?;
+                    }
+                }
                 let result = self.pager.io.block(|| self.pager.begin_write_tx())?;
                 if let crate::result::LimboResult::Busy = result {
                     panic!("Pager write transaction busy, in mvcc this should never happen");
@@ -629,6 +638,7 @@ impl<Clock: LogicalClock> StateTransition for CommitStateMachine<Clock> {
                 // Write committed data to pager for persistence
                 // Flush dirty pages to WAL - this is critical for data persistence
                 // Similar to what step_end_write_txn does for legacy transactions
+
                 loop {
                     let result = self
                         .pager
@@ -640,6 +650,12 @@ impl<Clock: LogicalClock> StateTransition for CommitStateMachine<Clock> {
                         .unwrap();
                     match result {
                         IOResult::Done(_) => {
+                            // FIXME: hack for now to keep database header updated for pager commit
+                            self.pager.io.block(|| {
+                                self.pager.with_header(|header| {
+                                    self.header.write().replace(header.clone());
+                                })
+                            })?;
                             self.commit_coordinator.pager_commit_lock.unlock();
                             // TODO: here mark we are ready for a batch
                             self.state = CommitState::SyncWal { end_ts };
@@ -913,6 +929,7 @@ pub struct MvStore<Clock: LogicalClock> {
     storage: Storage,
     loaded_tables: RwLock<HashSet<u64>>,
     commit_coordinator: Arc<CommitCoordinator>,
+    header: Arc<RwLock<Option<DatabaseHeader>>>,
 }
 
 impl<Clock: LogicalClock> MvStore<Clock> {
@@ -930,6 +947,7 @@ impl<Clock: LogicalClock> MvStore<Clock> {
                 pager_commit_lock: Arc::new(TursoRwLock::new()),
                 commits_waiting: Arc::new(AtomicU64::new(0)),
             }),
+            header: Arc::new(RwLock::new(None)),
         }
     }
 
@@ -1244,6 +1262,7 @@ impl<Clock: LogicalClock> MvStore<Clock> {
                 tx_id,
                 connection.clone(),
                 self.commit_coordinator.clone(),
+                self.header.clone(),
             ));
         Ok(state_machine)
     }
