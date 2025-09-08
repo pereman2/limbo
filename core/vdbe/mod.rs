@@ -545,12 +545,16 @@ impl Program {
     ) -> Result<IOResult<()>> {
         self.apply_view_deltas(rollback);
 
-        if self.connection.transaction_state.get() == TransactionState::None && mv_store.is_none() {
+        if self.connection.transaction_state.get() == TransactionState::None {
             // No need to do any work here if not in tx. Current MVCC logic doesn't work with this assumption,
             // hence the mv_store.is_none() check.
             return Ok(IOResult::Done(()));
         }
         if let Some(mv_store) = mv_store {
+            if self.connection.is_nested_stmt.get() {
+                // We don't want to commit on nested statements. Let parent handle it.
+                return Ok(IOResult::Done(()));
+            }
             let conn = self.connection.clone();
             let auto_commit = conn.auto_commit.get();
             if auto_commit {
@@ -565,10 +569,10 @@ impl Program {
                     let state_machine = mv_store.commit_tx(*tx_id, pager.clone(), &conn).unwrap();
                     program_state.commit_state = CommitState::CommitingMvcc { state_machine };
                 }
-                let CommitState::CommitingMvcc { state_machine } =
-                    &mut program_state.commit_state else {
-                        panic!("invalid state for mvcc commit step")
-                    };
+                let CommitState::CommitingMvcc { state_machine } = &mut program_state.commit_state
+                else {
+                    panic!("invalid state for mvcc commit step")
+                };
                 match self.step_end_mvcc_txn(state_machine, mv_store)? {
                     IOResult::Done(_) => {
                         assert!(state_machine.is_finalized());
