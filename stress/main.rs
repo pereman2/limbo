@@ -1100,33 +1100,48 @@ fn generate_plan(opts: &Opts) -> Result<Plan, Box<dyn std::error::Error + Send +
     let gen_cfg = gen_startup_config(op_profile);
     println!("Generator config: {gen_cfg:?}");
 
-    // Per-thread expected state (kept in-memory during plan generation).
-    // NOTE: Because execution can COMMIT/ROLLBACK, this expected state is best-effort
+    // Global expected state snapshot (best-effort).
+    // This is used to generate statements such that "what rows exist" evolves over (iteration) time,
+    // rather than each thread seeing a full private timeline that doesn't match wall-clock.
+    //
+    // NOTE: Because execution can COMMIT/ROLLBACK, this expected state is still best-effort
     // and currently only tracks autocommit-level effects (see TODO below).
-    let mut expected_per_thread: Vec<ExpectedState> = (0..opts.nr_threads)
-        .map(|_| ExpectedState::new_from_schema(&schema))
-        .collect();
+    let mut expected_global: ExpectedState = ExpectedState::new_from_schema(&schema);
 
-    // Write DDL statements to log file
-    for id in 0..opts.nr_threads {
-        writeln!(log_file, "{id}",)?;
-        let mut queries = vec![];
-        let mut push = |sql: &str| {
-            queries.push(sql.to_string());
-            if !opts.skip_log {
-                writeln!(log_file, "{sql}").unwrap();
-            }
+    // Pre-create per-thread query buffers and write thread headers once.
+    let mut queries_per_thread: Vec<Vec<String>> =
+        (0..opts.nr_threads).map(|_| Vec::new()).collect();
+    if !opts.skip_log {
+        for id in 0..opts.nr_threads {
+            writeln!(log_file, "{id}",)?;
+        }
+    }
+
+    // Helper to push into a thread buffer (and optionally log) without requiring per-thread loops.
+    let mut push = |thread_id: usize, sql: &str| {
+        queries_per_thread[thread_id].push(sql.to_string());
+        if !opts.skip_log {
+            writeln!(log_file, "{sql}").unwrap();
+        }
+    };
+
+    // Iterate by iteration first, then by thread, so generation follows a shared timeline.
+    for i in 0..opts.nr_iterations {
+        if !opts.silent && !opts.verbose && i % 100 == 0 {
+            print!(
+                "\r{} %",
+                (i as f64 / opts.nr_iterations as f64 * 100.0) as usize
+            );
+            std::io::stdout().flush().unwrap();
+        }
+
+        let progress_0_1 = if opts.nr_iterations <= 1 {
+            1.0
+        } else {
+            i as f64 / (opts.nr_iterations - 1) as f64
         };
 
-        for i in 0..opts.nr_iterations {
-            if !opts.silent && !opts.verbose && i % 100 == 0 {
-                print!(
-                    "\r{} %",
-                    (i as f64 / opts.nr_iterations as f64 * 100.0) as usize
-                );
-                std::io::stdout().flush().unwrap();
-            }
-
+        for thread_id in 0..opts.nr_threads {
             let tx = if get_random() % 2 == 0 {
                 Some("BEGIN")
             } else {
@@ -1136,34 +1151,24 @@ fn generate_plan(opts: &Opts) -> Result<Plan, Box<dyn std::error::Error + Send +
             // TODO: To make expected state exact across COMMIT/ROLLBACK, maintain a transactional
             // shadow copy of ExpectedState per thread and only merge on COMMIT.
             if let Some(tx) = tx {
-                push(tx);
+                push(thread_id, tx);
             }
 
-            let progress_0_1 = if opts.nr_iterations <= 1 {
-                1.0
-            } else {
-                i as f64 / (opts.nr_iterations - 1) as f64
-            };
-
-            let sql = generate_random_statement(
-                &schema,
-                &mut expected_per_thread[id],
-                &gen_cfg,
-                progress_0_1,
-            );
-            push(&sql);
+            let sql =
+                generate_random_statement(&schema, &mut expected_global, &gen_cfg, progress_0_1);
+            push(thread_id, &sql);
 
             if tx.is_some() {
                 if get_random() % 2 == 0 {
-                    push("COMMIT");
+                    push(thread_id, "COMMIT");
                 } else {
-                    push("ROLLBACK");
+                    push(thread_id, "ROLLBACK");
                 }
             }
         }
-
-        plan.queries_per_thread.push(queries);
     }
+
+    plan.queries_per_thread = queries_per_thread;
     Ok(plan)
 }
 
