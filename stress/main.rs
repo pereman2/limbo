@@ -28,10 +28,24 @@ pub enum ProbSchedule {
     Constant { p: f64 },
 
     /// Linearly ramps from `start` to `end` over progress in [0, 1].
+    ///
+    /// NOTE: The generator should ensure `end` is sufficiently far from `start` to avoid near-constant ramps.
     Ramp { start: f64, end: f64 },
 
     /// Triangle wave: rises from `min` to `max` by `peak_at` then falls back to `min` by 1.0.
+    ///
+    /// NOTE: The generator should avoid `peak_at` too close to 0.0 or 1.0 to avoid sudden changes.
     Triangle { min: f64, max: f64, peak_at: f64 },
+
+    /// Smooth sinusoidal schedule oscillating between `min` and `max`.
+    /// `cycles` is the number of full oscillations over progress in [0, 1].
+    /// `phase` is in radians.
+    Sin {
+        min: f64,
+        max: f64,
+        cycles: f64,
+        phase: f64,
+    },
 }
 
 fn clamp01(x: f64) -> f64 {
@@ -61,6 +75,19 @@ impl ProbSchedule {
                     clamp01(max + (min - max) * u)
                 }
             }
+            ProbSchedule::Sin {
+                min,
+                max,
+                cycles,
+                phase,
+            } => {
+                // Map sin output [-1, 1] -> [0, 1] then to [min, max]
+                let amp = (max - min) / 2.0;
+                let mid = (max + min) / 2.0;
+                let angle = (2.0 * std::f64::consts::PI) * cycles * t + phase;
+                let v = mid + amp * angle.sin();
+                clamp01(v)
+            }
         }
     }
 }
@@ -82,10 +109,10 @@ pub struct GenConfig {
     /// Probability schedule: UPDATE targets a missing/random PK (i.e. update maybe-nonexistent).
     pub update_target_missing_pk: ProbSchedule,
 
-    /// Startup-chosen weight for selecting INSERT vs UPDATE vs DELETE (still constant).
-    pub w_insert: u64,
-    pub w_update: u64,
-    pub w_delete: u64,
+    /// Probability schedule: weight for selecting INSERT vs UPDATE vs DELETE (can vary over time).
+    pub w_insert: ProbSchedule,
+    pub w_update: ProbSchedule,
+    pub w_delete: ProbSchedule,
 }
 
 /// Draw a startup config by randomizing schedules once.
@@ -104,21 +131,61 @@ fn gen_startup_config() -> GenConfig {
             (max_p, min_p)
         };
 
-        match get_random() % 3 {
+        // Helper to sample in [lo, hi]
+        let sample = || lo + (hi - lo) * ((get_random() % 1000) as f64 / 999.0);
+        // Enforce a minimum delta so ramps/triangles don't become "almost constant".
+        let min_delta = (hi - lo) * 0.15;
+
+        match get_random() % 4 {
             0 => {
-                let p = lo + (hi - lo) * ((get_random() % 1000) as f64 / 999.0);
+                let p = sample();
                 ProbSchedule::Constant { p }
             }
             1 => {
-                let start = lo + (hi - lo) * ((get_random() % 1000) as f64 / 999.0);
-                let end = lo + (hi - lo) * ((get_random() % 1000) as f64 / 999.0);
+                // Ramp with enforced separation between start and end.
+                let start = sample();
+                let mut end = sample();
+                let mut tries = 0;
+                while (end - start).abs() < min_delta && tries < 16 {
+                    end = sample();
+                    tries += 1;
+                }
+                // If still too close, force end to be at least min_delta away (clamped to bounds).
+                if (end - start).abs() < min_delta {
+                    end = if start + min_delta <= hi {
+                        start + min_delta
+                    } else if start - min_delta >= lo {
+                        start - min_delta
+                    } else {
+                        // Fallback: push to far end
+                        if start < (lo + hi) / 2.0 {
+                            hi
+                        } else {
+                            lo
+                        }
+                    };
+                }
                 ProbSchedule::Ramp { start, end }
             }
-            _ => {
+            2 => {
+                // Triangle with peak away from edges and with meaningful amplitude.
                 let min = lo;
                 let max = hi;
-                let peak_at = 0.05 + 0.90 * ((get_random() % 1000) as f64 / 999.0); // avoid extremes
+                let peak_at = 0.20 + 0.60 * ((get_random() % 1000) as f64 / 999.0); // keep away from extremes
                 ProbSchedule::Triangle { min, max, peak_at }
+            }
+            _ => {
+                // Sin: smooth oscillation, avoids sudden edges by design.
+                let min = lo;
+                let max = hi;
+                let cycles = 0.5 + 2.5 * ((get_random() % 1000) as f64 / 999.0); // 0.5 .. 3.0 cycles
+                let phase = (2.0 * std::f64::consts::PI) * ((get_random() % 1000) as f64 / 999.0);
+                ProbSchedule::Sin {
+                    min,
+                    max,
+                    cycles,
+                    phase,
+                }
             }
         }
     }
@@ -130,10 +197,13 @@ fn gen_startup_config() -> GenConfig {
     let delete_target_missing_pk = pick_schedule(0.00, 0.20);
     let update_target_missing_pk = pick_schedule(0.00, 0.20);
 
-    // Startup-chosen op selection weights in [1..=100] (non-zero).
-    let w_insert = (get_random() % 100 + 1) as u64;
-    let w_update = (get_random() % 100 + 1) as u64;
-    let w_delete = (get_random() % 100 + 1) as u64;
+    // Operation-selection weights.
+    // These are stored as schedules so they can be constant or time-varying, and are chosen at startup.
+    //
+    // We intentionally use a "weight" range (not necessarily summing to 1.0). The picker uses them proportionally.
+    let w_insert = pick_schedule(1.0, 100.0);
+    let w_update = pick_schedule(1.0, 100.0);
+    let w_delete = pick_schedule(1.0, 100.0);
 
     GenConfig {
         insert_attempt_constraint_error,
@@ -670,13 +740,13 @@ fn generate_random_statement(
 ) -> String {
     let table = &schema.tables[get_random() as usize % schema.tables.len()];
 
-    // Startup-chosen weights (non-zero).
-    let w_insert = cfg.w_insert;
-    let w_update = cfg.w_update;
-    let w_delete = cfg.w_delete;
+    // Profile-controlled weights (may vary over time).
+    let w_insert = cfg.w_insert.value_at(progress_0_1);
+    let w_update = cfg.w_update.value_at(progress_0_1);
+    let w_delete = cfg.w_delete.value_at(progress_0_1);
 
     let sum = w_insert + w_update + w_delete;
-    let roll = get_random() % sum;
+    let roll = (get_random() as f64 / u64::MAX as f64) * sum;
 
     if roll < w_insert {
         generate_insert(table, expected, cfg, progress_0_1)
