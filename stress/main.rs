@@ -7,7 +7,7 @@ use opts::Opts;
 use rand::rngs::StdRng;
 #[cfg(not(feature = "antithesis"))]
 use rand::{Rng, SeedableRng};
-use std::collections::HashSet;
+use std::collections::{BTreeMap, HashMap, HashSet};
 use std::fs::File;
 use std::io::{Read, Write};
 use std::path::Path;
@@ -21,6 +21,131 @@ use tracing_subscriber::reload;
 use tracing_subscriber::util::SubscriberInitExt;
 use tracing_subscriber::EnvFilter;
 use turso::Builder;
+
+#[derive(Debug, Clone)]
+pub enum ProbSchedule {
+    /// Always returns the same value.
+    Constant { p: f64 },
+
+    /// Linearly ramps from `start` to `end` over progress in [0, 1].
+    Ramp { start: f64, end: f64 },
+
+    /// Triangle wave: rises from `min` to `max` by `peak_at` then falls back to `min` by 1.0.
+    Triangle { min: f64, max: f64, peak_at: f64 },
+}
+
+fn clamp01(x: f64) -> f64 {
+    if x < 0.0 {
+        0.0
+    } else if x > 1.0 {
+        1.0
+    } else {
+        x
+    }
+}
+
+impl ProbSchedule {
+    pub fn value_at(&self, progress_0_1: f64) -> f64 {
+        let t = clamp01(progress_0_1);
+        match *self {
+            ProbSchedule::Constant { p } => clamp01(p),
+            ProbSchedule::Ramp { start, end } => clamp01(start + (end - start) * t),
+            ProbSchedule::Triangle { min, max, peak_at } => {
+                let peak = clamp01(peak_at.max(1e-9)); // avoid div by zero
+                if t <= peak {
+                    let u = t / peak;
+                    clamp01(min + (max - min) * u)
+                } else {
+                    let denom = (1.0 - peak).max(1e-9);
+                    let u = (t - peak) / denom;
+                    clamp01(max + (min - max) * u)
+                }
+            }
+        }
+    }
+}
+
+#[derive(Debug, Clone)]
+pub struct GenConfig {
+    /// Probability schedule: INSERT attempts a constraint error.
+    pub insert_attempt_constraint_error: ProbSchedule,
+
+    /// Probability schedule: given we're attempting a constraint error, reuse an existing PK.
+    pub insert_reuse_existing_pk_on_error: ProbSchedule,
+
+    /// Probability schedule: given we're attempting a constraint error and column is UNIQUE, steal existing UNIQUE value.
+    pub insert_steal_unique_value_on_error: ProbSchedule,
+
+    /// Probability schedule: DELETE targets a missing/random PK (i.e. delete maybe-nonexistent).
+    pub delete_target_missing_pk: ProbSchedule,
+
+    /// Probability schedule: UPDATE targets a missing/random PK (i.e. update maybe-nonexistent).
+    pub update_target_missing_pk: ProbSchedule,
+
+    /// Startup-chosen weight for selecting INSERT vs UPDATE vs DELETE (still constant).
+    pub w_insert: u64,
+    pub w_update: u64,
+    pub w_delete: u64,
+}
+
+/// Draw a startup config by randomizing schedules once.
+fn gen_startup_config() -> GenConfig {
+    // Helper to pick one of the schedule shapes at startup.
+    // Shapes:
+    // - Constant: never changes.
+    // - Ramp: increases or decreases over time.
+    // - Triangle: increases then decreases.
+    fn pick_schedule(min_p: f64, max_p: f64) -> ProbSchedule {
+        let min_p = clamp01(min_p);
+        let max_p = clamp01(max_p);
+        let (lo, hi) = if min_p <= max_p {
+            (min_p, max_p)
+        } else {
+            (max_p, min_p)
+        };
+
+        match get_random() % 3 {
+            0 => {
+                let p = lo + (hi - lo) * ((get_random() % 1000) as f64 / 999.0);
+                ProbSchedule::Constant { p }
+            }
+            1 => {
+                let start = lo + (hi - lo) * ((get_random() % 1000) as f64 / 999.0);
+                let end = lo + (hi - lo) * ((get_random() % 1000) as f64 / 999.0);
+                ProbSchedule::Ramp { start, end }
+            }
+            _ => {
+                let min = lo;
+                let max = hi;
+                let peak_at = 0.05 + 0.90 * ((get_random() % 1000) as f64 / 999.0); // avoid extremes
+                ProbSchedule::Triangle { min, max, peak_at }
+            }
+        }
+    }
+
+    // Keep ranges reasonable; tweak as desired.
+    let insert_attempt_constraint_error = pick_schedule(0.00, 0.30);
+    let insert_reuse_existing_pk_on_error = pick_schedule(0.30, 0.90);
+    let insert_steal_unique_value_on_error = pick_schedule(0.00, 0.80);
+    let delete_target_missing_pk = pick_schedule(0.00, 0.20);
+    let update_target_missing_pk = pick_schedule(0.00, 0.20);
+
+    // Startup-chosen op selection weights in [1..=100] (non-zero).
+    let w_insert = (get_random() % 100 + 1) as u64;
+    let w_update = (get_random() % 100 + 1) as u64;
+    let w_delete = (get_random() % 100 + 1) as u64;
+
+    GenConfig {
+        insert_attempt_constraint_error,
+        insert_reuse_existing_pk_on_error,
+        insert_steal_unique_value_on_error,
+        delete_target_missing_pk,
+        update_target_missing_pk,
+        w_insert,
+        w_update,
+        w_delete,
+    }
+}
 
 #[cfg(not(feature = "antithesis"))]
 static RNG: std::sync::OnceLock<StdMutex<StdRng>> = std::sync::OnceLock::new();
@@ -84,6 +209,33 @@ pub struct Table {
     pub name: String,
     pub columns: Vec<Column>,
     pub pk_values: Vec<String>,
+}
+
+/// In-memory representation of a row (SQL-literal strings per column name).
+#[derive(Debug, Clone)]
+pub struct RowState {
+    pub values: BTreeMap<String, String>,
+}
+
+/// In-memory tracker of expected rows, keyed by primary key SQL-literal.
+#[derive(Debug, Default, Clone)]
+pub struct TableState {
+    pub rows_by_pk: HashMap<String, RowState>,
+}
+
+#[derive(Debug, Default, Clone)]
+pub struct ExpectedState {
+    pub tables: HashMap<String, TableState>,
+}
+
+impl ExpectedState {
+    pub fn new_from_schema(schema: &ArbitrarySchema) -> Self {
+        let mut tables = HashMap::new();
+        for t in &schema.tables {
+            tables.insert(t.name.clone(), TableState::default());
+        }
+        Self { tables }
+    }
 }
 
 /// Represents a complete SQLite schema
@@ -257,8 +409,113 @@ fn generate_random_value(data_type: &DataType) -> String {
     }
 }
 
-/// Generate a random INSERT statement for a table
-fn generate_insert(table: &Table) -> String {
+/// Find the primary key column for a table.
+fn pk_column<'a>(table: &'a Table) -> &'a Column {
+    table
+        .columns
+        .iter()
+        .find(|col| col.constraints.contains(&Constraint::PrimaryKey))
+        .expect("Table should have a primary key")
+}
+
+/// Attempt to parse a simple equality predicate like `col = literal` and return the literal.
+fn parse_simple_eq_literal(where_clause: &str, col_name: &str) -> Option<String> {
+    let s = where_clause.trim();
+    // Expected patterns: "{col} = {lit}" (with arbitrary spaces), no trailing semicolon.
+    // We'll do a conservative parse: must start with col name, contain '=', and have non-empty RHS.
+    let prefix = col_name;
+    let s = s.strip_prefix(prefix)?;
+    let s = s.trim_start();
+    let s = s.strip_prefix('=')?;
+    let rhs = s.trim();
+    if rhs.is_empty() {
+        None
+    } else {
+        Some(rhs.to_string())
+    }
+}
+
+/// Generate an INSERT statement and (if it should succeed) update in-memory expected state.
+fn generate_insert(
+    table: &Table,
+    expected: &mut ExpectedState,
+    cfg: &GenConfig,
+    progress_0_1: f64,
+) -> String {
+    let pk = pk_column(table);
+
+    let table_state = expected
+        .tables
+        .get_mut(&table.name)
+        .expect("expected table state missing");
+
+    // Decide whether we attempt a constraint failure.
+    let attempt_constraint_error =
+        gen_bool(cfg.insert_attempt_constraint_error.value_at(progress_0_1))
+            && !table_state.rows_by_pk.is_empty();
+
+    // Choose PK value:
+    // - If attempting constraint error: reuse existing PK with high probability.
+    // - Otherwise: generate a fresh-ish value, but still might collide by chance.
+    let pk_value = if attempt_constraint_error
+        && gen_bool(cfg.insert_reuse_existing_pk_on_error.value_at(progress_0_1))
+    {
+        // Reuse an existing PK to trigger PRIMARY KEY/UNIQUE constraint.
+        let idx = get_random() as usize % table_state.rows_by_pk.len();
+        table_state
+            .rows_by_pk
+            .keys()
+            .nth(idx)
+            .expect("non-empty")
+            .clone()
+    } else {
+        generate_random_value(&pk.data_type)
+    };
+
+    // Build row values.
+    let mut values_by_col: BTreeMap<String, String> = BTreeMap::new();
+    for col in &table.columns {
+        let v = if col.name == pk.name {
+            pk_value.clone()
+        } else if attempt_constraint_error
+            && col.constraints.contains(&Constraint::Unique)
+            && gen_bool(
+                cfg.insert_steal_unique_value_on_error
+                    .value_at(progress_0_1),
+            )
+            && !table_state.rows_by_pk.is_empty()
+        {
+            // Try to violate a UNIQUE column by stealing an existing value from some row.
+            let idx = get_random() as usize % table_state.rows_by_pk.len();
+            let some_row = table_state.rows_by_pk.values().nth(idx).expect("non-empty");
+            some_row
+                .values
+                .get(&col.name)
+                .cloned()
+                .unwrap_or_else(|| generate_random_value(&col.data_type))
+        } else {
+            generate_random_value(&col.data_type)
+        };
+        values_by_col.insert(col.name.clone(), v);
+    }
+
+    // Decide whether we expect the INSERT to succeed.
+    // If we're attempting a constraint error, only mark success if the PK isn't already present.
+    let expect_success = if attempt_constraint_error {
+        !table_state.rows_by_pk.contains_key(&pk_value)
+    } else {
+        !table_state.rows_by_pk.contains_key(&pk_value)
+    };
+
+    if expect_success {
+        table_state.rows_by_pk.insert(
+            pk_value.clone(),
+            RowState {
+                values: values_by_col.clone(),
+            },
+        );
+    }
+
     let columns = table
         .columns
         .iter()
@@ -270,14 +527,10 @@ fn generate_insert(table: &Table) -> String {
         .columns
         .iter()
         .map(|col| {
-            if !table.pk_values.is_empty()
-                && col.constraints.contains(&Constraint::PrimaryKey)
-                && get_random() % 100 < 50
-            {
-                table.pk_values[get_random() as usize % table.pk_values.len()].clone()
-            } else {
-                generate_random_value(&col.data_type)
-            }
+            values_by_col
+                .get(&col.name)
+                .expect("missing col value")
+                .clone()
         })
         .collect::<Vec<_>>()
         .join(", ");
@@ -288,50 +541,73 @@ fn generate_insert(table: &Table) -> String {
     )
 }
 
-/// Generate a random UPDATE statement for a table
-fn generate_update(table: &Table) -> String {
-    // Find the primary key column
-    let pk_column = table
-        .columns
-        .iter()
-        .find(|col| col.constraints.contains(&Constraint::PrimaryKey))
-        .expect("Table should have a primary key");
+/// Generate an UPDATE statement and update in-memory expected state.
+/// Behavior:
+/// - Prefer updating an existing row; with configurable probability use a random PK that likely doesn't exist.
+fn generate_update(
+    table: &Table,
+    expected: &mut ExpectedState,
+    cfg: &GenConfig,
+    progress_0_1: f64,
+) -> String {
+    let pk = pk_column(table);
 
-    // Get all non-primary key columns
-    let non_pk_columns: Vec<_> = table
-        .columns
-        .iter()
-        .filter(|col| col.name != pk_column.name)
-        .collect();
+    let table_state = expected
+        .tables
+        .get_mut(&table.name)
+        .expect("expected table state missing");
 
-    // If we have no non-PK columns, just update the primary key itself
-    let set_clause = if non_pk_columns.is_empty() {
-        format!(
-            "{} = {}",
-            pk_column.name,
-            generate_random_value(&pk_column.data_type)
-        )
+    let target_missing = gen_bool(cfg.update_target_missing_pk.value_at(progress_0_1))
+        || table_state.rows_by_pk.is_empty();
+
+    let target_pk = if !target_missing {
+        let idx = get_random() as usize % table_state.rows_by_pk.len();
+        table_state
+            .rows_by_pk
+            .keys()
+            .nth(idx)
+            .expect("non-empty")
+            .clone()
     } else {
-        non_pk_columns
-            .iter()
-            .map(|col| format!("{} = {}", col.name, generate_random_value(&col.data_type)))
-            .collect::<Vec<_>>()
-            .join(", ")
+        generate_random_value(&pk.data_type)
     };
 
-    let where_clause = if !table.pk_values.is_empty() && get_random() % 100 < 50 {
-        format!(
-            "{} = {}",
-            pk_column.name,
-            table.pk_values[get_random() as usize % table.pk_values.len()]
-        )
+    // Update only non-PK columns (avoid changing PK to keep tracking sane).
+    let non_pk_columns: Vec<_> = table.columns.iter().filter(|c| c.name != pk.name).collect();
+
+    // If there are no non-PK columns, do a no-op update on PK.
+    let mut assignments: Vec<(String, String)> = Vec::new();
+    if non_pk_columns.is_empty() {
+        assignments.push((pk.name.clone(), target_pk.clone()));
     } else {
-        format!(
-            "{} = {}",
-            pk_column.name,
-            generate_random_value(&pk_column.data_type)
-        )
-    };
+        let nr_to_update = 1 + (get_random() as usize % non_pk_columns.len());
+        for _ in 0..nr_to_update {
+            let col = non_pk_columns[get_random() as usize % non_pk_columns.len()];
+            assignments.push((col.name.clone(), generate_random_value(&col.data_type)));
+        }
+        // De-dup by last-write-wins
+        let mut dedup: HashMap<String, String> = HashMap::new();
+        for (k, v) in assignments {
+            dedup.insert(k, v);
+        }
+        assignments = dedup.into_iter().collect();
+        assignments.sort_by(|a, b| a.0.cmp(&b.0));
+    }
+
+    // Apply to expected state if row exists.
+    if let Some(row) = table_state.rows_by_pk.get_mut(&target_pk) {
+        for (col, val) in &assignments {
+            row.values.insert(col.clone(), val.clone());
+        }
+    }
+
+    let set_clause = assignments
+        .iter()
+        .map(|(c, v)| format!("{c} = {v}"))
+        .collect::<Vec<_>>()
+        .join(", ");
+
+    let where_clause = format!("{} = {}", pk.name, target_pk);
 
     format!(
         "UPDATE {} SET {} WHERE {};",
@@ -339,39 +615,75 @@ fn generate_update(table: &Table) -> String {
     )
 }
 
-/// Generate a random DELETE statement for a table
-fn generate_delete(table: &Table) -> String {
-    // Find the primary key column
-    let pk_column = table
-        .columns
-        .iter()
-        .find(|col| col.constraints.contains(&Constraint::PrimaryKey))
-        .expect("Table should have a primary key");
+/// Generate a DELETE statement and update in-memory expected state.
+/// Behavior:
+/// - Prefer deleting an existing row; with configurable probability use a random PK that likely doesn't exist.
+fn generate_delete(
+    table: &Table,
+    expected: &mut ExpectedState,
+    cfg: &GenConfig,
+    progress_0_1: f64,
+) -> String {
+    let pk = pk_column(table);
 
-    let where_clause = if !table.pk_values.is_empty() && get_random() % 100 < 50 {
-        format!(
-            "{} = {}",
-            pk_column.name,
-            table.pk_values[get_random() as usize % table.pk_values.len()]
-        )
+    let table_state = expected
+        .tables
+        .get_mut(&table.name)
+        .expect("expected table state missing");
+
+    let target_missing = gen_bool(cfg.delete_target_missing_pk.value_at(progress_0_1))
+        || table_state.rows_by_pk.is_empty();
+
+    let target_pk = if !target_missing {
+        let idx = get_random() as usize % table_state.rows_by_pk.len();
+        table_state
+            .rows_by_pk
+            .keys()
+            .nth(idx)
+            .expect("non-empty")
+            .clone()
     } else {
-        format!(
-            "{} = {}",
-            pk_column.name,
-            generate_random_value(&pk_column.data_type)
-        )
+        generate_random_value(&pk.data_type)
     };
 
-    format!("DELETE FROM {} WHERE {};", table.name, where_clause)
+    // Apply to expected state if row exists.
+    let _ = table_state.rows_by_pk.remove(&target_pk);
+
+    format!(
+        "DELETE FROM {} WHERE {} = {};",
+        table.name, pk.name, target_pk
+    )
 }
 
-/// Generate a random SQL statement for a schema
-fn generate_random_statement(schema: &ArbitrarySchema) -> String {
+/// Generate a random SQL statement for a schema while tracking expected in-memory state.
+///
+/// The probabilities for choosing INSERT vs UPDATE vs DELETE are randomized per-statement:
+/// we generate 3 random weights and pick an operation proportionally.
+///
+/// The "constraint-ish" and "missing row targeting" probabilities used inside INSERT/UPDATE/DELETE
+/// are chosen once at startup via `GenConfig` and then kept constant for the run.
+fn generate_random_statement(
+    schema: &ArbitrarySchema,
+    expected: &mut ExpectedState,
+    cfg: &GenConfig,
+    progress_0_1: f64,
+) -> String {
     let table = &schema.tables[get_random() as usize % schema.tables.len()];
-    match get_random() % 3 {
-        0 => generate_insert(table),
-        1 => generate_update(table),
-        _ => generate_delete(table),
+
+    // Startup-chosen weights (non-zero).
+    let w_insert = cfg.w_insert;
+    let w_update = cfg.w_update;
+    let w_delete = cfg.w_delete;
+
+    let sum = w_insert + w_update + w_delete;
+    let roll = get_random() % sum;
+
+    if roll < w_insert {
+        generate_insert(table, expected, cfg, progress_0_1)
+    } else if roll < w_insert + w_update {
+        generate_update(table, expected, cfg, progress_0_1)
+    } else {
+        generate_delete(table, expected, cfg, progress_0_1)
     }
 }
 
@@ -493,6 +805,18 @@ fn generate_plan(opts: &Opts) -> Result<Plan, Box<dyn std::error::Error + Send +
         plan.ddl_statements = ddl_statements;
         schema
     };
+
+    // Choose randomized generator behavior once at startup (per run).
+    let gen_cfg = gen_startup_config();
+    println!("Generator config: {gen_cfg:?}");
+
+    // Per-thread expected state (kept in-memory during plan generation).
+    // NOTE: Because execution can COMMIT/ROLLBACK, this expected state is best-effort
+    // and currently only tracks autocommit-level effects (see TODO below).
+    let mut expected_per_thread: Vec<ExpectedState> = (0..opts.nr_threads)
+        .map(|_| ExpectedState::new_from_schema(&schema))
+        .collect();
+
     // Write DDL statements to log file
     for id in 0..opts.nr_threads {
         writeln!(log_file, "{id}",)?;
@@ -503,6 +827,7 @@ fn generate_plan(opts: &Opts) -> Result<Plan, Box<dyn std::error::Error + Send +
                 writeln!(log_file, "{sql}").unwrap();
             }
         };
+
         for i in 0..opts.nr_iterations {
             if !opts.silent && !opts.verbose && i % 100 == 0 {
                 print!(
@@ -511,16 +836,33 @@ fn generate_plan(opts: &Opts) -> Result<Plan, Box<dyn std::error::Error + Send +
                 );
                 std::io::stdout().flush().unwrap();
             }
+
             let tx = if get_random() % 2 == 0 {
                 Some("BEGIN")
             } else {
                 None
             };
+
+            // TODO: To make expected state exact across COMMIT/ROLLBACK, maintain a transactional
+            // shadow copy of ExpectedState per thread and only merge on COMMIT.
             if let Some(tx) = tx {
                 push(tx);
             }
-            let sql = generate_random_statement(&schema);
+
+            let progress_0_1 = if opts.nr_iterations <= 1 {
+                1.0
+            } else {
+                i as f64 / (opts.nr_iterations - 1) as f64
+            };
+
+            let sql = generate_random_statement(
+                &schema,
+                &mut expected_per_thread[id],
+                &gen_cfg,
+                progress_0_1,
+            );
             push(&sql);
+
             if tx.is_some() {
                 if get_random() % 2 == 0 {
                     push("COMMIT");
@@ -529,6 +871,7 @@ fn generate_plan(opts: &Opts) -> Result<Plan, Box<dyn std::error::Error + Send +
                 }
             }
         }
+
         plan.queries_per_thread.push(queries);
     }
     Ok(plan)
