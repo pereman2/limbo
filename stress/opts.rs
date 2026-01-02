@@ -81,6 +81,24 @@ pub struct Opts {
     #[clap(long, help = "Random seed for reproducibility")]
     pub seed: Option<u64>,
 
+    /// Operation-mix profile name (affects INSERT/UPDATE/DELETE schedule generation).
+    ///
+    /// Available profiles:
+    /// - random
+    /// - insert-to-modify-80
+    /// - insert-then-delete-80
+    /// - fill-then-churn-80
+    /// - delete-storm
+    /// - update-storm
+    /// - oscillating-write-mix
+    /// - ramping-deletes
+    #[clap(
+        long = "op-profile",
+        help = "Operation-mix profile name (affects INSERT/UPDATE/DELETE schedule generation)",
+        default_value = "random"
+    )]
+    pub op_profile: String,
+
     #[clap(long, help = "Reference DB to take schema and initial state")]
     pub db_ref: Option<PathBuf>,
 }

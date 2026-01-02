@@ -22,6 +22,72 @@ use tracing_subscriber::util::SubscriberInitExt;
 use tracing_subscriber::EnvFilter;
 use turso::Builder;
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum OpProfile {
+    /// Random schedules for insert/update/delete weights.
+    RandomSchedule,
+
+    /// Insert-heavy until 80%, then updates+deletes dominate.
+    InsertToModify80,
+
+    /// Insert-heavy until 80%, then deletes dominate (updates remain low).
+    InsertThenDelete80,
+
+    /// Fill with inserts until 80%, then churn hard with updates+deletes.
+    FillThenChurn80,
+
+    /// Deletes dominate throughout.
+    DeleteStorm,
+
+    /// Updates dominate throughout.
+    UpdateStorm,
+
+    /// Insert/update/delete dominance oscillates smoothly over time.
+    OscillatingWriteMix,
+
+    /// Deletes ramp up smoothly over time (inserts ramp down).
+    RampingDeletes,
+}
+
+impl OpProfile {
+    pub fn name(&self) -> &'static str {
+        match self {
+            OpProfile::RandomSchedule => "random",
+            OpProfile::InsertToModify80 => "insert-to-modify-80",
+            OpProfile::InsertThenDelete80 => "insert-then-delete-80",
+            OpProfile::FillThenChurn80 => "fill-then-churn-80",
+            OpProfile::DeleteStorm => "delete-storm",
+            OpProfile::UpdateStorm => "update-storm",
+            OpProfile::OscillatingWriteMix => "oscillating-write-mix",
+            OpProfile::RampingDeletes => "ramping-deletes",
+        }
+    }
+
+    pub fn parse(s: &str) -> Result<Self, String> {
+        match s.trim().to_ascii_lowercase().as_str() {
+            "random" | "random-schedule" => Ok(OpProfile::RandomSchedule),
+
+            "insert-to-modify" | "insert-to-modify-80" => Ok(OpProfile::InsertToModify80),
+
+            "insert-then-delete" | "insert-then-delete-80" => Ok(OpProfile::InsertThenDelete80),
+
+            "fill-then-churn" | "fill-then-churn-80" => Ok(OpProfile::FillThenChurn80),
+
+            "delete-storm" | "delete-storm-const" => Ok(OpProfile::DeleteStorm),
+
+            "update-storm" | "update-storm-const" => Ok(OpProfile::UpdateStorm),
+
+            "oscillating-write-mix" | "oscillating" => Ok(OpProfile::OscillatingWriteMix),
+
+            "ramping-deletes" | "ramp-deletes" => Ok(OpProfile::RampingDeletes),
+
+            other => Err(format!(
+                "Unknown --op-profile '{other}'. Valid: random, insert-to-modify-80, insert-then-delete-80, fill-then-churn-80, delete-storm, update-storm, oscillating-write-mix, ramping-deletes"
+            )),
+        }
+    }
+}
+
 #[derive(Debug, Clone)]
 pub enum ProbSchedule {
     /// Always returns the same value.
@@ -46,6 +112,53 @@ pub enum ProbSchedule {
         cycles: f64,
         phase: f64,
     },
+
+    /// Piecewise constant schedule:
+    /// each segment applies when progress_0_1 <= `end_at` (in ascending order).
+    Stepwise { segments: Vec<(f64, f64)> },
+}
+
+impl ProbSchedule {
+    /// Interpret this schedule as a non-negative "weight" at the given progress.
+    /// (Unlike probability schedules, weights are not clamped to [0, 1].)
+    pub fn weight_at(&self, progress_0_1: f64) -> f64 {
+        let t = clamp01(progress_0_1);
+        match self {
+            ProbSchedule::Constant { p } => p.max(0.0),
+            ProbSchedule::Ramp { start, end } => (start + (end - start) * t).max(0.0),
+            ProbSchedule::Triangle { min, max, peak_at } => {
+                let peak = clamp01((*peak_at).max(1e-9));
+                let v = if t <= peak {
+                    let u = t / peak;
+                    min + (max - min) * u
+                } else {
+                    let denom = (1.0 - peak).max(1e-9);
+                    let u = (t - peak) / denom;
+                    max + (min - max) * u
+                };
+                v.max(0.0)
+            }
+            ProbSchedule::Sin {
+                min,
+                max,
+                cycles,
+                phase,
+            } => {
+                let amp = (max - min) / 2.0;
+                let mid = (max + min) / 2.0;
+                let angle = (2.0 * std::f64::consts::PI) * (*cycles) * t + *phase;
+                (mid + amp * angle.sin()).max(0.0)
+            }
+            ProbSchedule::Stepwise { segments } => {
+                for (end_at, v) in segments {
+                    if t <= *end_at {
+                        return v.max(0.0);
+                    }
+                }
+                segments.last().map(|(_, v)| v.max(0.0)).unwrap_or(0.0)
+            }
+        }
+    }
 }
 
 fn clamp01(x: f64) -> f64 {
@@ -61,18 +174,18 @@ fn clamp01(x: f64) -> f64 {
 impl ProbSchedule {
     pub fn value_at(&self, progress_0_1: f64) -> f64 {
         let t = clamp01(progress_0_1);
-        match *self {
-            ProbSchedule::Constant { p } => clamp01(p),
-            ProbSchedule::Ramp { start, end } => clamp01(start + (end - start) * t),
+        match self {
+            ProbSchedule::Constant { p } => clamp01(*p),
+            ProbSchedule::Ramp { start, end } => clamp01(*start + (*end - *start) * t),
             ProbSchedule::Triangle { min, max, peak_at } => {
-                let peak = clamp01(peak_at.max(1e-9)); // avoid div by zero
+                let peak = clamp01((*peak_at).max(1e-9)); // avoid div by zero
                 if t <= peak {
                     let u = t / peak;
-                    clamp01(min + (max - min) * u)
+                    clamp01(*min + (*max - *min) * u)
                 } else {
                     let denom = (1.0 - peak).max(1e-9);
                     let u = (t - peak) / denom;
-                    clamp01(max + (min - max) * u)
+                    clamp01(*max + (*min - *max) * u)
                 }
             }
             ProbSchedule::Sin {
@@ -84,9 +197,17 @@ impl ProbSchedule {
                 // Map sin output [-1, 1] -> [0, 1] then to [min, max]
                 let amp = (max - min) / 2.0;
                 let mid = (max + min) / 2.0;
-                let angle = (2.0 * std::f64::consts::PI) * cycles * t + phase;
+                let angle = (2.0 * std::f64::consts::PI) * (*cycles) * t + *phase;
                 let v = mid + amp * angle.sin();
                 clamp01(v)
+            }
+            ProbSchedule::Stepwise { segments } => {
+                for (end_at, v) in segments {
+                    if t <= *end_at {
+                        return clamp01(*v);
+                    }
+                }
+                segments.last().map(|(_, v)| clamp01(*v)).unwrap_or(0.0)
             }
         }
     }
@@ -94,6 +215,8 @@ impl ProbSchedule {
 
 #[derive(Debug, Clone)]
 pub struct GenConfig {
+    pub op_profile: OpProfile,
+
     /// Probability schedule: INSERT attempts a constraint error.
     pub insert_attempt_constraint_error: ProbSchedule,
 
@@ -109,19 +232,20 @@ pub struct GenConfig {
     /// Probability schedule: UPDATE targets a missing/random PK (i.e. update maybe-nonexistent).
     pub update_target_missing_pk: ProbSchedule,
 
-    /// Probability schedule: weight for selecting INSERT vs UPDATE vs DELETE (can vary over time).
+    /// Weight schedules for selecting INSERT vs UPDATE vs DELETE (vary over time).
     pub w_insert: ProbSchedule,
     pub w_update: ProbSchedule,
     pub w_delete: ProbSchedule,
 }
 
 /// Draw a startup config by randomizing schedules once.
-fn gen_startup_config() -> GenConfig {
+fn gen_startup_config(op_profile: OpProfile) -> GenConfig {
     // Helper to pick one of the schedule shapes at startup.
     // Shapes:
     // - Constant: never changes.
     // - Ramp: increases or decreases over time.
     // - Triangle: increases then decreases.
+    // - Sin: smooth oscillation.
     fn pick_schedule(min_p: f64, max_p: f64) -> ProbSchedule {
         let min_p = clamp01(min_p);
         let max_p = clamp01(max_p);
@@ -133,7 +257,7 @@ fn gen_startup_config() -> GenConfig {
 
         // Helper to sample in [lo, hi]
         let sample = || lo + (hi - lo) * ((get_random() % 1000) as f64 / 999.0);
-        // Enforce a minimum delta so ramps/triangles don't become "almost constant".
+        // Enforce a minimum delta so ramps don't become "almost constant".
         let min_delta = (hi - lo) * 0.15;
 
         match get_random() % 4 {
@@ -190,6 +314,89 @@ fn gen_startup_config() -> GenConfig {
         }
     }
 
+    fn weights_insert_to_modify_80() -> (ProbSchedule, ProbSchedule, ProbSchedule) {
+        let switch_at = 0.80;
+        let w_insert = ProbSchedule::Stepwise {
+            segments: vec![(switch_at, 90.0), (1.0, 10.0)],
+        };
+        let w_update = ProbSchedule::Stepwise {
+            segments: vec![(switch_at, 5.0), (1.0, 45.0)],
+        };
+        let w_delete = ProbSchedule::Stepwise {
+            segments: vec![(switch_at, 5.0), (1.0, 45.0)],
+        };
+        (w_insert, w_update, w_delete)
+    }
+
+    fn weights_insert_then_delete_80() -> (ProbSchedule, ProbSchedule, ProbSchedule) {
+        let switch_at = 0.80;
+        let w_insert = ProbSchedule::Stepwise {
+            segments: vec![(switch_at, 95.0), (1.0, 10.0)],
+        };
+        let w_update = ProbSchedule::Stepwise {
+            segments: vec![(switch_at, 4.0), (1.0, 5.0)],
+        };
+        let w_delete = ProbSchedule::Stepwise {
+            segments: vec![(switch_at, 1.0), (1.0, 85.0)],
+        };
+        (w_insert, w_update, w_delete)
+    }
+
+    fn weights_fill_then_churn_80() -> (ProbSchedule, ProbSchedule, ProbSchedule) {
+        let switch_at = 0.80;
+        let w_insert = ProbSchedule::Stepwise {
+            segments: vec![(switch_at, 95.0), (1.0, 5.0)],
+        };
+        let w_update = ProbSchedule::Stepwise {
+            segments: vec![(switch_at, 3.0), (1.0, 60.0)],
+        };
+        let w_delete = ProbSchedule::Stepwise {
+            segments: vec![(switch_at, 2.0), (1.0, 35.0)],
+        };
+        (w_insert, w_update, w_delete)
+    }
+
+    fn weights_delete_storm() -> (ProbSchedule, ProbSchedule, ProbSchedule) {
+        (
+            ProbSchedule::Constant { p: 5.0 },
+            ProbSchedule::Constant { p: 10.0 },
+            ProbSchedule::Constant { p: 85.0 },
+        )
+    }
+
+    fn weights_update_storm() -> (ProbSchedule, ProbSchedule, ProbSchedule) {
+        (
+            ProbSchedule::Constant { p: 10.0 },
+            ProbSchedule::Constant { p: 85.0 },
+            ProbSchedule::Constant { p: 5.0 },
+        )
+    }
+
+    fn weights_oscillating_write_mix() -> (ProbSchedule, ProbSchedule, ProbSchedule) {
+        let two_pi = 2.0 * std::f64::consts::PI;
+        let base = |phase: f64| ProbSchedule::Sin {
+            min: 5.0,
+            max: 95.0,
+            cycles: 1.0,
+            phase,
+        };
+        (base(0.0), base(two_pi / 3.0), base(2.0 * two_pi / 3.0))
+    }
+
+    fn weights_ramping_deletes() -> (ProbSchedule, ProbSchedule, ProbSchedule) {
+        (
+            ProbSchedule::Ramp {
+                start: 90.0,
+                end: 10.0,
+            },
+            ProbSchedule::Constant { p: 10.0 },
+            ProbSchedule::Ramp {
+                start: 0.0,
+                end: 80.0,
+            },
+        )
+    }
+
     // Keep ranges reasonable; tweak as desired.
     let insert_attempt_constraint_error = pick_schedule(0.00, 0.30);
     let insert_reuse_existing_pk_on_error = pick_schedule(0.30, 0.90);
@@ -197,15 +404,26 @@ fn gen_startup_config() -> GenConfig {
     let delete_target_missing_pk = pick_schedule(0.00, 0.20);
     let update_target_missing_pk = pick_schedule(0.00, 0.20);
 
-    // Operation-selection weights.
-    // These are stored as schedules so they can be constant or time-varying, and are chosen at startup.
-    //
-    // We intentionally use a "weight" range (not necessarily summing to 1.0). The picker uses them proportionally.
-    let w_insert = pick_schedule(1.0, 100.0);
-    let w_update = pick_schedule(1.0, 100.0);
-    let w_delete = pick_schedule(1.0, 100.0);
+    // Operation-mix schedules:
+    // - Default is a fully random schedule per operation
+    // - Named profiles are handcrafted and selectable via --op-profile
+    let (w_insert, w_update, w_delete) = match op_profile {
+        OpProfile::RandomSchedule => (
+            pick_schedule(1.0, 100.0),
+            pick_schedule(1.0, 100.0),
+            pick_schedule(1.0, 100.0),
+        ),
+        OpProfile::InsertToModify80 => weights_insert_to_modify_80(),
+        OpProfile::InsertThenDelete80 => weights_insert_then_delete_80(),
+        OpProfile::FillThenChurn80 => weights_fill_then_churn_80(),
+        OpProfile::DeleteStorm => weights_delete_storm(),
+        OpProfile::UpdateStorm => weights_update_storm(),
+        OpProfile::OscillatingWriteMix => weights_oscillating_write_mix(),
+        OpProfile::RampingDeletes => weights_ramping_deletes(),
+    };
 
     GenConfig {
+        op_profile,
         insert_attempt_constraint_error,
         insert_reuse_existing_pk_on_error,
         insert_steal_unique_value_on_error,
@@ -741,9 +959,9 @@ fn generate_random_statement(
     let table = &schema.tables[get_random() as usize % schema.tables.len()];
 
     // Profile-controlled weights (may vary over time).
-    let w_insert = cfg.w_insert.value_at(progress_0_1);
-    let w_update = cfg.w_update.value_at(progress_0_1);
-    let w_delete = cfg.w_delete.value_at(progress_0_1);
+    let w_insert = cfg.w_insert.weight_at(progress_0_1);
+    let w_update = cfg.w_update.weight_at(progress_0_1);
+    let w_delete = cfg.w_delete.weight_at(progress_0_1);
 
     let sum = w_insert + w_update + w_delete;
     let roll = (get_random() as f64 / u64::MAX as f64) * sum;
@@ -876,8 +1094,10 @@ fn generate_plan(opts: &Opts) -> Result<Plan, Box<dyn std::error::Error + Send +
         schema
     };
 
+    let op_profile = OpProfile::parse(&opts.op_profile).unwrap_or_else(|e| panic!("{e}"));
+
     // Choose randomized generator behavior once at startup (per run).
-    let gen_cfg = gen_startup_config();
+    let gen_cfg = gen_startup_config(op_profile);
     println!("Generator config: {gen_cfg:?}");
 
     // Per-thread expected state (kept in-memory during plan generation).
@@ -1135,20 +1355,14 @@ async fn async_main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
 
     let vfs_option = opts.vfs.clone();
 
-    for thread in 0..opts.nr_threads {
-        let db_file = db_file.clone();
-        let mut builder = Builder::new_local(&db_file);
-        if let Some(ref vfs) = vfs_option {
-            builder = builder.with_io(vfs.clone());
-        }
-        let db = Arc::new(Mutex::new(builder.build().await?));
-        let plan = plan.clone();
+    let db_file = db_file.clone();
+    let mut builder = Builder::new_local(&db_file);
+    if let Some(ref vfs) = vfs_option {
+        builder = builder.with_io(vfs.clone());
+    }
+    let db = Arc::new(Mutex::new(builder.build().await?));
+    {
         let conn = db.lock().await.connect()?;
-
-        conn.busy_timeout(std::time::Duration::from_millis(opts.busy_timeout))?;
-
-        conn.execute("PRAGMA data_sync_retry = 1", ()).await?;
-
         // Apply each DDL statement individually
         for stmt in &plan.ddl_statements {
             if opts.verbose {
@@ -1170,6 +1384,16 @@ async fn async_main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
                 }
             }
         }
+    }
+
+    for thread in 0..opts.nr_threads {
+        let plan = plan.clone();
+        let conn = db.lock().await.connect()?;
+        let db_file = db_file.clone();
+
+        conn.busy_timeout(std::time::Duration::from_millis(opts.busy_timeout))?;
+
+        conn.execute("PRAGMA data_sync_retry = 1", ()).await?;
 
         let nr_iterations = plan.nr_iterations;
         let db = db.clone();
