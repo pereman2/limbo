@@ -1,75 +1,58 @@
-# p99 CONF: Turso MVCC + io_uring — slide plan
+# p99 CONF: Turso MVCC + io_uring — slide plan (18–20 min)
 
 **Working title:** Concurrent writes in a SQLite-compatible engine: row-level MVCC, io_uring, and tail latency
 
-**Length:** ~25–30 minutes, ~1 slide per minute (28 slides including title/close). Cut slides 21–23 if the room is engine-only; keep them if you want the Cloud punchline.
+**Slot:** 18–20 minutes, **pre-recorded in September**. No live Q&A. Target **16 slides** (~70–80s average). Record to ~19:00, leave 60s of trim room.
 
-**Story:** SQLite is fast and simple, but one writer. WAL already solved read/write concurrency with page versions. Turso adds write/write concurrency with row-level MVCC (`BEGIN CONCURRENT`, snapshot isolation, commit-time certification). Durability is a logical log flushed through a cooperative async I/O stack (`io_uring`) so writers are not parked on `fsync`. That same yield model is what lets a single-threaded multi-tenant server multiplex many databases and sync `.db-log` + `.db` to S3 as segments. Then: what it did to p99 write latency.
+**Story:** SQLite is fast, but one writer. WAL solved read/write concurrency, not write/write. Turso adds row-level MVCC (`BEGIN CONCURRENT`, snapshot isolation, commit-time certification). Commits append a logical log flushed with cooperative `io_uring`, so writers are not parked on `fsync`. That yield model is also how a single-threaded multi-tenant server syncs `.db-log` + `.db` to S3 as segments. Then: p99 write latency under concurrent load.
 
-**Sources for this plan**
-
-- Engine: current `tursodatabase/turso` (`core/mvcc/`, `core/io/io_uring.rs`, `core/vdbe/`, `sync/engine/`).
-- This workspace (`pereman2/limbo`) is the 2024 Limbo prototype: read-only SQLite file format + `io_uring` `pread`. Useful as the *origin story* of the async I/O stack, not as the MVCC implementation.
-- Cloud: public durability / diskless posts + the user description of turso-server (single-threaded, multi-tenant, S3 sync of logical log and `.db` through segments).
-- **`tursodatabase/turso-server` is private** (clone returned “repository not found” with the available GitHub token). Server slides are therefore labeled *inferred from engine interfaces + public Cloud posts + your description*. Fill speaker notes from the real server once you have that tree open.
+**Sources:** current `tursodatabase/turso` (`core/mvcc/`, `core/io/io_uring.rs`, `sync/engine`). This repo is the 2024 Limbo `io_uring` prototype, not the MVCC code. `turso-server` is private — slide 11 is inferred; fill from that tree before recording.
 
 ---
 
-## Talk spine (what the audience should remember)
+## Talk spine (four sentences)
 
-1. SQLite WAL = many readers + **one writer**. The exclusive write lock is a p99 problem, not just a throughput problem.
-2. SQLite’s experimental `BEGIN CONCURRENT` still certifies at **page** granularity. Turso certifies at **row** granularity (Hekaton-style MVCC).
-3. Commits do not write B-tree pages. They append a **logical log** (`.db-log`). Checkpoint later materializes into the SQLite file. That split is the hard part, and also the Cloud sync unit.
-4. The engine is **cooperatively async** (`IOResult` / VDBE yield), not Tokio-on-the-hot-path. On Linux, `UringIO` batches durability work so a writer is not stalled in `fsync`.
-5. That yield model is why a **single-threaded multi-tenant** server can host many DBs: one thread, many connections, I/O completions instead of blocking syscalls. Logical log + `.db` go to S3 as **segments**.
+1. The exclusive write lock is a **p99** problem: queueing, not disk.
+2. Turso certifies at **row** grain; SQLite’s `BEGIN CONCURRENT` branch was still **page** grain.
+3. Commit = **logical log** + async flush; the SQLite file is a **checkpoint**.
+4. **io_uring + VDBE yield** keeps durability off the writer — and fits one thread, many tenants.
 
 ---
 
-## Act 1 — SQLite’s single writer (slides 1–6, ~6 min)
+## Timing
 
-### Slide 1 — Title
+| Min | Slides | Beat |
+|-----|--------|------|
+| 0:00–0:20 | 1 | Title |
+| 0:20–3:00 | 2–3 | SQLite single writer + WAL |
+| 3:00–10:00 | 4–7 | MVCC |
+| 10:00–13:30 | 8–9 | Hard parts |
+| 13:30–16:00 | 10–11 | io_uring + server |
+| 16:00–18:30 | 12–14 | Eval placeholders |
+| 18:30–19:30 | 15–16 | Limits + takeaways |
+
+If the recording is running long at slide 7, skip the SQLite-compat bullets on slide 9 (keep conflicts only). If short, spend the extra on slide 13 (hero chart).
+
+---
+
+## Act 1 — The lock (slides 1–3, ~3 min)
+
+### Slide 1 — Title (~20s)
 
 **On slide**
 
 - Concurrent writes in SQLite’s shadow
-- Turso: row-level MVCC + io_uring
-- What it did to p99 write latency
-- p99 CONF / your name / Turso
+- Row-level MVCC + io_uring
+- What that did to p99 write latency
+- Name / Turso / p99 CONF
 
-**Speak:** One sentence of setup: we rewrote SQLite in Rust, then we had to make writes concurrent *and* keep tail latency boring.
+**Speak:** One sentence: we rewrote SQLite in Rust to get concurrent writers without giving up the file, then made durability async so tails stay boring.
 
----
-
-### Slide 2 — Agenda (keep it short)
-
-**On slide**
-
-1. SQLite’s single-writer lock
-2. Row-level MVCC (`BEGIN CONCURRENT`)
-3. The hard parts (checkpoint, conflicts, compatibility)
-4. io_uring: durability without stalling writers
-5. One thread, many tenants, S3 segments
-6. Evaluation (numbers TBD)
-
-**Speak:** Promise the eval up front so people know this is a p99 talk, not a product pitch.
+No agenda slide. The three subtitle lines *are* the agenda.
 
 ---
 
-### Slide 3 — SQLite is the right database, except…
-
-**On slide**
-
-- In-process, one file, no server, battle-tested
-- Fast: ~150k durable rows/s with batching (full sync) is not the issue
-- The issue: **one writer at a time**
-
-**Visual:** A single file → many readers OK / writers in a queue.
-
-**Speak:** Do not dunk on SQLite. The audience loves it. Frame this as “the last remaining tax.”
-
----
-
-### Slide 4 — Single-writer transactions (the problem slide)
+### Slide 2 — Single-writer transactions (~90s)
 
 **On slide**
 
@@ -79,88 +62,48 @@ BEGIN;          -- exclusive writer
 COMMIT;         -- everyone else waited
 ```
 
-- Second writer: `SQLITE_BUSY` / `database is locked`
-- Adding threads does **not** add write throughput
-- Interactive txns (read → compute → write) hold the lock for the whole compute window
+- Second writer: `SQLITE_BUSY`
+- More threads ≠ more writes
+- Interactive txns hold the lock for the *compute*, not just the SQL
 
-**Visual:** Timeline: Writer A occupies the lock for 1ms of SQL + 5ms of app logic. Writers B–H are blocked. p99 is dominated by queueing, not disk.
+**Visual:** Writer A occupies the lock for 1ms SQL + 5ms app logic. B–H queued. p99 is the queue.
 
-**Speak:** This is the slide you asked for. Spend a full minute. Emphasize *blocking behavior*, not just “SQLite is slow” (it isn’t). Cite the Turso concurrent-writes blog: with 1ms of compute in the txn, throughput collapses and extra threads do nothing.
-
-**Code / facts**
-
-- SQLite WAL: N readers + 1 writer. Rollback journal: even readers block.
-- `SQLITE_BUSY` is the production API for this lock.
+**Speak:** Do not dunk on SQLite — it is fast (~150k durable rows/s batched, FULL). The tax is **one writer**. This is the problem the rest of the talk solves. Cite the compute-in-txn collapse: extra cores do nothing while the lock is held.
 
 ---
 
-### Slide 5 — WAL already did page-level versioning
+### Slide 3 — WAL is not write/write concurrency (~50s)
 
 **On slide**
 
 - WAL = page versions in `.db-wal`
-- Readers take a **read mark**; they do not see in-flight writer pages
-- Result: **read/write concurrency, not write/write concurrency**
+- Readers take a read mark → they do not see in-flight writer pages
+- Result: **read/write yes, write/write no**
 
-**Visual:** Two columns: “Reader snapshot (old pages)” vs “Writer (new WAL frames)”. Caption: still one writer.
+**Visual:** two columns — reader snapshot vs single writer appending frames.
 
-**Speak:** Steal this from the abstract. A lot of people think WAL already solved concurrent writes. It solved concurrent *reads during a write*.
-
----
-
-### Slide 6 — Why this is a p99 talk
-
-**On slide**
-
-- Mean write time can look fine (one fast writer)
-- Tail = lock wait + `fsync` + checkpoint
-- Edge / embedded / agents: you wanted SQLite’s simplicity **and** predictable tails
-
-**Visual:** Cartoon latency histogram: p50 in the noise, p99 in the lock queue.
-
-**Speak:** Set the metric you will return to: **p99 commit latency under concurrent writers**, durable (`synchronous=FULL`). Throughput is supporting evidence.
+**Speak:** A lot of this audience thinks WAL already solved concurrent writes. Steal the abstract: page-level versioning for readers, still one writer.
 
 ---
 
-## Act 2 — MVCC (slides 7–16, ~10 min)
+## Act 2 — MVCC (slides 4–7, ~7 min)
 
-### Slide 7 — SQLite `BEGIN CONCURRENT` (the almost)
+### Slide 4 — Page OCC vs row OCC (~60s)
 
 **On slide (table)**
 
-| | SQLite default | SQLite BEGIN CONCURRENT branch | Turso |
+| | SQLite | SQLite `BEGIN CONCURRENT` branch | Turso |
 |---|---|---|---|
 | Writers | 1 | optimistic N | optimistic N |
-| Lock moment | BEGIN | COMMIT | COMMIT |
-| Conflict grain | whole DB | **page** | **row** |
-| Shipped? | yes | experimental, never merged | engine + Cloud preview |
+| Lock | BEGIN | COMMIT | COMMIT |
+| Conflict | whole DB | **page** | **row** |
+| Shipped | yes | never merged | engine + Cloud preview |
 
-**Speak:** Two txns updating different rows on the same B-tree page still collide in SQLite’s branch. That is why page-level OCC is not enough for small-row OLTP.
-
----
-
-### Slide 8 — Turso: Hekaton-style MVCC on a SQLite file
-
-**On slide**
-
-- Inspired by Larson et al., VLDB 2011 (Hekaton)
-- In-memory version chains, optimistic writers, **first-committer-wins**
-- Isolation: **snapshot isolation** (not serializable — say this out loud)
-- Layered on the existing B-tree + WAL, not a greenfield store
-
-**Visual:** `MvStore` sitting on top of pager/WAL/DB.
-
-**Code**
-
-- `core/mvcc/mod.rs` — paper citation + anomaly list
-- `core/mvcc/database/mod.rs` — `MvStore`, `RowVersion`, commit SM
-- Enable: `PRAGMA journal_mode = mvcc;` then `BEGIN CONCURRENT;`
-
-**Speak:** We did not invent MVCC. We adapted a main-memory OCC design to a SQLite-compatible on-disk format.
+**Speak:** Two txns on different rows that share a B-tree page still collide in SQLite’s branch. That is why we went to Hekaton-style MVCC (Larson et al., VLDB 2011): snapshot isolation, first-committer-wins, `PRAGMA journal_mode = mvcc` then `BEGIN CONCURRENT`. Say SI out loud — not serializable.
 
 ---
 
-### Slide 9 — Architecture: three tiers
+### Slide 5 — Three tiers (~75s)
 
 **On slide**
 
@@ -168,426 +111,230 @@ COMMIT;         -- everyone else waited
 BEGIN CONCURRENT
         │
         ▼
-   MvStore (SkipMap of row version chains)   ← hot path
+   MvStore (row version chains)     ← hot path
         │ commit
         ▼
-   logical log (.db-log)                     ← durability
+   logical log (.db-log)            ← durability
         │ checkpoint
         ▼
-   B-tree pages → WAL → .db                  ← SQLite file
+   B-tree → WAL → .db               ← SQLite file
 ```
 
-**Speak:** Writes during the txn never touch the B-tree. That is why they do not take the SQLite write lock. The B-tree is the checkpoint/recovery image, not the commit path.
-
-**Code**
-
-- Dual-cursor reads: `core/mvcc/cursor.rs` (merge MvStore + B-tree)
-- If the row is in MvStore, that version wins (all writes go through MVCC)
+**Speak:** Writes during the txn never touch the B-tree, so they never take the SQLite write lock. Dual-cursor reads merge MvStore + B-tree (`core/mvcc/cursor.rs`). The `.db` is the checkpoint/recovery image, not the commit path. That split is also the Cloud sync split (slide 11).
 
 ---
 
-### Slide 10 — Version chains (the picture people will photograph)
+### Slide 6 — Version chains (~75s)
 
-**On slide** — inventory example from the Oct 2025 blog:
+**On slide**
 
 ```
 products
-  row 1 "Mug"
-    v1  begin=T1  end=T3
-    v2  begin=T3  end=∞
-  row 2 "Teapot"
-    v1  begin=T2  end=∞
+  Mug     v1 [T1, T3)   v2 [T3, ∞)
+  Teapot  v1 [T2, ∞)
 ```
 
-- `begin` / `end` packed as TxID (uncommitted) or Timestamp (committed)
-- Visibility: version visible if `begin ≤ snapshot < end`
-- Speculative reads of `Preparing` versions + **commit dependencies** (Hekaton §2.7)
+- Visible if `begin ≤ snapshot < end`
+- Uncommitted versions carry a TxID; commit rewrites to a timestamp
+- `Preparing(end_ts)` published **under the clock lock** (SI)
+- Speculative reads + commit dependencies (Hekaton §2.7)
 
-**Code**
+**Speak:** T2 inserting Teapot does not wait for T3 updating Mug. This is the photograph slide — keep it visually clean.
 
-- `RowVersion` in `core/mvcc/database/mod.rs`
-- `MvccClock`: commit timestamp published as `Preparing(ts)` **under the clock lock** so a reader cannot observe a torn snapshot
-
-**Speak:** This is snapshot isolation. T3’s update of Mug does not block T2 inserting Teapot.
+**Code:** `RowVersion` + `MvccClock` in `core/mvcc/database/mod.rs` / `clock.rs`.
 
 ---
 
-### Slide 11 — `BEGIN CONCURRENT` lifecycle
+### Slide 7 — Commit: certify, then log (~90s)
 
 **On slide**
 
-1. Assign `begin_ts` from the logical clock (no pager write lock)
-2. DML appends a new `RowVersion { begin: TxID(self), end: None }` — **no conflict check**
-3. Track write set (and reads that matter for SI)
-4. COMMIT → certification (next slide)
+1. `end_ts`, atomically `Preparing`
+2. Certify write set (row + index) — walk version chains
+3. Append `.db-log` (row ops, not pages) + fsync if FULL
+4. Publish timestamps
 
-**Speak:** Pure optimistic. Two txns may insert the same rowid; first committer wins. Quote the comment in `insert()`: *“We do NOT check for conflicts at insert time.”*
+- No conflict check at insert (pure optimistic)
+- WW conflict → `SQLITE_BUSY` → retry from `BEGIN CONCURRENT`
+- Commit I/O scales with **dirty rows**, not dirty pages
+- Yield every 1024 rowids so one fat commit does not freeze the executor
 
-**SQLite-compat note:** one active txn per connection. Concurrency = **multiple connections**, not interleaved statements.
-
----
-
-### Slide 12 — Commit-time certification
-
-**On slide — commit state machine (compressed)**
-
-1. Prepare: `end_ts`, atomically `Preparing(end_ts)`
-2. Gates: exclusive txn? schema cookie changed?
-3. **Certify write set** (row + index): walk version chain backwards
-4. Wait commit dependencies
-5. Append + (optional) fsync logical log
-6. Publish: rewrite TxIDs → timestamps, notify dependents
-7. Maybe auto-checkpoint / incremental GC
-
-**Conflict:** `LimboError::WriteWriteConflict` → `SQLITE_BUSY`. Retry from `BEGIN CONCURRENT`.
-
-**Code**
-
-- `CommitStateMachine` in `core/mvcc/database/mod.rs`
-- Batch/yield every 1024 rowids so a huge commit does not monopolize the executor (`MVCC_COMMIT_BATCH_SIZE`)
-
-**Speak:** Certification is the only serialization point that *must* be right. Lower `end_ts` wins if two txns are both `Preparing`.
+**Speak:** This is the whole MVCC punchline in one slide. Logical log torn-tail = EOF, same availability idea as WAL. `DurableStorage::on_log_write_complete` is where Cloud can wait on S3 without changing certification.
 
 ---
 
-### Slide 13 — Logical log: the real commit record
+## Act 3 — Hard parts (slides 8–9, ~3.5 min)
+
+### Slide 8 — Checkpoint (~90s)
+
+**On slide — crash-safe order**
+
+1. Write versions into pager (WAL)
+2. Commit pager txn **with** `persistent_tx_ts_max`
+3. WAL → DB, fsync DB
+4. Truncate logical log
+5. **Truncate WAL last**
+
+- Default checkpoint is **stop-the-world** (p99 cliff)
+- Passive checkpoint (experimental): I/O unlocked, short publish window
+- Recovery replays only `commit_ts > persistent_tx_ts_max`
+
+**Speak:** This is *the* hard part. Get the order wrong and recovery lies. Blocking checkpoint on a busy writer set is visible as latency spikes — `perf/checkpoint-bench` exists to plot that. Four artifacts: `.db` / `.db-wal` / `.db-log` / meta row.
+
+---
+
+### Slide 9 — Conflicts + SQLite compatibility (~60s)
 
 **On slide**
 
-- File: `.db-log` (header 56B + TX frames)
-- Frame: header (commit_ts, op_count) + upsert/delete ops + CRC trailer
-- Torn tail = EOF (SQLite WAL prefix semantics)
-- `synchronous=FULL` → fsync this file on commit
-- This is **logical** (row ops), not page images
+- Distinct rows → both commit (even same B-tree page)
+- Hot row → real WW conflict, retry (ACID, not a bug)
+- `BEGIN IMMEDIATE` / DDL: concurrent txns run, **cannot commit**
+- One txn per connection; concurrency = many connections
+- SI, not serializable (phantoms / write skew still TODO)
 
-**Why it matters for p99:** commit I/O size scales with dirty rows, not dirty B-tree pages.
-
-**Why it matters for Cloud:** this file is what you can ship as a sync stream / S3 object, independently of the `.db` generation.
-
-**Code**
-
-- `core/mvcc/persistent_storage/logical_log.rs` (format + durability contract)
-- `DurableStorage::log_tx` / `on_log_write_complete` — hook for extra durability (the Cloud server can wait on S3 here without changing certification)
+**Speak:** “Do I still need retry?” Yes — less of it. Queueing on `BEGIN` is gone. Compatibility is why we still speak `SQLITE_BUSY` and still checkpoint into a SQLite file. Skip the last two bullets if time is tight.
 
 ---
 
-### Slide 14 — Hard part: checkpointing
+## Act 4 — io_uring + the server (slides 10–11, ~2.5 min)
 
-**On slide — crash-safe order** (from `RECOVERY_SEMANTICS.md`)
-
-1. Stop-the-world lock (TRUNCATE) *or* unlocked I/O + short publish (PASSIVE, experimental)
-2. Write versions into pager (WAL)
-3. Commit pager txn **including** `__turso_internal_mvcc_meta.persistent_tx_ts_max`
-4. WAL → DB file, fsync DB
-5. Truncate logical log, fsync log
-6. **Truncate WAL last** (safety net)
-
-**p99 hook:** blocking checkpoint is a tail-latency cliff. `perf/checkpoint-bench` exists specifically to plot that cliff vs passive mode.
-
-**Speak:** Checkpoint is where MVCC meets SQLite compatibility. Get the order wrong and recovery lies. The metadata watermark is the replay boundary: recover only frames with `commit_ts > persistent_tx_ts_max`.
-
-**Visual:** Four artifacts: `.db` / `.db-wal` / `.db-log` / meta row.
-
----
-
-### Slide 15 — Hard part: conflict handling
-
-**On slide**
-
-- Hot row → genuine WW conflict, retry (this is ACID, not a bug)
-- Distinct rows → both commit (even if they share a B-tree page)
-- Exclusive `BEGIN IMMEDIATE` / DDL: concurrent txns may run but **cannot commit**
-- Schema cookie mismatch → `SchemaConflict`
-- Preparing writer aborted → dependents abort (`CommitDependencyAborted`)
-
-**Speak:** “Do I still need retry logic?” Yes — less of it. Queueing on `BEGIN` is gone; remaining retries are real row conflicts. Show the two-connection `accounts` example from `docs/sql-reference/statements/transactions.mdx`.
-
----
-
-### Slide 16 — Hard part: SQLite compatibility
-
-**On slide (honest list)**
-
-- Same file format after checkpoint; MVCC writes are invisible if you reopen without MVCC until checkpointed
-- DDL / header updates still want exclusive txn
-- One txn per connection (SQLite-shaped API)
-- SI, not serializable (phantoms / write skew still TODO in `core/mvcc/mod.rs`)
-- Manual still says “indexes don’t work” in places — **code has index version chains**. Don’t read stale `docs/agent-guides/mvcc.md` on stage (it also claims recovery/GC are missing; both exist)
-
-**Speak:** Compatibility is a product constraint, not a footnote. Every Cloud customer has SQLite muscle memory.
-
----
-
-## Act 3 — io_uring (slides 17–20, ~5 min)
-
-### Slide 17 — `fsync` is the other p99 villain
-
-**On slide**
-
-- SQLite FULL: `fsync` WAL (and sometimes more) on every commit
-- ~2ms local NVMe fsync is already a tail contributor
-- A blocked writer holds the *SQLite* write lock → everyone pays
-- MVCC removes the lock; **blocking I/O would still serialize the thread**
-
-**Speak:** Concurrent certification is useless if the commit path does `pwrite`+`fsync` synchronously on the only executor.
-
----
-
-### Slide 18 — Cooperative completions, not async/await
+### Slide 10 — Durability without stalling writers (~90s)
 
 **On slide**
 
 ```rust
-enum IOResult<T> {
-    Done(T),
-    IO(IOCompletions),  // yield; caller drives io.step()
-}
+enum IOResult<T> { Done(T), IO(IOCompletions) }
 ```
 
-- VDBE `StepResult::IO` / `Yield`
-- Explicit state machines for commit + checkpoint
-- Completions keep write buffers alive until the kernel is done
+- VDBE yields; `io.step()` drives the ring (not Tokio on the hot path)
+- `UringIO`: 512 SQEs, SQPOLL, concurrent submit, **one leader** in `submit_and_wait`
+- `MAX_WAIT = 4` — fewer `io_uring_enter` vs a bit more single-op latency (p99 knob)
+- Writer is in the completion loop, **not** inside `fsync`
+- Other connections keep certifying while this commit’s CQEs are in flight
 
-**Code**
-
-- `core/types.rs` — `IOResult`
-- `docs/agent-guides/async-io-model.md`
-- `core/vdbe/mod.rs` — drive `io.step()` so other work is not starved
-
-**Speak:** This is the Limbo/EdgeSys ’24 idea, grown up. This workspace’s `core/io/linux.rs` was a 128-entry ring and `pread` only. Production `UringIO` is the same shape: submit, yield, complete.
-
-**Origin visual (optional):** tiny code snippet from this repo’s `LinuxIO::pread` vs today’s `UringIO`.
+**Speak:** MVCC without async I/O would still serialize the thread on durability. This is the Limbo/EdgeSys lineage grown up: this repo’s `LinuxIO` was `pread` only; production `core/io/io_uring.rs` is the same shape. Abstract sentence: *we flush durability work without stalling writers.*
 
 ---
 
-### Slide 19 — `UringIO` on Linux
+### Slide 11 — One thread, many tenants, S3 segments (~60s)
 
 **On slide**
 
-- 512-entry ring, **SQPOLL**, iovec pool, writev for contiguous pages
-- Threads may **submit concurrently**; **one leader** in `submit_and_wait` (Linux wakes a single waiter)
-- `MAX_WAIT = 4`: fewer `io_uring_enter` syscalls vs a bit more single-op latency — say this; it is a p99 knob
-- Unsupported opcodes (e.g. ftruncate) fall back to POSIX
+- turso-server: **single-threaded** event loop, many DBs
+- Yield + uring = multiplex tenants without a blocked `fsync`
+- `.db` as ~128kB **segments** (generation); lazy fetch
+- With tursodb: hot path syncs **logical log** frames; checkpointed `.db` segments are cold
+- Blocking checkpoint is lethal on one thread → passive mode is Cloud-relevant
 
-**Code:** `core/io/io_uring.rs` (leader/follower comments around the wait lock)
-
-**Visual:** SQ → kernel → CQ → `Completion::complete()` → waker → VDBE resumes commit SM.
-
----
-
-### Slide 20 — Durability without stalling writers
-
-**On slide**
-
-| Stage | What is flushed | When (FULL) |
-|---|---|---|
-| Commit | logical log append | per commit, async completion |
-| Checkpoint | DB file, then log | periodic |
-| NORMAL | skip commit fsync | checkpoint still fsyncs DB |
-
-- Writer thread is **not** inside `fsync`; it is in the io_uring wait/complete loop
-- Other connections keep certifying / executing while this commit’s CQEs are in flight
-- `DurableStorage::on_log_write_complete` is the Cloud hook: extra durability (S3 PUT) can be another completion, same state machine
-
-**Speak:** This is the sentence from the abstract: *“we flush durability work without stalling writers.”* Tie it back to p99: you want the wait *overlapped*, not *queued behind a lock*.
+**Speak:** “Single-threaded” here is a tail-latency choice, not a limitation. Label Cloud p99 separately later: local FULL fsync ~2ms vs batched S3 Express PUT ~6–7ms (diskless post). **Fill this slide from turso-server before recording** (event loop, batch window, exact PUT of log vs generation).
 
 ---
 
-## Act 4 — One thread, many tenants, S3 (slides 21–23, ~4 min)
+## Act 5 — Evaluation placeholders (slides 12–14, ~2.5 min)
 
-> Server internals inferred. Replace with turso-server screenshots/code when you have the private tree.
+Leave chart frames. Re-run in September; do not reuse the Oct 2025 4× throughput number as the p99 CONF figure.
 
-### Slide 21 — turso-server: single-threaded multi-tenant
+Harnesses: `perf/throughput`, `perf/checkpoint-bench`, `perf/latency`.
 
-**On slide**
+### Slide 12 — Method (~45s)
 
-- One process, many SQLite-compatible files
-- **Single-threaded event loop** (matches VDBE: one txn per connection, sequential opcodes)
-- Concurrency = many connections / many DBs, cooperative yield on I/O
-- Multi-tenant batching is also how S3 Express stays cheap (public diskless post)
+**On slide (fill)**
 
-**Speak:** People hear “single-threaded” and think “slow.” In this design, single-threaded is the *isolation and tail-latency* choice: no cross-tenant lock convoys on a thread pool, deterministic scheduling, io_uring as the parallelism.
-
-**Why MVCC matters here:** without concurrent writes, each DB still has a single writer, but *interactive* txns would block that DB’s other writers. With agents / many small DBs, that is the Cloud workload.
-
----
-
-### Slide 22 — Why the engine shape fits the server
-
-**On slide**
-
-```
-request → VDBE step
-            │ IOResult::IO
-            ▼
-     io_uring SQ  (maybe many tenants’ ops)
-            │
-            ▼
-     CQE → resume that connection only
-```
-
-- Shared `MvStore` per database, not per process
-- Commit SM yields every 1024 rows so one fat txn cannot freeze the loop
-- Blocking checkpoint is lethal on a 1-thread server → **passive checkpoint** is a Cloud-relevant eval
-
-**Speak:** This is the architectural punchline connecting Acts 2, 3, and 4.
+- Box / kernel / SQPOLL on?
+- `synchronous=FULL`
+- N connections, batch, keyspace, conflict rate
+- `BEGIN CONCURRENT` vs SQLite `BEGIN IMMEDIATE`
+- Local engine vs Cloud (S3) — pick one axis for the hero chart
 
 ---
 
-### Slide 23 — S3: logical log + `.db` as segments
-
-**On slide**
-
-- `.db` split into **~128kB segments** (generation = the set of segments that make a file)
-- Lazy fetch: serve a query without the whole file (public durability post)
-- **Before tursodb:** durable unit ≈ WAL frames, then checkpoint into `.db` segments
-- **With tursodb:** durable unit ≈ **logical log frames** (row ops) + checkpointed `.db` segments
-- S3 Express: ack commit after batched PUT; local NVMe is a write-through cache
-- Engine already has `RemotePullProtocol::MvccLogical` and generation/bootstrap catch-up (`sync/engine`)
-
-**Visual:** two object streams — `log` segments (hot, small, per-commit batched) and `db` segments (cold, after checkpoint).
-
-**Speak (your words):** “We add tursodb to a single-threaded multi-tenant server with S3 synchronization of the logical log and `.db` through segments.” That is this slide. If you can show a real segment layout from turso-server, do it here.
-
-**Eval implication:** p99 in Cloud = engine certify + log append + **batched S3 Express PUT** (~6–7ms in the diskless post), not local fsync (~2ms). Be explicit which number you are showing.
-
----
-
-## Act 5 — Evaluation placeholders (slides 24–27, ~4 min)
-
-Leave these as **chart frames**. Fill after you run the benches. Suggested harnesses already in-tree:
-
-- `perf/throughput/` — thread scaling + compute-in-txn vs rusqlite (`plot-thread-scaling.py`, `plot-compute-impact.py`)
-- `perf/checkpoint-bench` — TRUNCATE vs PASSIVE tail latency under concurrent BEGIN CONCURRENT
-- `perf/latency/` — p50–p999 tooling
-- Blog numbers (Oct 2025, treat as *historical*, re-measure): up to **4×** write throughput vs SQLite with 1ms compute @ 8 threads; SQLite still wins single-thread no-compute
-
-### Slide 24 — Methodology (placeholder)
-
-**On slide (fill in)**
-
-- Hardware / kernel / io_uring features (SQPOLL on?)
-- `PRAGMA synchronous = FULL` vs NORMAL
-- Workload: N connections, batch size, keyspace, conflict rate
-- Isolation: `BEGIN CONCURRENT` vs SQLite `BEGIN IMMEDIATE`
-- What is *not* measured (page cache cold vs warm, checkpoint on/off)
-
-**Speak:** p99 people will roast you if this slide is missing.
-
----
-
-### Slide 25 — Throughput vs SQLite (placeholder)
-
-**Chart:** rows/s vs thread count, with and without in-txn compute.
-
-**Expected shape (from blog, verify):** SQLite flat line; Turso rises until conflict or IO saturation.
-
-**Caption to write later:** “SQLite: more threads ≠ more writes. Turso: cores help until we hit row conflicts or durability.”
-
----
-
-### Slide 26 — Hero: p99 write latency under concurrent load (placeholder)
+### Slide 13 — Hero: p99 write latency (~90s)
 
 **Chart:** p50 / p99 / p999 commit latency vs #writers.
 
-**Series to include**
+**Series**
 
 1. SQLite WAL, FULL
 2. Turso MVCC, FULL, blocking checkpoint
-3. Turso MVCC, FULL, **passive** checkpoint
-4. Optional: Turso MVCC + io_uring vs POSIX fallback (prove the I/O claim)
+3. Turso MVCC, FULL, passive checkpoint
+4. Optional: io_uring vs POSIX fallback (proves slide 10)
 
-**Callouts you want the chart to make**
+**Callouts:** SQLite p99 grows with writer count (lock queue). MVCC stays flatter on a low-conflict keyspace. Blocking checkpoint injects spikes (time-series from `checkpoint-bench`).
 
-- SQLite p99 grows with writer count (lock queue)
-- MVCC p99 stays flatter on low-conflict keyspaces
-- Blocking checkpoint injects spikes (time-series from `checkpoint-bench`)
-- io_uring should cut the *stall* component, not the S3 RTT if this is Cloud
+This is the slide the recording should linger on.
 
 ---
 
-### Slide 27 — Secondary eval (placeholder, pick 1–2)
+### Slide 14 — Supporting charts (~60s)
 
-**Options (do not show all)**
+**On slide — two small charts, not a third eval act**
 
-- Conflict rate vs keyspace (hot row vs disjoint rows)
-- Checkpoint: logical log size over time (did checkpoint keep up?)
-- Compute-in-txn: the 4× slide, redrawn with **latency** not just throughput
-- Cloud: local FULL vs S3 Express batched PUT p99 (if you are telling the server story)
+- Left: rows/s vs threads ± in-txn compute (`perf/throughput`)
+- Right: checkpoint time-series, TRUNCATE vs PASSIVE
+
+**Speak:** Throughput is supporting evidence. The compute-in-txn plot is why MVCC exists; the checkpoint plot is why tails still spike if you stop the world.
 
 ---
 
-## Act 6 — Close (slides 28–30, ~2 min)
+## Act 6 — Close (slides 15–16, ~1 min)
 
-### Slide 28 — Limitations (trust slide)
+### Slide 15 — Limitations (~30s)
 
 **On slide**
 
-- Experimental; Cloud concurrent writes are an early preview
+- Experimental / Cloud early preview
 - SI, not serializable
-- Version GC / memory: full row copies, not deltas (blog future work)
-- Row-version vector still under a lock — not wait-free Hekaton
-- Blocking checkpoint still the default; passive is experimental
-- Multi-process MVCC not supported
+- Full-row versions, not deltas; version table not wait-free
+- Default checkpoint still blocking
+- No multi-process MVCC
 
-**Speak:** Don’t overclaim. p99 audience respects unfinished systems that know their cliffs.
+**Speak:** Trust slide. p99 audience respects unfinished cliffs.
 
 ---
 
-### Slide 29 — Takeaways
+### Slide 16 — Takeaways (~30s)
 
 **On slide**
 
-1. WAL solved readers. **Row-level MVCC** is how writers stop blocking each other.
-2. Commit is a **logical log** + certify; the SQLite file is a checkpoint.
-3. **io_uring + cooperative yield** keeps durability off the writer’s critical section — and fits a one-thread multi-tenant server.
+1. WAL solved readers. **Row-level MVCC** is how writers stop blocking.
+2. Commit is a **logical log**; the SQLite file is a checkpoint.
+3. **io_uring + yield** keeps durability off the critical section — and fits a one-thread multi-tenant server.
 4. Measure **p99 commit latency under concurrent load**, including checkpoint.
 
----
-
-### Slide 30 — Q&A / backup
-
-Backup slides (not in the 30-min cut):
-
-- B1: Full commit state machine
-- B2: Recovery case table from `docs/internals/mvcc/RECOVERY_SEMANTICS.md`
-- B3: Logical log frame layout (encrypted vs not)
-- B4: Dual-cursor merge
-- B5: `MAX_WAIT=4` / SQPOLL knobs
-- B6: Hekaton paper vs Turso deltas (clock lock, logical log, B-tree materialization)
-- B7: How to enable: `PRAGMA journal_mode=mvcc;` / Cloud `BEGIN CONCURRENT`
+No Q&A card (pre-recorded). End on takeaways; cut to black.
 
 ---
 
-## Timing cheat sheet
+## What we cut from the 30-slide draft (and where it went)
 
-| Min | Slides | Beat |
-|-----|--------|------|
-| 0–1 | 1–2 | Title, agenda |
-| 1–6 | 3–6 | SQLite + WAL + why p99 |
-| 6–16 | 7–16 | MVCC architecture + hard parts |
-| 16–21 | 17–20 | io_uring |
-| 21–25 | 21–23 | Server / S3 (or skip) |
-| 25–29 | 24–27 | Eval |
-| 29–30 | 28–30 | Limits, takeaways |
-
-If you only have 20 minutes: drop 21–23 and 27, keep 26 as the only chart.
+| Cut | Why | If you need it |
+|-----|-----|----------------|
+| Agenda | Title carries it | — |
+| “SQLite is great” | Folded into slide 2 | — |
+| Separate “why p99” | One line on slide 2 | — |
+| Separate lifecycle / logical-log / fsync slides | Folded into 7 and 10 | Appendix A |
+| Three Cloud slides | One slide (11) | Appendix B |
+| Fourth eval slide | Two charts on 14 | — |
+| Q&A | Pre-recorded | — |
 
 ---
 
-## Design notes for the actual deck
+## Appendix (not in the recording)
 
-- Dark slides, one idea each. Slide 10 (version chains) and 14 (checkpoint order) are the two diagrams worth making beautiful.
-- Do not paste Rust on stage except: `IOResult`, `BEGIN CONCURRENT`, and maybe the `MAX_WAIT` comment.
-- Every architecture slide should end with a **latency implication** (“this is why p99 does / doesn’t spike”).
-- Re-run `perf/throughput` and `perf/checkpoint-bench` close to the talk; the Oct 2025 4× number is a preview, not your p99 CONF figure.
-- `docs/agent-guides/mvcc.md` is stale. Prefer `docs/internals/mvcc/RECOVERY_SEMANTICS.md` and the source.
+Keep these as speaker-note backups if a chart needs a follow-up cut, not as extra slides.
+
+- **A.** Full commit state machine; log frame layout; dual-cursor merge; `MAX_WAIT` / SQPOLL.
+- **B.** Recovery case table (`docs/internals/mvcc/RECOVERY_SEMANTICS.md`); S3 Express batching; `RemotePullProtocol::MvccLogical`.
+- **C.** How to enable: `PRAGMA journal_mode=mvcc;` / Cloud `BEGIN CONCURRENT`.
+
+Do not quote `docs/agent-guides/mvcc.md` on stage — it is stale (claims recovery/GC/indexes are missing).
 
 ---
 
-## Open items before locking the deck
+## Open items before September recording
 
-1. Clone `turso-server` and replace Act 4 speaker notes with: event loop, tenant scheduling, exact segment size, when logical log is PUT vs when `.db` generation is PUT, batching window.
-2. Decide **local engine p99** vs **Cloud p99 (S3 Express)**. They are different talks; the abstract can cover both if you label axes.
-3. Fill slides 25–27 with real plots.
-4. Confirm current product names on stage: Turso (engine), Turso Cloud, `tursodb`, `BEGIN CONCURRENT`, `PRAGMA journal_mode=mvcc`.
+1. Fill slide 11 from `turso-server` (loop, segment PUT, batch window).
+2. Decide **local** vs **Cloud** for slide 13; do not mix axes on one chart.
+3. Produce plots for 13–14 from `perf/throughput` + `perf/checkpoint-bench`.
+4. Time a table read of slides 2→16; if over 19:30, drop slide 14’s left chart and the last two bullets of slide 9.
