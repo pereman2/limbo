@@ -332,6 +332,63 @@ Do not quote `docs/agent-guides/mvcc.md` on stage — it is stale (claims recove
 
 ---
 
+## Figma Slides — design lock (blocked on MCP auth)
+
+Figma MCP in this cloud run is `needsAuth`; interactive login only works in the Cursor desktop IDE. Build the 16-slide deck there after connecting Figma. Do not invent a second visual system — use this lock.
+
+**File:** new Slides file, name `p99 Turso MVCC`. Sections (rows): The lock | MVCC | Hard parts | I/O + server | Eval | Close.
+
+**Voice:** Latency talk, not a product pitch. Dark, precise, a little industrial. One idea per slide.
+
+**Palette (`C`)**
+
+- `bg` `#0B0C0E` — near-black graphite (title/close)
+- `bgMid` `#12141A` — content slides
+- `surface` `#1A1E28` — panels, SQL, chart wells
+- `text` `#F4F1EA` — body (high contrast, warm paper)
+- `muted` `#8B8A84` — labels, timing
+- `lock` `#E8A04A` — copper: contention, p99, lock, “the tax”
+- `flow` `#3ECFCF` — teal: concurrent path, io_uring, the fix
+- `danger` `#E85D4A` — WW conflict / BUSY only
+
+**Type:** IBM Plex Sans (Light titles, Regular body, Bold labels) + IBM Plex Mono for SQL/code. If Plex is missing, Geist + JetBrains Mono. Titles 56–96pt; body 22–28pt; labels 13–14pt tracking-wide. Left-align body. Never a line under a heading.
+
+**Motif:** a cropped **p99 histogram** — five vertical copper bars of rising height, bleeding off an edge. Title/close: large, top-right crop. Content slides: small mark bottom-left as a page tick. Architecture slides reuse the bars as stacked **tiers**. Do not fade it to 5% opacity.
+
+**Speaker notes:** copy the **Speak** bullets from each slide in this doc into `slide.speakerNotes` (markdown lists). This is a conference recording script.
+
+### Spatial plan (no pixel math)
+
+1. **Title** — dark `bg`. Huge Light title lower-left, three subtitle lines in muted + one copper phrase (“p99 write latency”). Histogram bleeds off top-right. Footer: p99 CONF · Turso.
+2. **Single writer** — `bgMid`. SQL block in `surface` left ~60%. Right: vertical stack of writer chips, A in copper occupying height, B–H muted and queued. Caption: “p99 is the queue.”
+3. **WAL** — two unequal columns. Left (wider): “readers / snapshot” in teal. Right (narrow): one writer chip + WAL frames. Big punchline bottom: read/write yes · write/write no.
+4. **Page vs row** — four-row comparison, three columns. Turso column sits on a teal surface; SQLite branch is quiet. Last row “Conflict” is the only loud row (page vs **row**).
+5. **Three tiers** — full-height stacked bands (MvStore / .db-log / B-tree), left labels, right one-word roles (hot / durable / file). Not a flowchart of boxes.
+6. **Version chains** — open. Two horizontal version tracks (Mug, Teapot) with `[T1,T3)` capsules. Visibility rule as a single line under the diagram. Photograph slide — almost no extra copy.
+7. **Certify + log** — four numbered steps as a left-to-right process (not a bullet list). One copper callout: “I/O ∝ dirty rows.”
+8. **Checkpoint** — vertical 1–5 with step 5 (“Truncate WAL last”) in copper, larger. Tiny note: blocking = p99 cliff.
+9. **Conflicts** — two big opposing statements, not five bullets: “Different rows → both commit” (teal, left) vs “Same row → retry” (copper, right). Three quiet compat lines under.
+10. **io_uring** — `IOResult` enum as the hero in mono, left. Right rail: five short facts. Teal accent. Histogram tick only.
+11. **One thread / S3** — one horizontal spine (event loop) with many small DB ticks hanging off it; two streams below (hot log / cold .db segments). Stamp: “fill from turso-server.”
+12. **Method** — sparse checklist, lots of air. Dashed copper “TBD” stamp.
+13. **Hero p99** — chart well dominates (~70% of canvas). Empty axes labeled writers × latency. Four series keys (SQLite / MVCC block / MVCC passive / uring). Linger slide.
+14. **Supporting** — two chart wells, not equal: left throughput, right checkpoint time-series. Both stamped TBD.
+15. **Limitations** — five short lines, generous leading, no cards.
+16. **Takeaways** — four numbered sentences, large Regular, 1–4 in copper. Histogram returns large, bottom-right crop. No Q&A.
+
+**Layout variety check:** title (open/dark) → diagram/queue → split columns → table → stacked bands → timeline → process → vertical steps → split statements → code hero → spine diagram → sparse list → chart → two charts → airy list → open close. Not a repeating title+bullets template.
+
+**Preamble to paste into every `use_figma` build script:** `C` as above (RGB 0–1), `Promise.all` load Plex Sans Light/Regular/Bold + Plex Mono Regular/Bold, plus `addFrame` / `addText` / `addRect` from slide-gotchas (appendChild before x/y). Batches of 3–5 slides. Overwrite the default light theme tokens on first script. Include speaker notes.
+
+### Build batches
+
+1. Theme + rows + slides 1–3 (screenshot title + slide 2)
+2. Slides 4–7
+3. Slides 8–11
+4. Slides 12–16 (screenshot 13 + 16); validate each batch
+
+---
+
 ## Open items before September recording
 
 1. Fill slide 11 from `turso-server` (loop, segment PUT, batch window).
