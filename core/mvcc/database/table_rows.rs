@@ -64,6 +64,7 @@ pub struct TableRows<A: ConcurrentAllocator> {
     ordered: RwLock<BTreeMap<RowID, RowVersions<A>>>,
 }
 
+#[derive(Clone)]
 pub struct TableRowRef<A: ConcurrentAllocator> {
     key: RowID,
     versions: RowVersions<A>,
@@ -79,11 +80,15 @@ impl<A: ConcurrentAllocator> TableRowRef<A> {
     }
 }
 
+const RANGE_BATCH: usize = 128;
+
 pub struct TableRowRange<A: ConcurrentAllocator> {
     rows: *const TableRows<A>,
     start: Bound<RowID>,
     end: Bound<RowID>,
     reverse: bool,
+    batch: Vec<TableRowRef<A>>,
+    batch_idx: usize,
 }
 
 unsafe impl<A: ConcurrentAllocator> Send for TableRowRange<A> {}
@@ -211,6 +216,8 @@ impl<A: ConcurrentAllocator> TableRows<A> {
             start: bound_cloned(bounds.start_bound()),
             end: bound_cloned(bounds.end_bound()),
             reverse: false,
+            batch: Vec::new(),
+            batch_idx: 0,
         }
     }
 }
@@ -220,34 +227,57 @@ impl<A: ConcurrentAllocator> TableRowRange<A> {
         self.reverse = !self.reverse;
         self
     }
+
+    fn fill_batch(&mut self) {
+        self.batch.clear();
+        self.batch_idx = 0;
+        // SAFETY: `rows` points at the `TableRows` inside `MvStore`. Cursors
+        // and checkpoint hold that store for the iterator's lifetime.
+        let rows = unsafe { &*self.rows };
+        let tree = rows.ordered.read();
+        if self.reverse {
+            for (key, versions) in tree
+                .range((self.start.clone(), self.end.clone()))
+                .rev()
+                .take(RANGE_BATCH)
+            {
+                self.batch.push(TableRowRef {
+                    key: key.clone(),
+                    versions: versions.clone(),
+                });
+            }
+        } else {
+            for (key, versions) in tree
+                .range((self.start.clone(), self.end.clone()))
+                .take(RANGE_BATCH)
+            {
+                self.batch.push(TableRowRef {
+                    key: key.clone(),
+                    versions: versions.clone(),
+                });
+            }
+        }
+        drop(tree);
+        if let Some(last) = self.batch.last() {
+            if self.reverse {
+                self.end = Bound::Excluded(last.key.clone());
+            } else {
+                self.start = Bound::Excluded(last.key.clone());
+            }
+        }
+    }
 }
 
 impl<A: ConcurrentAllocator> Iterator for TableRowRange<A> {
     type Item = TableRowRef<A>;
 
     fn next(&mut self) -> Option<Self::Item> {
-        // SAFETY: `rows` points at the `TableRows` inside `MvStore`. Cursors
-        // and checkpoint hold that store for the iterator's lifetime.
-        let rows = unsafe { &*self.rows };
-        let tree = rows.ordered.read();
-        let picked = if self.reverse {
-            tree.range((self.start.clone(), self.end.clone()))
-                .rev()
-                .next()
-                .map(|(key, versions)| (key.clone(), versions.clone()))
-        } else {
-            tree.range((self.start.clone(), self.end.clone()))
-                .next()
-                .map(|(key, versions)| (key.clone(), versions.clone()))
-        };
-        drop(tree);
-        let (key, versions) = picked?;
-        if self.reverse {
-            self.end = Bound::Excluded(key.clone());
-        } else {
-            self.start = Bound::Excluded(key.clone());
+        if self.batch_idx >= self.batch.len() {
+            self.fill_batch();
         }
-        Some(TableRowRef { key, versions })
+        let item = self.batch.get(self.batch_idx)?.clone();
+        self.batch_idx += 1;
+        Some(item)
     }
 }
 
