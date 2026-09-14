@@ -6,6 +6,7 @@ use crate::types::IOResultOr;
 use crate::mvcc::clock::LogicalClock;
 use crate::mvcc::database::{
     create_seek_range, MVTableId, MvStore, Row, RowID, RowKey, RowVersions, SortableIndexKey,
+    TableRowRef,
 };
 #[cfg(any(test, injected_yields))]
 use crate::mvcc::yield_hooks::{ProvidesYieldContext, YieldContext, YieldPointMarker};
@@ -343,6 +344,9 @@ pub(crate) type MvccEntry<'l, T, A = TursoAllocator> =
 pub(crate) type MvccIterator<'l, T, A = TursoAllocator> =
     Box<dyn Iterator<Item = MvccEntry<'l, T, A>> + Send + Sync>;
 
+pub(crate) type TableMvccIterator<A = TursoAllocator> =
+    Box<dyn Iterator<Item = TableRowRef<A>> + Send + Sync>;
+
 /// Extends the lifetime of a SkipMap iterator to `'static`.
 ///
 /// # Why a macro instead of a function?
@@ -504,7 +508,7 @@ pub struct MvccLazyCursor<Clock: LogicalClock + 'static, A: ConcurrentAllocator 
     yield_instance_id: u64,
     current_pos: CursorPosition<A>,
     /// Stateful MVCC table iterator if this is a table cursor.
-    table_iterator: Option<MvccIterator<'static, RowID, A>>,
+    table_iterator: Option<TableMvccIterator<A>>,
     /// Stateful MVCC index iterator if this is an index cursor.
     index_iterator: Option<MvccIterator<'static, Arc<SortableIndexKey>, A>>,
     mv_cursor_type: MvccCursorType,
@@ -1219,8 +1223,7 @@ impl<Clock: LogicalClock + 'static, A: ConcurrentAllocator> MvccLazyCursor<Clock
                 };
                 let range =
                     create_seek_range(Bound::Included(start_rowid), IterationDirection::Forwards);
-                let iter_box = Box::new(self.db.rows.range(range));
-                self.table_iterator = Some(static_iterator_hack!(iter_box, RowID, A));
+                self.table_iterator = Some(Box::new(self.db.rows.range(range)));
             }
             MvccCursorType::Index(_) => {
                 let index_rows = self.db.get_or_create_index_rows(self.table_id)?;
@@ -2205,8 +2208,7 @@ impl<Clock: LogicalClock + 'static, A: ConcurrentAllocator> CursorTrait
                     std::ops::Bound::Included(start_rowid),
                     std::ops::Bound::Unbounded,
                 );
-                let iter_box = Box::new(self.db.rows.range(range));
-                self.table_iterator = Some(static_iterator_hack!(iter_box, RowID, A));
+                self.table_iterator = Some(Box::new(self.db.rows.range(range)));
             }
             MvccCursorType::Index(_) => {
                 // For index cursors, initialize the iterator to the beginning

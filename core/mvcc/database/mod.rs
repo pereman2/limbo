@@ -3,7 +3,7 @@ use crate::alloc::{
     TursoTryWithCapacityExt, TursoVecInExt, ALLOC_ERR_MSG,
 };
 use crate::mvcc::clock::LogicalClock;
-use crate::mvcc::cursor::{static_iterator_hack, MvccIterator};
+use crate::mvcc::cursor::{static_iterator_hack, MvccIterator, TableMvccIterator};
 #[cfg(any(test, injected_yields))]
 use crate::mvcc::yield_hooks::{ProvidesYieldContext, YieldContext, YieldPointMarker};
 use crate::mvcc::yield_points::{inject_transition_failure, inject_transition_yield};
@@ -67,8 +67,9 @@ pub use checkpoint_state_machine::{
 mod group_commit;
 pub(crate) use group_commit::{CommitCoordinator, GroupBatch, GroupWork};
 
-mod int_row_index;
-use int_row_index::IntRowIndex;
+mod table_rows;
+pub(crate) use table_rows::TableRowRef;
+pub use table_rows::TableRows;
 
 #[cfg(feature = "conn_raw_api")]
 use super::persistent_storage::logical_log::{
@@ -152,13 +153,13 @@ impl<A: ConcurrentAllocator> RowVersionAllocator for A {
 
 pub type RowVersionChain<A = TursoAllocator> = <A as RowVersionAllocator>::RowVersionChain;
 pub type RowVersions<A = TursoAllocator> = Arc<RwLock<RowVersionChain<A>>>;
-type TableRowEntry<'a, A = TursoAllocator> = Entry<'a, RowID, RowVersions<A>, BasicComparator, A>;
+type TableRowEntry<A = TursoAllocator> = TableRowRef<A>;
 type IndexRowEntry<'a, A = TursoAllocator> =
     Entry<'a, Arc<SortableIndexKey>, RowVersions<A>, BasicComparator, A>;
 type IndexRowsEntry<'a, A = TursoAllocator> =
     Entry<'a, MVTableId, IndexRowsMap<A>, BasicComparator, A>;
-type TableRowIterator<'a, A = TursoAllocator> =
-    Box<dyn Iterator<Item = TableRowEntry<'a, A>> + Send + Sync + 'a>;
+type TableRowIterator<A = TursoAllocator> =
+    Box<dyn Iterator<Item = TableRowEntry<A>> + Send + Sync>;
 type IndexRowIterator<'a, A = TursoAllocator> =
     Box<dyn Iterator<Item = IndexRowEntry<'a, A>> + Send + Sync + 'a>;
 
@@ -4339,8 +4340,7 @@ struct IndexMethodWriteLease {
 /// A multi-version concurrency control database.
 #[derive(Debug)]
 pub struct MvStore<Clock: LogicalClock, A: ConcurrentAllocator = TursoAllocator> {
-    pub rows: SkipMap<RowID, RowVersions<A>, BasicComparator, A>,
-    int_rows: IntRowIndex<A>,
+    pub rows: TableRows<A>,
     /// Table ID is an opaque identifier that is only meaningful to the MV store.
     /// Each checkpointed MVCC table corresponds to a single B-tree on the pager,
     /// which naturally has a root page.
@@ -4602,8 +4602,7 @@ impl<Clock: LogicalClock, A: ConcurrentAllocator> MvStore<Clock, A> {
         // table id 1 / root page 1 is always sqlite_schema.
         table_id_to_rootpage.try_insert(SQLITE_SCHEMA_MVCC_TABLE_ID, RootEntry::live(Some(1)))?;
         Ok(Self {
-            rows: SkipMap::new_in(alloc.clone()),
-            int_rows: IntRowIndex::new(),
+            rows: TableRows::new(),
             table_id_to_rootpage,
             index_rows: SkipMap::new_in(alloc.clone()),
             index_rows_epoch: AtomicU64::new(0),
@@ -5889,7 +5888,7 @@ impl<Clock: LogicalClock, A: ConcurrentAllocator> MvStore<Clock, A> {
     pub(crate) fn advance_cursor_and_get_row_id_for_table(
         &self,
         table_id: MVTableId,
-        mv_store_iterator: &mut Option<MvccIterator<'static, RowID, A>>,
+        mv_store_iterator: &mut Option<TableMvccIterator<A>>,
         tx_id: TxID,
     ) -> Option<(RowID, RowVersions<A>)> {
         let mv_store_iterator = mv_store_iterator.as_mut().expect(
@@ -6111,7 +6110,7 @@ impl<Clock: LogicalClock, A: ConcurrentAllocator> MvStore<Clock, A> {
     fn find_last_visible_version(
         &self,
         tx: &Transaction<A>,
-        row: &TableRowEntry<'_, A>,
+        row: &TableRowEntry<A>,
         take_payload: bool,
     ) -> Option<(RowID, RowVersions<A>, Option<Row>)> {
         let versions_arc = row.value();
@@ -6157,7 +6156,7 @@ impl<Clock: LogicalClock, A: ConcurrentAllocator> MvStore<Clock, A> {
         }
     }
 
-    fn find_next_visible_table_row<'a, I>(
+    fn find_next_visible_table_row<I>(
         &self,
         tx: &Transaction<A>,
         mut rows: I,
@@ -6165,7 +6164,7 @@ impl<Clock: LogicalClock, A: ConcurrentAllocator> MvStore<Clock, A> {
         take_payload: bool,
     ) -> Option<(RowID, RowVersions<A>, Option<Row>)>
     where
-        I: Iterator<Item = TableRowEntry<'a, A>>,
+        I: Iterator<Item = TableRowEntry<A>>,
     {
         loop {
             let row = rows.next()?;
@@ -6185,12 +6184,11 @@ impl<Clock: LogicalClock, A: ConcurrentAllocator> MvStore<Clock, A> {
         eq_only: bool,
         direction: IterationDirection,
         tx_id: TxID,
-        table_iterator: &mut Option<MvccIterator<'static, RowID, A>>,
+        table_iterator: &mut Option<TableMvccIterator<A>>,
     ) -> Option<(RowID, Option<Row>)> {
         let table_id = start.table_id;
         if eq_only {
-            let empty: TableRowIterator<'_, A> = Box::new(std::iter::empty());
-            *table_iterator = Some(static_iterator_hack!(empty, RowID, A));
+            *table_iterator = Some(Box::new(std::iter::empty()));
             let tx = self
                 .txs
                 .get(&tx_id)
@@ -6209,14 +6207,14 @@ impl<Clock: LogicalClock, A: ConcurrentAllocator> MvStore<Clock, A> {
             };
             match direction {
                 IterationDirection::Forwards => {
-                    Box::new(self.rows.range(range)) as TableRowIterator<'_, A>
+                    Box::new(self.rows.range(range)) as TableRowIterator<A>
                 }
                 IterationDirection::Backwards => {
-                    Box::new(self.rows.range(range).rev()) as TableRowIterator<'_, A>
+                    Box::new(self.rows.range(range).rev()) as TableRowIterator<A>
                 }
             }
         };
-        *table_iterator = Some(static_iterator_hack!(iter_box, RowID, A));
+        *table_iterator = Some(iter_box);
 
         let mv_store_iterator = table_iterator
             .as_mut()
@@ -6254,22 +6252,7 @@ impl<Clock: LogicalClock, A: ConcurrentAllocator> MvStore<Clock, A> {
     }
 
     fn table_versions(&self, id: &RowID) -> Option<RowVersions<A>> {
-        match id.row_id {
-            RowKey::Int(rowid) => self.int_rows.get(id.table_id, rowid),
-            RowKey::Record(_) => self.rows.get(id).map(|entry| entry.value().clone()),
-        }
-    }
-
-    fn index_int_row(&self, id: &RowID, versions: &RowVersions<A>) {
-        if let RowKey::Int(rowid) = id.row_id {
-            self.int_rows.insert(id.table_id, rowid, versions.clone());
-        }
-    }
-
-    fn unindex_int_row(&self, id: &RowID) {
-        if let RowKey::Int(rowid) = id.row_id {
-            self.int_rows.remove(id.table_id, rowid);
-        }
+        self.rows.get(id).map(|entry| entry.value().clone())
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -8107,8 +8090,7 @@ impl<Clock: LogicalClock, A: ConcurrentAllocator> MvStore<Clock, A> {
                     drop_current_if_in_btree,
                 );
                 if !passive && versions.is_empty() {
-                    self.unindex_int_row(entry.key());
-                    entry.remove();
+                    self.rows.remove(entry.key());
                 }
             }
             last_key = Some(entry.key().clone());
@@ -8295,8 +8277,7 @@ impl<Clock: LogicalClock, A: ConcurrentAllocator> MvStore<Clock, A> {
             );
             Self::collect_referenced_txids(&versions, referenced_tx_ids);
             if remove_empty_slots && versions.is_empty() {
-                self.unindex_int_row(entry.key());
-                entry.remove();
+                self.rows.remove(entry.key());
             }
         }
         dropped
@@ -8592,9 +8573,7 @@ impl<Clock: LogicalClock, A: ConcurrentAllocator> MvStore<Clock, A> {
                 A,
             >>::new_in(alloc)))
         })?;
-        let arc = versions.value().clone();
-        self.index_int_row(&id, &arc);
-        Ok(arc)
+        Ok(versions.value().clone())
     }
 
     /// Gets an existing Arc<SortableIndexKey> from the index if the key exists,
@@ -8829,7 +8808,7 @@ impl<Clock: LogicalClock, A: ConcurrentAllocator> MvStore<Clock, A> {
     pub fn get_last_table_rowid(
         &self,
         table_id: MVTableId,
-        table_iterator: &mut Option<MvccIterator<'static, RowID, A>>,
+        table_iterator: &mut Option<TableMvccIterator<A>>,
         tx_id: TxID,
     ) -> Option<RowKey> {
         let tx = self
@@ -8842,8 +8821,7 @@ impl<Clock: LogicalClock, A: ConcurrentAllocator> MvStore<Clock, A> {
             row_id: RowKey::Int(i64::MAX),
         };
         let range = create_seek_range(Bound::Included(max_rowid), IterationDirection::Backwards);
-        let iter_box = Box::new(self.rows.range(range).rev());
-        *table_iterator = Some(static_iterator_hack!(iter_box, RowID, A));
+        *table_iterator = Some(Box::new(self.rows.range(range).rev()));
         let iter = table_iterator
             .as_mut()
             .expect("table_iterator was assigned above");

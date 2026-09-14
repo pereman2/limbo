@@ -352,18 +352,11 @@ fn mv_store_skiplist_allocations_are_fallible() {
     .unwrap();
     alloc.fail_allocations(true);
 
-    let row_id = RowID::new(MVTableId::from(-2), RowKey::Int(1));
-    let row_version = RowVersion {
-        id: 1,
-        begin: PackedTs::pack(Some(TxTimestampOrID::TxID(1))),
-        end: PackedTs::pack(None),
-        row: Row::new_table_row(row_id.clone(), &[], 0).unwrap(),
-        btree_resident: false,
-        materialized_at: crate::mvcc::database::WalPos::ORIGIN,
-    };
-    let result = store.insert_version(row_id, row_version);
-    assert!(matches!(result, Err(crate::alloc::TryReserveError)));
-    assert!(store.rows.is_empty());
+    let index_id = MVTableId::from(-7);
+    let (key, row_version) = fallible_index_probe(index_id);
+    let result = store.insert_index_version(index_id, key, row_version);
+    assert!(matches!(result, Err(LimboError::OutOfMemory)));
+    assert!(store.index_rows.is_empty());
 }
 
 #[cfg(nightly)]
@@ -448,17 +441,19 @@ fn mv_store_insert_allocation_failure_leaves_tx_state_untouched() {
     tx.begin_savepoint();
     store.txs.try_insert(tx_id, tx).unwrap();
 
-    let table_id = MVTableId::from(-2);
-    let row_id = RowID::new(table_id, RowKey::Int(42));
-    let row = Row::new_table_row(row_id.clone(), &[], 0).unwrap();
-    let allocator = store.get_rowid_allocator(&table_id);
+    let index_id = MVTableId::from(-7);
+    let (key, row_version) = fallible_index_probe(index_id);
+    let row = row_version.row;
 
     alloc.fail_allocations(true);
-    let result = store.insert(tx_id, row);
+    let result = store.insert_to_table_or_index(tx_id, row, Some(index_id));
     assert!(matches!(result, Err(LimboError::OutOfMemory)));
 
-    assert!(store.rows.get(&row_id).is_none());
-    assert_eq!(allocator.max_rowid.load(Ordering::SeqCst), 0);
+    assert!(store.index_rows.get(&index_id).is_none());
+    assert!(store
+        .rows
+        .get(&RowID::new(index_id, RowKey::Record(key)))
+        .is_none());
 
     let tx = store.txs.get(&tx_id).unwrap();
     let tx = tx.value();
@@ -466,8 +461,38 @@ fn mv_store_insert_allocation_failure_leaves_tx_state_untouched() {
 
     let savepoints = tx.savepoint_stack.read();
     let savepoint = savepoints.last().unwrap();
-    assert!(savepoint.created_table_versions.is_empty());
+    assert!(savepoint.created_index_versions.is_empty());
     assert!(savepoint.newly_added_to_write_set.is_empty());
+}
+
+fn fallible_index_probe(index_id: MVTableId) -> (Arc<SortableIndexKey>, RowVersion) {
+    let info = Arc::new(
+        crate::types::IndexInfo::new(
+            crate::alloc::vec![crate::types::KeyInfo {
+                sort_order: turso_parser::ast::SortOrder::Asc,
+                collation: crate::translate::collate::CollationSeq::Binary,
+                nulls_order: None,
+            }],
+            false,
+            1,
+            false,
+        )
+        .unwrap(),
+    );
+    let rec = ImmutableRecord::from_values(&[Value::from_i64(1)], 1).unwrap();
+    let key = Arc::new(SortableIndexKey::new_from_payload_in(&rec, info, TursoAllocator).unwrap());
+    let row_id = RowID::new(index_id, RowKey::Record(key.clone()));
+    (
+        key,
+        RowVersion {
+            id: 1,
+            begin: PackedTs::pack(Some(TxTimestampOrID::TxID(1))),
+            end: PackedTs::pack(None),
+            row: Row::new_index_row(row_id, 1),
+            btree_resident: false,
+            materialized_at: crate::mvcc::database::WalPos::ORIGIN,
+        },
+    )
 }
 
 impl MvccTestDb {
