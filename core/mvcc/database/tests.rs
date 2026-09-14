@@ -13686,6 +13686,49 @@ fn test_mvcc_same_primary_key() {
         .expect_err("duplicate key - visible committed row");
 }
 
+#[test]
+fn test_user_integer_pk_unique_and_visible_after_many_inserts() {
+    let db = MvccTestDbNoConn::new_with_random_db();
+    let conn = db.connect();
+    conn.execute("CREATE TABLE t(id INTEGER PRIMARY KEY, v TEXT)")
+        .unwrap();
+    conn.execute("BEGIN CONCURRENT").unwrap();
+    for i in 1..=200 {
+        conn.execute(&format!("INSERT INTO t VALUES ({i}, 'r{i}')"))
+            .unwrap();
+    }
+    conn.execute("COMMIT").unwrap();
+
+    conn.execute("INSERT INTO t VALUES (100, 'dup')")
+        .expect_err("duplicate user INTEGER PRIMARY KEY must fail");
+
+    conn.execute("BEGIN CONCURRENT").unwrap();
+    conn.execute("INSERT INTO t VALUES (201, 'gone')").unwrap();
+    conn.execute("ROLLBACK").unwrap();
+    conn.execute("INSERT INTO t VALUES (201, 'ok')").unwrap();
+
+    let rows = get_rows(&conn, "SELECT id, v FROM t WHERE id = 1");
+    assert_eq!(rows.len(), 1);
+    assert_eq!(rows[0][0].as_int().unwrap(), 1);
+    assert_eq!(rows[0][1].to_string(), "r1");
+
+    let rows = get_rows(&conn, "SELECT id, v FROM t WHERE id = 200");
+    assert_eq!(rows.len(), 1);
+    assert_eq!(rows[0][0].as_int().unwrap(), 200);
+
+    let rows = get_rows(&conn, "SELECT id FROM t ORDER BY id");
+    assert_eq!(rows.len(), 201);
+    assert_eq!(rows[0][0].as_int().unwrap(), 1);
+    assert_eq!(rows[199][0].as_int().unwrap(), 200);
+    assert_eq!(rows[200][0].as_int().unwrap(), 201);
+
+    let conn2 = db.connect();
+    conn2.execute("BEGIN CONCURRENT").unwrap();
+    conn2
+        .execute("INSERT INTO t VALUES (50, 'other')")
+        .expect_err("committed INTEGER PRIMARY KEY must be unique for a later snapshot");
+}
+
 /// What this test checks: MVCC transaction visibility and conflict handling follow the intended isolation behavior.
 /// Why this matters: Concurrency bugs are correctness bugs: they create anomalies users can observe as wrong query results.
 #[test]
