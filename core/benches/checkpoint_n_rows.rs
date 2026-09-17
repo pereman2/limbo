@@ -29,7 +29,7 @@ use std::io::Write;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 use tempfile::TempDir;
-use turso_core::{Connection, Database, PlatformIO, StepResult};
+use turso_core::{Connection, Database, DatabaseOpts, OpenFlags, PlatformIO, StepResult};
 
 #[cfg(not(target_family = "wasm"))]
 #[global_allocator]
@@ -163,7 +163,15 @@ fn load_n_rows(n: usize) -> Loaded {
     let db_path = dir.path().join("checkpoint_n_rows.db");
     #[allow(clippy::arc_with_non_send_sync)]
     let io = Arc::new(PlatformIO::new().unwrap());
-    let db = Database::open_file(io, db_path.to_str().unwrap(), Arc::new(SqliteDialect)).unwrap();
+    let db = Database::open_file_with_flags(
+        io,
+        db_path.to_str().unwrap(),
+        OpenFlags::default(),
+        DatabaseOpts::new().with_experimental_mvcc_passive_checkpoint(true),
+        None,
+        Arc::new(SqliteDialect),
+    )
+    .unwrap();
     let conn = db.connect().unwrap();
     exec(&conn, &db, "PRAGMA journal_mode = 'mvcc'");
     exec(&conn, &db, "PRAGMA mvcc_checkpoint_threshold = -1");
