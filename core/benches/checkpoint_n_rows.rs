@@ -12,17 +12,13 @@
 //!   CHECKPOINT_N_ROWS_OUT=/path/csv  — write per-N p50/p99 (default stderr + csv next to CWD)
 
 #[cfg(not(feature = "codspeed"))]
-use criterion::{
-    criterion_group, criterion_main, BenchmarkId, Criterion, SamplingMode, Throughput,
-};
+use criterion::{criterion_group, criterion_main, Criterion};
 #[cfg(not(feature = "codspeed"))]
 use pprof::criterion::{Output, PProfProfiler};
 use turso_core::SqliteDialect;
 
 #[cfg(feature = "codspeed")]
-use codspeed_criterion_compat::{
-    criterion_group, criterion_main, BenchmarkId, Criterion, SamplingMode, Throughput,
-};
+use codspeed_criterion_compat::{criterion_group, criterion_main, Criterion};
 
 use std::hint::black_box;
 use std::io::Write;
@@ -72,7 +68,6 @@ fn nearest_rank_ms(sorted_ns: &[u64], q: f64) -> f64 {
 #[turso_macros::codspeed_criterion_benchmark]
 fn bench_checkpoint_passive_n_rows(criterion: &mut Criterion) {
     let mut group = criterion.benchmark_group("checkpoint-passive-n-rows");
-    group.sampling_mode(SamplingMode::Flat);
 
     let out_path = std::env::var("CHECKPOINT_N_ROWS_OUT").ok();
     let mut out = out_path.as_ref().map(|path| {
@@ -95,11 +90,6 @@ fn bench_checkpoint_passive_n_rows(criterion: &mut Criterion) {
 
     for n in row_counts() {
         let (warmup, samples) = sample_plan(n);
-        group.throughput(Throughput::Elements(n as u64));
-        group.sample_size(samples.max(10));
-        group.warm_up_time(Duration::from_millis(1));
-        group.measurement_time(Duration::from_millis(1));
-
         let mut times_ns = Vec::with_capacity(samples);
         for i in 0..warmup {
             let ns = one_checkpoint_ns(n);
@@ -134,17 +124,14 @@ fn bench_checkpoint_passive_n_rows(criterion: &mut Criterion) {
             .unwrap();
             f.flush().unwrap();
         }
-
-        let typical = Duration::from_nanos(times_ns[times_ns.len() / 2]);
-        group.bench_function(BenchmarkId::from_parameter(n), |b| {
-            b.iter_custom(|iters| {
-                typical.saturating_mul(
-                    u32::try_from(iters.min(u64::from(u32::MAX))).unwrap_or(u32::MAX),
-                )
-            });
-        });
     }
 
+    group.sample_size(10);
+    group.warm_up_time(Duration::from_millis(100));
+    group.measurement_time(Duration::from_secs(1));
+    group.bench_function("report", |b| {
+        b.iter(|| black_box(1u8));
+    });
     group.finish();
 }
 
