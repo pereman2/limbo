@@ -1297,11 +1297,9 @@ impl WalCoordination for InProcessWalCoordination {
     }
 
     fn wal_is_initialized(&self) -> bool {
-        self.shared
-            .read()
-            .metadata
-            .initialized
-            .load(Ordering::Acquire)
+        let shared = self.shared.read();
+        shared.metadata.max_frame.load(Ordering::Acquire) > 0
+            || shared.metadata.initialized.load(Ordering::Acquire)
     }
 
     fn prepare_wal_header(&self, io: &dyn IO, page_size: PageSize) -> Option<WalHeader> {
@@ -2378,13 +2376,13 @@ impl WalCoordination for ShmWalCoordination {
 
     fn wal_is_initialized(&self) -> bool {
         let authority_snapshot = self.authority.snapshot();
-        if Self::authority_needs_local_header_seed(authority_snapshot) {
-            return self.fallback.wal_is_initialized();
-        }
         if authority_snapshot.max_frame > 0 {
             self.sync_local_from_authority(authority_snapshot);
             self.fallback.mark_initialized();
             return true;
+        }
+        if Self::authority_needs_local_header_seed(authority_snapshot) {
+            return self.fallback.wal_is_initialized();
         }
         if self.local_zero_frame_generation_is_initialized(authority_snapshot) {
             return true;
@@ -6752,6 +6750,62 @@ pub mod test {
             "prepare_frames must chain after unpublished spill frames"
         );
         assert_eq!(prepared.final_max_frame, 2);
+    }
+
+    /// `commit_wal_inner` always calls `prepare_wal_start` before `prepare_frames`.
+    /// A stale `initialized=false` flag must not zero this connection's cursor
+    /// while the committed high-water mark is already positive. Antithesis run
+    /// `cf534edd4e59af5b1856beb0bf3a8cea-61-8` hit that shape on COMMIT:
+    /// `local_max_frame=0, authority_max_frame=1032`.
+    #[test]
+    fn prepare_wal_start_keeps_cursor_when_authority_already_has_frames() {
+        let page_size = 512;
+        let (io, buffer_pool, wal) = make_initialized_memory_wal(page_size);
+        let committed = page_with_pattern(7, 0x70, &buffer_pool);
+        append_test_pages(&io, &wal, page_size, &[committed]);
+        let authority = wal.get_max_frame_in_wal();
+        assert!(
+            authority > 0,
+            "setup must publish a committed high-water mark before the second connection commits"
+        );
+
+        let shared = wal.coordination.shared_wal_state();
+        let wal2 = WalFile::new(io.clone(), shared.clone(), ((0, 0), 0), buffer_pool.clone());
+        assert_eq!(wal2.get_max_frame(), 0);
+
+        wal2.begin_read_tx().unwrap();
+        wal2.begin_write_tx(WalAutoActions::Checkpoint).unwrap();
+        assert_eq!(
+            wal2.get_max_frame(),
+            authority,
+            "write upgrade must install the authority snapshot before prepare_wal_start"
+        );
+
+        shared
+            .read()
+            .metadata
+            .initialized
+            .store(false, Ordering::Release);
+        if let Some(c) = wal2
+            .prepare_wal_start(PageSize::new(page_size).unwrap())
+            .unwrap()
+        {
+            io.wait_for_completion(c).unwrap();
+            let finish = wal2.prepare_wal_finish(FileSyncType::Fsync).unwrap();
+            io.wait_for_completion(finish).unwrap();
+        }
+        assert_eq!(
+            wal2.get_max_frame(),
+            authority,
+            "prepare_wal_start must not zero the connection cursor behind a positive high-water mark"
+        );
+        assert_eq!(wal2.get_max_frame_in_wal(), authority);
+
+        let next = page_with_pattern(8, 0x80, &buffer_pool);
+        let prepared = wal2
+            .prepare_frames(&[next], PageSize::new(page_size).unwrap(), Some(99), None)
+            .unwrap();
+        assert_eq!(prepared.final_max_frame, authority + 1);
     }
 
     fn wait_for_completion_error(io: &Arc<dyn IO>, completion: Completion) -> CompletionError {

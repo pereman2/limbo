@@ -1178,6 +1178,67 @@ fn subprocess_database_open_selects_multiprocess_shm_backend() {
     );
 }
 
+/// A new write process must be able to COMMIT while a peer still holds a
+/// read snapshot. Antithesis hit `wal.rs` `prepare_frames` on that overlap:
+/// `integrity_check` held a connection, a fresh `parallel_driver_write.py`
+/// process opened, and the first `COMMIT` panicked with
+/// `local_max_frame=0, authority_max_frame=1032`.
+#[test]
+fn subprocess_new_writer_commits_while_peer_holds_read_tx() {
+    let dir = tempfile::tempdir().unwrap();
+    let db_path = dir.path().join("hwm-writer-during-reader.db");
+    let ready_file = dir.path().join("child-ready");
+    let release_file = dir.path().join("child-release");
+    let db_path_str = db_path.to_str().unwrap();
+    let io: Arc<dyn IO> = multiprocess_test_io();
+    let db = open_multiprocess_db(io, db_path_str).unwrap();
+    let conn = db.connect().unwrap();
+    conn.execute("create table test(id integer primary key, value text)")
+        .unwrap();
+    for i in 0..64 {
+        conn.execute(&format!("insert into test(value) values ('row-{i}')"))
+            .unwrap();
+    }
+    assert!(
+        wal_max_frame(&conn) > 0,
+        "parent must publish WAL frames before the overlapping writer starts"
+    );
+
+    let current_exe = std::env::current_exe().unwrap();
+    let mut reader = Command::new(&current_exe)
+        .arg(MULTIPROCESS_SHM_HOLD_READ_TX_CHILD_TEST)
+        .arg("--exact")
+        .arg("--nocapture")
+        .env("TURSO_MULTIPROCESS_DB_PATH", db_path_str)
+        .env("TURSO_MULTIPROCESS_READY_FILE", &ready_file)
+        .env("TURSO_MULTIPROCESS_RELEASE_FILE", &release_file)
+        .spawn()
+        .unwrap();
+    wait_for_file(&ready_file);
+
+    let insert_output = Command::new(&current_exe)
+        .arg(MULTIPROCESS_SHM_INSERT_CHILD_TEST)
+        .arg("--exact")
+        .arg("--nocapture")
+        .env("TURSO_MULTIPROCESS_DB_PATH", db_path_str)
+        .output()
+        .unwrap();
+    assert!(
+        insert_output.status.success(),
+        "new write process panicked or failed while a peer held a read snapshot: stdout={}; stderr={}",
+        String::from_utf8_lossy(&insert_output.stdout),
+        String::from_utf8_lossy(&insert_output.stderr)
+    );
+
+    std::fs::write(&release_file, b"release").unwrap();
+    let reader_status = reader.wait().unwrap();
+    assert!(
+        reader_status.success(),
+        "read-snapshot child should exit cleanly: {reader_status:?}"
+    );
+    assert_eq!(count_test_rows(&conn), 65);
+}
+
 #[test]
 fn plain_vacuum_rejects_multiprocess_wal_database() {
     let dir = tempfile::tempdir().unwrap();
