@@ -1999,35 +1999,18 @@ impl<Clock: LogicalClock + 'static, A: ConcurrentAllocator> CursorTrait
                 Value::Numeric(crate::numeric::Numeric::Integer(i)) => i,
                 _ => unreachable!("btree tables are indexed by integers!"),
             };
-            let inclusive = true;
-
-            // Check MVCC first. This is a point existence probe, so it is
-            // eq-only: bound the skiplist walk to the single rowid instead of
-            // scanning forward over invisible concurrent rows.
-            let rowid = self.db.seek_rowid(
-                RowID {
+            // Check MVCC first. This is a point existence probe, so it is a
+            // single skiplist lookup instead of a range iterator.
+            self.table_iterator = None;
+            let mvcc_exists = self.db.table_row_visible_for_tx(
+                &RowID {
                     table_id: self.table_id,
                     row_id: RowKey::Int(*int_key),
                 },
-                inclusive,
-                true,
-                IterationDirection::Forwards,
                 self.tx_id,
-                &mut self.table_iterator,
             );
 
-            let mvcc_exists = if let Some((rowid, _)) = &rowid {
-                let RowKey::Int(rowid) = rowid.row_id else {
-                    panic!("Rowid is not an integer in mvcc table cursor");
-                };
-                rowid == *int_key
-            } else {
-                false
-            };
-
-            tracing::trace!(
-                "MVCC exists check: mvcc_exists={mvcc_exists} find={int_key} got={rowid:?}"
-            );
+            tracing::trace!("MVCC exists check: mvcc_exists={mvcc_exists} find={int_key}");
 
             // If found in MVCC, update dual_peek and return true
             if mvcc_exists {

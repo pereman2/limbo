@@ -525,6 +525,24 @@ fn get() {
 }
 
 #[test]
+fn get_with_reads_present_keys_and_misses_removed_ones() {
+    let s = SkipMap::new();
+    s.insert(30, 3);
+    s.insert(50, 5);
+    s.insert(10, 1);
+
+    assert_eq!(s.get_with(&10, |k, v| (*k, *v)), Some((10, 1)));
+    assert_eq!(s.get_with(&30, |_, v| *v * 100), Some(300));
+    assert_eq!(s.get_with(&50, |_, v| *v), Some(5));
+    assert_eq!(s.get_with(&7, |_, v| *v), None);
+    assert_eq!(s.get_with(&40, |_, v| *v), None);
+
+    s.remove(&30);
+    assert_eq!(s.get_with(&30, |_, v| *v), None);
+    assert_eq!(s.get_with(&50, |_, v| *v), Some(5));
+}
+
+#[test]
 fn lower_bound() {
     let s = SkipMap::new();
     s.insert(30, 3);

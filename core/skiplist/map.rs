@@ -373,6 +373,31 @@ where
         try_pin_loop(|| self.inner.get(key, guard)).map(Entry::new)
     }
 
+    /// Looks up `key` and runs `f` on the entry while the epoch stays pinned.
+    ///
+    /// Unlike [`SkipMap::get`], this takes no reference count on the node, so
+    /// it skips two atomic read-modify-write operations. Use it when the
+    /// caller only reads the entry or clones the value out of it.
+    ///
+    /// # Example
+    /// ```
+    /// use turso_core::skiplist::SkipMap;
+    ///
+    /// let numbers: SkipMap<&str, i32> = SkipMap::new();
+    /// numbers.insert("six", 6);
+    /// assert_eq!(numbers.get_with("six", |_, v| *v * 2), Some(12));
+    /// assert_eq!(numbers.get_with("seven", |_, v| *v), None);
+    /// ```
+    pub fn get_with<Q, R>(&self, key: &Q, f: impl FnOnce(&K, &V) -> R) -> Option<R>
+    where
+        C: Comparator<K, Q>,
+        Q: ?Sized,
+    {
+        let guard = &epoch::pin();
+        let entry = self.inner.get(key, guard)?;
+        Some(f(entry.key(), entry.value()))
+    }
+
     /// Returns an `Entry` pointing to the lowest element whose key is above
     /// the given bound. If no such element is found then `None` is
     /// returned.

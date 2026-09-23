@@ -1860,8 +1860,8 @@ impl<Clock: LogicalClock, A: ConcurrentAllocator> CheckpointStateMachine<Clock, 
                 continue;
             }
             let row_id = &self.write_set[current].0.row.id;
-            if let Some(entry) = self.mvstore.rows.get(row_id) {
-                let mut versions = entry.value().write();
+            let found = self.mvstore.rows.get_with(row_id, |_, chain| {
+                let mut versions = chain.write();
                 if let RowKey::Int(n) = row_id.row_id {
                     if self.written_table_rowids.contains(&(row_id.table_id, n)) {
                         self.mvstore.stamp_chain_materialized(
@@ -1879,7 +1879,8 @@ impl<Clock: LogicalClock, A: ConcurrentAllocator> CheckpointStateMachine<Clock, 
                     drop_current_if_in_btree,
                 );
                 self.mvstore.dec_live_version_count_approx(dropped);
-            } else {
+            });
+            if found.is_none() {
                 // The MVCC metadata table row (persistent_tx_ts_max) is staged
                 // directly into the write set by maybe_stage_mvcc_metadata_write() and do not
                 // have a backing in-memory MVCC version chain. Skip GC for these.
