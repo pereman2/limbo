@@ -1,14 +1,14 @@
 use super::*;
-use crate::mvcc::database::checkpoint_state_machine::{
-    CheckpointState, CheckpointStateMachine, CheckpointYieldPoint,
-};
+use crate::alloc::{ConcurrentAllocator, DynAllocator};
+use crate::mvcc::clock::{LogicalClock, MvccClock};
+use crate::mvcc::database::checkpoint_state_machine::{CheckpointState, CheckpointStateMachine};
 use crate::state_machine::{StateTransition, TransitionResult};
 use crate::storage::wal::CheckpointMode;
-use crate::{Database, DatabaseOpts, OpenFlags, PlatformIO, SqliteDialect, StepResult};
+use crate::{Database, DatabaseOpts, OpenFlags, PlatformIO, SqliteDialect};
 use std::sync::Arc;
 
-fn drive_checkpoint_sm_until(
-    checkpoint_sm: &mut CheckpointStateMachine,
+fn drive_checkpoint_sm_until<C: LogicalClock, A: ConcurrentAllocator>(
+    checkpoint_sm: &mut CheckpointStateMachine<C, A>,
     pager: &crate::Pager,
     stop: impl Fn(&CheckpointState) -> bool,
 ) {
@@ -28,7 +28,10 @@ fn drive_checkpoint_sm_until(
     );
 }
 
-fn finish_checkpoint_sm(checkpoint_sm: &mut CheckpointStateMachine, pager: &crate::Pager) {
+fn finish_checkpoint_sm<C: LogicalClock, A: ConcurrentAllocator>(
+    checkpoint_sm: &mut CheckpointStateMachine<C, A>,
+    pager: &crate::Pager,
+) {
     for _ in 0..50_000 {
         match checkpoint_sm.step(&()).unwrap() {
             TransitionResult::Io(io) => io.wait(pager.io.as_ref()).unwrap(),
@@ -46,7 +49,10 @@ fn ids(conn: &Arc<Connection>) -> Vec<i64> {
         .collect()
 }
 
-fn new_truncate_sm(db: &MvccTestDbNoConn, conn: &Arc<Connection>) -> CheckpointStateMachine {
+fn new_truncate_sm(
+    db: &MvccTestDbNoConn,
+    conn: &Arc<Connection>,
+) -> CheckpointStateMachine<MvccClock, DynAllocator> {
     CheckpointStateMachine::new(
         conn.pager.load().clone(),
         db.get_mvcc_store(),
@@ -60,7 +66,10 @@ fn new_truncate_sm(db: &MvccTestDbNoConn, conn: &Arc<Connection>) -> CheckpointS
     )
 }
 
-fn new_passive_sm(db: &MvccTestDbNoConn, conn: &Arc<Connection>) -> CheckpointStateMachine {
+fn new_passive_sm(
+    db: &MvccTestDbNoConn,
+    conn: &Arc<Connection>,
+) -> CheckpointStateMachine<MvccClock, DynAllocator> {
     CheckpointStateMachine::new(
         conn.pager.load().clone(),
         db.get_mvcc_store(),
@@ -88,7 +97,8 @@ fn known_truncate_with_passive_flag_skips_acquire_lock() {
     let mut checkpoint_sm = new_truncate_sm(&db, &conn);
     match checkpoint_sm.step(&()).unwrap() {
         TransitionResult::Continue => {}
-        other => panic!("PrepareCheckpoint should continue, got {other:?}"),
+        TransitionResult::Io(_) => panic!("PrepareCheckpoint should not wait for IO"),
+        TransitionResult::Done(_) => panic!("PrepareCheckpoint should not finish"),
     }
     assert_eq!(
         checkpoint_sm.state_for_test(),
@@ -168,6 +178,38 @@ fn truncate_is_silent_noop_while_passive_checkpoint_is_running() {
     );
 
     finish_checkpoint_sm(&mut passive_sm, &pager);
+}
+
+#[test]
+fn dropped_passive_checkpoint_must_not_block_later_truncate() {
+    let db = MvccTestDbNoConn::new_with_random_db_passive();
+    let conn = db.connect();
+    conn.execute("PRAGMA mvcc_checkpoint_threshold = -1")
+        .unwrap();
+    conn.execute("CREATE TABLE t(id INTEGER PRIMARY KEY, v TEXT)")
+        .unwrap();
+    conn.execute("INSERT INTO t VALUES (1, 'seed')").unwrap();
+
+    let pager = conn.pager.load().clone();
+    {
+        let mut passive_sm = new_passive_sm(&db, &conn);
+        drive_checkpoint_sm_until(&mut passive_sm, &pager, |state| {
+            *state == CheckpointState::BeginPagerTxn
+        });
+        drop(passive_sm);
+    }
+
+    let other = db.connect();
+    other
+        .execute("INSERT INTO t VALUES (2, 'after-drop')")
+        .unwrap();
+    let before = db.get_mvcc_store().get_logical_log_file().size().unwrap();
+    other.execute("PRAGMA wal_checkpoint(TRUNCATE)").unwrap();
+    let after = db.get_mvcc_store().get_logical_log_file().size().unwrap();
+    assert!(
+        after < before,
+        "dropping a parked Passive checkpoint must release the in-progress gate so a later TRUNCATE can run; log was {before} then {after}"
+    );
 }
 
 #[test]
