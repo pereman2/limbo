@@ -23169,6 +23169,161 @@ fn select_continues_after_commit_sees_rows_inserted_in_same_txn() {
     );
 }
 
+#[test]
+fn select_continues_after_commit_while_other_connection_checkpoints() {
+    let db = MvccTestDbNoConn::new_with_random_db();
+    let conn = db.connect();
+    conn.execute("CREATE TABLE t(id INTEGER PRIMARY KEY)")
+        .unwrap();
+    conn.execute("INSERT INTO t VALUES (1), (2), (3)").unwrap();
+
+    conn.execute("BEGIN").unwrap();
+    let io = conn.pager.load().io.clone();
+    let mut stmt = conn.prepare("SELECT id FROM t").unwrap();
+    assert!(matches!(
+        step_until_row_or_done(&mut stmt, io.as_ref()),
+        crate::StepResult::Row
+    ));
+    let mut ids = vec![stmt.row().unwrap().get_value(0).as_int().unwrap()];
+    conn.execute("COMMIT").unwrap();
+
+    let writer = db.connect();
+    writer.execute("INSERT INTO t VALUES (4)").unwrap();
+    writer.execute("PRAGMA wal_checkpoint(TRUNCATE)").unwrap();
+
+    drain_statement_ids(&mut stmt, io.as_ref(), &mut ids);
+    assert_eq!(ids, vec![1, 2, 3]);
+}
+
+#[test]
+fn select_continues_after_commit_sees_same_txn_inserts_after_gc() {
+    let db = MvccTestDbNoConn::new_with_random_db();
+    let conn = db.connect();
+    conn.execute("CREATE TABLE t(id INTEGER PRIMARY KEY)")
+        .unwrap();
+
+    conn.execute("BEGIN").unwrap();
+    conn.execute("INSERT INTO t VALUES (1), (2), (3)").unwrap();
+    let io = conn.pager.load().io.clone();
+    let mut stmt = conn.prepare("SELECT id FROM t").unwrap();
+    assert!(matches!(
+        step_until_row_or_done(&mut stmt, io.as_ref()),
+        crate::StepResult::Row
+    ));
+    let mut ids = vec![stmt.row().unwrap().get_value(0).as_int().unwrap()];
+    conn.execute("COMMIT").unwrap();
+
+    db.get_mvcc_store().drop_unused_row_versions();
+    db.connect()
+        .execute("PRAGMA wal_checkpoint(TRUNCATE)")
+        .unwrap();
+
+    drain_statement_ids(&mut stmt, io.as_ref(), &mut ids);
+    assert_eq!(ids, vec![1, 2, 3]);
+}
+
+#[test]
+fn select_continues_after_commit_sees_same_txn_update_after_gc() {
+    let db = MvccTestDbNoConn::new_with_random_db();
+    let conn = db.connect();
+    conn.execute("CREATE TABLE t(id INTEGER PRIMARY KEY, v INTEGER)")
+        .unwrap();
+    conn.execute("INSERT INTO t VALUES (1, 10), (2, 20), (3, 30)")
+        .unwrap();
+
+    conn.execute("BEGIN").unwrap();
+    conn.execute("UPDATE t SET v = v + 1").unwrap();
+    let io = conn.pager.load().io.clone();
+    let mut stmt = conn.prepare("SELECT v FROM t").unwrap();
+    assert!(matches!(
+        step_until_row_or_done(&mut stmt, io.as_ref()),
+        crate::StepResult::Row
+    ));
+    let mut values = vec![stmt.row().unwrap().get_value(0).as_int().unwrap()];
+    conn.execute("COMMIT").unwrap();
+
+    db.get_mvcc_store().drop_unused_row_versions();
+    db.connect()
+        .execute("PRAGMA wal_checkpoint(TRUNCATE)")
+        .unwrap();
+
+    drain_statement_ids(&mut stmt, io.as_ref(), &mut values);
+    assert_eq!(values, vec![11, 21, 31]);
+}
+
+#[test]
+fn select_continues_after_commit_sees_same_txn_delete_after_gc() {
+    let db = MvccTestDbNoConn::new_with_random_db();
+    let conn = db.connect();
+    conn.execute("CREATE TABLE t(id INTEGER PRIMARY KEY)")
+        .unwrap();
+    conn.execute("INSERT INTO t VALUES (1), (2), (3)").unwrap();
+
+    conn.execute("BEGIN").unwrap();
+    conn.execute("DELETE FROM t WHERE id = 2").unwrap();
+    let io = conn.pager.load().io.clone();
+    let mut stmt = conn.prepare("SELECT id FROM t").unwrap();
+    assert!(matches!(
+        step_until_row_or_done(&mut stmt, io.as_ref()),
+        crate::StepResult::Row
+    ));
+    let mut ids = vec![stmt.row().unwrap().get_value(0).as_int().unwrap()];
+    conn.execute("COMMIT").unwrap();
+
+    db.get_mvcc_store().drop_unused_row_versions();
+    db.connect()
+        .execute("PRAGMA wal_checkpoint(TRUNCATE)")
+        .unwrap();
+
+    drain_statement_ids(&mut stmt, io.as_ref(), &mut ids);
+    assert_eq!(ids, vec![1, 3]);
+}
+
+#[test]
+fn select_desc_continues_after_commit() {
+    let db = MvccTestDbNoConn::new_with_random_db();
+    let conn = db.connect();
+    conn.execute("CREATE TABLE t(id INTEGER PRIMARY KEY)")
+        .unwrap();
+    conn.execute("INSERT INTO t VALUES (1), (2), (3)").unwrap();
+    assert_eq!(
+        collect_ids_after_paused_commit(&conn, "SELECT id FROM t ORDER BY id DESC"),
+        vec![3, 2, 1]
+    );
+}
+
+#[test]
+fn select_index_desc_continues_after_commit() {
+    let db = MvccTestDbNoConn::new_with_random_db();
+    let conn = db.connect();
+    conn.execute("CREATE TABLE t(id INTEGER PRIMARY KEY, v INTEGER)")
+        .unwrap();
+    conn.execute("CREATE INDEX idx_t_v ON t(v)").unwrap();
+    conn.execute("INSERT INTO t VALUES (1, 10), (2, 20), (3, 30)")
+        .unwrap();
+    conn.execute("PRAGMA wal_checkpoint(TRUNCATE)").unwrap();
+    assert_eq!(
+        collect_ids_after_paused_commit(
+            &conn,
+            "SELECT id FROM t INDEXED BY idx_t_v ORDER BY v DESC"
+        ),
+        vec![3, 2, 1]
+    );
+}
+
+#[test]
+fn select_in_list_continues_after_commit() {
+    let db = MvccTestDbNoConn::new_with_random_db();
+    let conn = db.connect();
+    conn.execute("CREATE TABLE t(id INTEGER PRIMARY KEY)")
+        .unwrap();
+    conn.execute("INSERT INTO t VALUES (1), (2), (3)").unwrap();
+    assert_eq!(
+        collect_ids_after_paused_commit(&conn, "SELECT id FROM t WHERE id IN (2, 3)"),
+        vec![2, 3]
+    );
+}
+
 fn collect_ids_after_paused_commit(conn: &Arc<crate::Connection>, sql: &str) -> Vec<i64> {
     if conn.get_tx_state() == crate::connection::TransactionState::None {
         conn.execute("BEGIN").unwrap();
@@ -23186,25 +23341,27 @@ fn collect_ids_after_paused_commit(conn: &Arc<crate::Connection>, sql: &str) -> 
 }
 
 fn drain_statement_ids(stmt: &mut crate::Statement, io: &dyn crate::io::IO, ids: &mut Vec<i64>) {
-    loop {
+    for _ in 0..100_000 {
         match step_until_row_or_done(stmt, io) {
             crate::StepResult::Row => {
                 ids.push(stmt.row().unwrap().get_value(0).as_int().unwrap());
             }
-            crate::StepResult::Done => break,
+            crate::StepResult::Done => return,
             other => panic!("unexpected step after COMMIT: {other:?}"),
         }
     }
+    panic!("statement did not finish after COMMIT");
 }
 
 fn step_until_row_or_done(
     stmt: &mut crate::Statement,
     io: &dyn crate::io::IO,
 ) -> crate::StepResult {
-    loop {
+    for _ in 0..100_000 {
         match stmt.step().unwrap() {
             crate::StepResult::IO | crate::StepResult::Yield => io.step().unwrap(),
             other => return other,
         }
     }
+    panic!("statement kept returning IO")
 }
