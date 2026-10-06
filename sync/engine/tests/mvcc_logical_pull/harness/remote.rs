@@ -17,12 +17,23 @@ pub struct Remote {
 
 impl Remote {
     pub fn new(setup: &[&str]) -> Result<Arc<Self>> {
+        Self::open(setup, database_opts())
+    }
+
+    pub fn new_passive(setup: &[&str]) -> Result<Arc<Self>> {
+        Self::open(
+            setup,
+            database_opts().with_experimental_mvcc_passive_checkpoint(true),
+        )
+    }
+
+    fn open(setup: &[&str], opts: DatabaseOpts) -> Result<Arc<Self>> {
         let dir = tempfile::tempdir()?;
         let db_path = dir.path().join("remote.db");
         let db = Database::open(
             Arc::new(PlatformIO::new()?),
             &db_path.to_string_lossy(),
-            OpenOptions::new(Arc::new(SqliteDialect)).db_opts(database_opts()),
+            OpenOptions::new(Arc::new(SqliteDialect)).db_opts(opts),
         )?;
         let conn = db.connect()?;
         conn.execute("PRAGMA journal_mode = 'mvcc'")?;
@@ -42,6 +53,10 @@ impl Remote {
         Replica::bootstrap(self.clone())
     }
 
+    pub fn bootstrap_replica_from_current_image(self: &Arc<Self>) -> Result<Replica> {
+        Replica::bootstrap_from_current_image(self.clone())
+    }
+
     pub fn execute_transaction(&self, statements: &[&str]) -> Result<()> {
         self.conn.execute("BEGIN")?;
         for sql in statements {
@@ -57,6 +72,15 @@ impl Remote {
 
     pub(super) fn checkpoint_and_read_database_file(&self) -> Result<Vec<u8>> {
         self.conn.execute("PRAGMA wal_checkpoint(TRUNCATE)")?;
+        Ok(std::fs::read(&self.db_path)?)
+    }
+
+    pub fn checkpoint_passive(&self) -> Result<()> {
+        self.conn.execute("PRAGMA wal_checkpoint(PASSIVE)")?;
+        Ok(())
+    }
+
+    pub(super) fn read_database_file(&self) -> Result<Vec<u8>> {
         Ok(std::fs::read(&self.db_path)?)
     }
 

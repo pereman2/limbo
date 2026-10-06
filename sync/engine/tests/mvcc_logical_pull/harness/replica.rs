@@ -20,10 +20,18 @@ pub struct Replica {
 
 impl Replica {
     pub(super) fn bootstrap(remote: Arc<Remote>) -> Result<Self> {
+        Self::open(InProcessServer::new(remote))
+    }
+
+    pub(super) fn bootstrap_from_current_image(remote: Arc<Remote>) -> Result<Self> {
+        Self::open(InProcessServer::from_current_image(remote))
+    }
+
+    fn open(server: InProcessServer) -> Result<Self> {
         let dir = tempfile::tempdir()?;
         let db_path = dir.path().join("replica.db").to_string_lossy().into_owned();
         let io: Arc<dyn IO> = Arc::new(PlatformIO::new()?);
-        let server = SyncEngineIoStats::new(Arc::new(InProcessServer::new(remote)));
+        let server = SyncEngineIoStats::new(Arc::new(server));
         let engine = drive(&io, async |coro| {
             DatabaseSyncEngine::create_db(coro, io.clone(), server, &db_path, replica_opts()).await
         })?;
