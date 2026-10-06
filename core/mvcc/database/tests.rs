@@ -23032,3 +23032,60 @@ fn dropping_connect_async_state_mid_wait_does_not_block() {
     let conn = db.connect();
     assert!(conn.schema.read().analyze_stats.table_stats("t1").is_some());
 }
+
+/// https://github.com/tursodatabase/turso/issues/9327
+#[test]
+fn select_continues_after_commit_on_same_connection() {
+    assert_select_ids_after_commit(false);
+}
+
+/// Same interleave after a checkpoint has written the rows into the B-tree.
+#[test]
+fn select_continues_after_commit_when_rows_are_in_btree() {
+    assert_select_ids_after_commit(true);
+}
+
+fn assert_select_ids_after_commit(checkpoint_first: bool) {
+    let db = MvccTestDbNoConn::new_with_random_db();
+    let conn = db.connect();
+    conn.execute("CREATE TABLE t(id INTEGER PRIMARY KEY)")
+        .unwrap();
+    conn.execute("INSERT INTO t VALUES (1), (2), (3)").unwrap();
+    if checkpoint_first {
+        conn.execute("PRAGMA wal_checkpoint(TRUNCATE)").unwrap();
+    }
+
+    conn.execute("BEGIN").unwrap();
+    let io = conn.pager.load().io.clone();
+    let mut stmt = conn.prepare("SELECT id FROM t").unwrap();
+    assert!(matches!(
+        step_until_row_or_done(&mut stmt, io.as_ref()),
+        crate::StepResult::Row
+    ));
+    let mut ids = vec![stmt.row().unwrap().get_value(0).as_int().unwrap()];
+
+    conn.execute("COMMIT").unwrap();
+
+    loop {
+        match step_until_row_or_done(&mut stmt, io.as_ref()) {
+            crate::StepResult::Row => {
+                ids.push(stmt.row().unwrap().get_value(0).as_int().unwrap());
+            }
+            crate::StepResult::Done => break,
+            other => panic!("unexpected step after COMMIT: {other:?}"),
+        }
+    }
+    assert_eq!(ids, vec![1, 2, 3]);
+}
+
+fn step_until_row_or_done(
+    stmt: &mut crate::Statement,
+    io: &dyn crate::io::IO,
+) -> crate::StepResult {
+    loop {
+        match stmt.step().unwrap() {
+            crate::StepResult::IO | crate::StepResult::Yield => io.step().unwrap(),
+            other => return other,
+        }
+    }
+}

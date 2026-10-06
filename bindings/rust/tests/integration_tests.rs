@@ -2655,3 +2655,34 @@ async fn test_transactional_batch_joins_an_open_transaction() {
     let row = rows.next().await.unwrap().unwrap();
     assert_eq!(row.get::<i64>(0).unwrap(), 0);
 }
+
+/// https://github.com/tursodatabase/turso/issues/9327
+#[tokio::test]
+async fn test_mvcc_select_continues_after_commit() {
+    for mode in ["wal", "mvcc"] {
+        let db = Builder::new_local(":memory:").build().await.unwrap();
+        let conn = db.connect().unwrap();
+        drain_query(&conn, &format!("PRAGMA journal_mode = '{mode}'")).await;
+        conn.execute("CREATE TABLE t(id INTEGER PRIMARY KEY)", ())
+            .await
+            .unwrap();
+        conn.execute("INSERT INTO t VALUES (1), (2), (3)", ())
+            .await
+            .unwrap();
+
+        conn.execute("BEGIN", ()).await.unwrap();
+        let mut rows = conn.query("SELECT id FROM t", ()).await.unwrap();
+        let mut ids = vec![rows
+            .next()
+            .await
+            .unwrap()
+            .expect("first row")
+            .get::<i64>(0)
+            .unwrap()];
+        conn.execute("COMMIT", ()).await.unwrap();
+        while let Some(row) = rows.next().await.unwrap() {
+            ids.push(row.get::<i64>(0).unwrap());
+        }
+        assert_eq!(ids, vec![1, 2, 3], "{mode} SELECT after COMMIT");
+    }
+}
