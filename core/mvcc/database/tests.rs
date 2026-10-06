@@ -23436,10 +23436,7 @@ fn paused_read_blocks_vacuum_gate() {
     );
 
     assert!(
-        matches!(
-            db.mvcc_store.try_begin_vacuum_gate(),
-            Err(LimboError::Busy)
-        ),
+        matches!(db.mvcc_store.try_begin_vacuum_gate(), Err(LimboError::Busy)),
         "VACUUM gate must be Busy while a paused read is registered"
     );
 

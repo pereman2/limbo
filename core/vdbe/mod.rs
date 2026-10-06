@@ -1278,6 +1278,14 @@ impl ProgramState {
         self.subprogram_stmt_cache.clear();
     }
 
+    pub(crate) fn release_paused_reads(&mut self) {
+        for cursor in self.cursors.iter_mut().flatten() {
+            if let Cursor::Dyn(cursor, ..) = cursor {
+                cursor.release_paused_read();
+            }
+        }
+    }
+
     pub(crate) fn record_statement_change(&self) {
         bump_change_count(&self.n_change);
         bump_change_count(&self.n_total_change);
@@ -3284,6 +3292,7 @@ impl Program {
         }
 
         let mut abort_error: Option<LimboError> = None;
+        state.release_paused_reads();
         if let Err(err) = execute::abort_active_subprogram(self, state, err) {
             capture_abort_error(&mut abort_error, err, "Failed to abort active subprogram");
         }

@@ -559,6 +559,7 @@ pub struct MvccLazyCursor<Clock: LogicalClock + 'static, A: ConcurrentAllocator 
     dual_peek: DualCursorPeek<A>,
     /// Forward scan over `index_rows`; see [`IndexShadowScan`].
     index_shadow_scan: IndexShadowScan<A>,
+    paused_read_held: bool,
 }
 
 pub enum NextRowidResult {
@@ -628,6 +629,7 @@ impl<Clock: LogicalClock + 'static, A: ConcurrentAllocator> MvccLazyCursor<Clock
             btree_advance_state: None,
             dual_peek: DualCursorPeek::default(),
             index_shadow_scan: IndexShadowScan::default(),
+            paused_read_held: true,
         })
     }
 
@@ -1255,7 +1257,7 @@ impl<Clock: LogicalClock + 'static, A: ConcurrentAllocator> Drop for MvccLazyCur
         self.end_new_rowid();
         self.table_iterator = None;
         self.index_iterator = None;
-        self.db.unregister_paused_read(self.tx_id);
+        CursorTrait::release_paused_read(self);
     }
 }
 
@@ -2275,6 +2277,13 @@ impl<Clock: LogicalClock + 'static, A: ConcurrentAllocator> CursorTrait
     /// Returns true if this cursor operates in MVCC mode.
     fn is_mvcc(&self) -> bool {
         true
+    }
+
+    fn release_paused_read(&mut self) {
+        if self.paused_read_held {
+            self.db.unregister_paused_read(self.tx_id);
+            self.paused_read_held = false;
+        }
     }
 }
 

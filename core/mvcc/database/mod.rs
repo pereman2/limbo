@@ -4884,6 +4884,10 @@ impl<Clock: LogicalClock, A: ConcurrentAllocator> MvStore<Clock, A> {
         if !self.blocking_checkpoint_lock.write() {
             return Err(LimboError::Busy);
         }
+        if !self.paused_reads.is_empty() {
+            self.blocking_checkpoint_lock.unlock();
+            return Err(LimboError::Busy);
+        }
         turso_assert!(
             self.txs.is_empty(),
             "MVCC vacuum gate acquired while transactions are still active"
@@ -6206,14 +6210,15 @@ impl<Clock: LogicalClock, A: ConcurrentAllocator> MvStore<Clock, A> {
         if let Some(ts) = snapshot.own_commit_ts {
             return Some(ts);
         }
+        if let Some(tx) = self.txs.get(&snapshot.tx_id) {
+            return match tx.value().state.load() {
+                TransactionState::Committed(ts) => Some(ts),
+                _ => None,
+            };
+        }
         if let Some(entry) = self.paused_reads.get(&snapshot.tx_id) {
             let ts = entry.value().own_commit_ts.load(Ordering::Acquire);
             if ts != 0 {
-                return Some(ts);
-            }
-        }
-        if let Some(tx) = self.txs.get(&snapshot.tx_id) {
-            if let TransactionState::Committed(ts) = tx.value().state.load() {
                 return Some(ts);
             }
         }
@@ -6879,9 +6884,6 @@ impl<Clock: LogicalClock, A: ConcurrentAllocator> MvStore<Clock, A> {
         };
         if entry.value().refs.fetch_sub(1, Ordering::AcqRel) == 1 {
             self.paused_reads.remove(&tx_id);
-            if self.compute_lwm() == u64::MAX {
-                self.gc_incremental(Self::MAX_CHAINS_PER_GC);
-            }
         }
     }
 

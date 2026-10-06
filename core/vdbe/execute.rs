@@ -3749,6 +3749,7 @@ pub fn halt(
     on_error: Option<ResolveType>,
 ) -> InsnResult {
     state.halt_in_progress = true;
+    state.release_paused_reads();
     let mv_store = state.mv_store(&program.connection).cloned();
     let auto_commit = program.connection.auto_commit.load(Ordering::SeqCst);
     // halt() runs while the statement is still stepping, so it is always
