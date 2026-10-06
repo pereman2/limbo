@@ -603,6 +603,7 @@ impl<Clock: LogicalClock + 'static, A: ConcurrentAllocator> MvccLazyCursor<Clock
         } else {
             db.get_table_id_from_root_page_at(root_page_or_table_id, snapshot.begin_ts)
         };
+        db.register_paused_read(snapshot)?;
         Ok(Self {
             db,
             #[cfg(any(test, injected_yields))]
@@ -687,7 +688,7 @@ impl<Clock: LogicalClock + 'static, A: ConcurrentAllocator> MvccLazyCursor<Clock
                     };
                     match self
                         .db
-                        .read_from_table_or_index(self.tx_id, row_id, maybe_index_id)?
+                        .read_from_table_or_index(self.snapshot, row_id, maybe_index_id)?
                     {
                         Some(row) => {
                             record.invalidate();
@@ -735,7 +736,7 @@ impl<Clock: LogicalClock + 'static, A: ConcurrentAllocator> MvccLazyCursor<Clock
             MvccCursorType::Table => None,
         };
         self.db
-            .read_from_table_or_index(self.tx_id, row_id, maybe_index_id)
+            .read_from_table_or_index(self.snapshot, row_id, maybe_index_id)
     }
 
     pub fn close(self) -> Result<()> {
@@ -1252,6 +1253,9 @@ impl<Clock: LogicalClock + 'static, A: ConcurrentAllocator> Drop for MvccLazyCur
         // while paused at an op_new_rowid IO yield. end_new_rowid is a no-op
         // when creating_new_rowid is false, so this is safe in every case.
         self.end_new_rowid();
+        self.table_iterator = None;
+        self.index_iterator = None;
+        self.db.unregister_paused_read(self.tx_id);
     }
 }
 
@@ -1293,7 +1297,7 @@ impl<Clock: LogicalClock + 'static, A: ConcurrentAllocator> CursorTrait
             MvccCursorType::Table => match self.db.get_last_table_rowid(
                 self.table_id,
                 &mut self.table_iterator,
-                self.tx_id,
+                self.snapshot,
             ) {
                 Some(k) => {
                     tracing::trace!("last: mvcc_key: {:?}", k);
@@ -1308,7 +1312,7 @@ impl<Clock: LogicalClock + 'static, A: ConcurrentAllocator> CursorTrait
             },
             MvccCursorType::Index(_) => match self.db.get_last_index_rowid(
                 self.table_id,
-                self.tx_id,
+                self.snapshot,
                 &mut self.index_iterator,
             )? {
                 Some(k) => {
@@ -1607,7 +1611,7 @@ impl<Clock: LogicalClock + 'static, A: ConcurrentAllocator> CursorTrait
                         self.query_btree_version_is_valid(&row_id.row_id)
                     } else {
                         self.db
-                            .read_from_table_or_index(self.tx_id, row_id, maybe_index_id)?
+                            .read_from_table_or_index(self.snapshot, row_id, maybe_index_id)?
                             .is_some()
                     };
                     if visible {
@@ -1870,7 +1874,7 @@ impl<Clock: LogicalClock + 'static, A: ConcurrentAllocator> CursorTrait
         // FIXME: set btree to somewhere close to this rowid?
         if self
             .db
-            .read_from_table_or_index(self.tx_id, &row.id, maybe_index_id)?
+            .read_from_table_or_index(self.snapshot, &row.id, maybe_index_id)?
             .is_some()
         {
             let updated = self

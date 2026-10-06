@@ -4662,6 +4662,7 @@ mod tests {
 
         // Verify table rows can be read
         let tx = mvcc_store.begin_tx(pager).unwrap();
+        let snapshot = mvcc_store.read_snapshot(tx).unwrap();
         for (row_id, expected_data) in [(1, "foo"), (2, "bar"), (3, "baz")] {
             let row = mvcc_store
                 .read(tx, &RowID::new(table_id, RowKey::Int(row_id)))
@@ -4701,7 +4702,7 @@ mod tests {
             // Use read_from_table_or_index to read the index row
             // This verifies that index rows were properly serialized and deserialized from the logical log
             let index_row_opt = mvcc_store
-                .read_from_table_or_index(tx, &index_rowid, Some(index_id))
+                .read_from_table_or_index(snapshot, &index_rowid, Some(index_id))
                 .unwrap_or_else(|e| {
                     panic!("Failed to read index row for ({}, {}): {:?}. Index ID: {:?}, root_page: {}",
                            data_value, row_id, e, index_id, index.root_page)
