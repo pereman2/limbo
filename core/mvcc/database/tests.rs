@@ -23036,24 +23036,102 @@ fn dropping_connect_async_state_mid_wait_does_not_block() {
 /// https://github.com/tursodatabase/turso/issues/9327
 #[test]
 fn select_continues_after_commit_on_same_connection() {
-    assert_select_ids_after_commit(false);
-}
-
-/// Same interleave after a checkpoint has written the rows into the B-tree.
-#[test]
-fn select_continues_after_commit_when_rows_are_in_btree() {
-    assert_select_ids_after_commit(true);
-}
-
-fn assert_select_ids_after_commit(checkpoint_first: bool) {
     let db = MvccTestDbNoConn::new_with_random_db();
     let conn = db.connect();
     conn.execute("CREATE TABLE t(id INTEGER PRIMARY KEY)")
         .unwrap();
     conn.execute("INSERT INTO t VALUES (1), (2), (3)").unwrap();
-    if checkpoint_first {
-        conn.execute("PRAGMA wal_checkpoint(TRUNCATE)").unwrap();
-    }
+    assert_eq!(
+        collect_ids_after_paused_commit(&conn, "SELECT id FROM t"),
+        vec![1, 2, 3]
+    );
+}
+
+#[test]
+fn select_continues_after_commit_when_rows_are_in_btree() {
+    let db = MvccTestDbNoConn::new_with_random_db();
+    let conn = db.connect();
+    conn.execute("CREATE TABLE t(id INTEGER PRIMARY KEY)")
+        .unwrap();
+    conn.execute("INSERT INTO t VALUES (1), (2), (3)").unwrap();
+    conn.execute("PRAGMA wal_checkpoint(TRUNCATE)").unwrap();
+    assert_eq!(
+        collect_ids_after_paused_commit(&conn, "SELECT id FROM t"),
+        vec![1, 2, 3]
+    );
+}
+
+#[test]
+fn select_index_scan_continues_after_commit() {
+    let db = MvccTestDbNoConn::new_with_random_db();
+    let conn = db.connect();
+    conn.execute("CREATE TABLE t(id INTEGER PRIMARY KEY, v INTEGER)")
+        .unwrap();
+    conn.execute("CREATE INDEX idx_t_v ON t(v)").unwrap();
+    conn.execute("INSERT INTO t VALUES (1, 10), (2, 20), (3, 30)")
+        .unwrap();
+    conn.execute("PRAGMA wal_checkpoint(TRUNCATE)").unwrap();
+    assert_eq!(
+        collect_ids_after_paused_commit(&conn, "SELECT id FROM t INDEXED BY idx_t_v"),
+        vec![1, 2, 3]
+    );
+}
+
+#[test]
+fn select_seek_continues_after_commit() {
+    let db = MvccTestDbNoConn::new_with_random_db();
+    let conn = db.connect();
+    conn.execute("CREATE TABLE t(id INTEGER PRIMARY KEY)")
+        .unwrap();
+    conn.execute("INSERT INTO t VALUES (1), (2), (3)").unwrap();
+    conn.execute("PRAGMA wal_checkpoint(TRUNCATE)").unwrap();
+    assert_eq!(
+        collect_ids_after_paused_commit(&conn, "SELECT id FROM t WHERE id >= 2"),
+        vec![2, 3]
+    );
+}
+
+#[test]
+fn select_continues_after_commit_after_checkpoint_and_update() {
+    let db = MvccTestDbNoConn::new_with_random_db();
+    let conn = db.connect();
+    conn.execute("CREATE TABLE t(id INTEGER PRIMARY KEY, v INTEGER)")
+        .unwrap();
+    conn.execute("INSERT INTO t VALUES (1, 10), (2, 20), (3, 30)")
+        .unwrap();
+    conn.execute("PRAGMA wal_checkpoint(TRUNCATE)").unwrap();
+    conn.execute("UPDATE t SET v = v + 1 WHERE id = 2").unwrap();
+    assert_eq!(
+        collect_ids_after_paused_commit(&conn, "SELECT id FROM t"),
+        vec![1, 2, 3]
+    );
+}
+
+#[test]
+fn select_index_continues_after_commit_after_checkpoint_and_update() {
+    let db = MvccTestDbNoConn::new_with_random_db();
+    let conn = db.connect();
+    conn.execute("CREATE TABLE t(id INTEGER PRIMARY KEY, v INTEGER)")
+        .unwrap();
+    conn.execute("CREATE INDEX idx_t_v ON t(v)").unwrap();
+    conn.execute("INSERT INTO t VALUES (1, 10), (2, 20), (3, 30)")
+        .unwrap();
+    conn.execute("PRAGMA wal_checkpoint(TRUNCATE)").unwrap();
+    conn.execute("UPDATE t SET v = v + 1 WHERE id = 2").unwrap();
+    assert_eq!(
+        collect_ids_after_paused_commit(&conn, "SELECT id FROM t INDEXED BY idx_t_v"),
+        vec![1, 2, 3]
+    );
+}
+
+#[test]
+fn select_continues_after_commit_while_other_connection_has_uncommitted_write() {
+    let db = MvccTestDbNoConn::new_with_random_db();
+    let conn = db.connect();
+    conn.execute("CREATE TABLE t(id INTEGER PRIMARY KEY, v INTEGER)")
+        .unwrap();
+    conn.execute("INSERT INTO t VALUES (1, 10), (2, 20), (3, 30)")
+        .unwrap();
 
     conn.execute("BEGIN").unwrap();
     let io = conn.pager.load().io.clone();
@@ -23064,10 +23142,55 @@ fn assert_select_ids_after_commit(checkpoint_first: bool) {
     ));
     let mut ids = vec![stmt.row().unwrap().get_value(0).as_int().unwrap()];
 
-    conn.execute("COMMIT").unwrap();
+    let writer = db.connect();
+    writer.execute("BEGIN CONCURRENT").unwrap();
+    writer.execute("UPDATE t SET v = 99 WHERE id = 2").unwrap();
+    writer.execute("INSERT INTO t VALUES (4, 40)").unwrap();
 
+    conn.execute("COMMIT").unwrap();
+    drain_statement_ids(&mut stmt, io.as_ref(), &mut ids);
+    writer.execute("ROLLBACK").unwrap();
+    assert_eq!(ids, vec![1, 2, 3]);
+}
+
+#[test]
+fn select_continues_after_commit_sees_rows_inserted_in_same_txn() {
+    let db = MvccTestDbNoConn::new_with_random_db();
+    let conn = db.connect();
+    conn.execute("CREATE TABLE t(id INTEGER PRIMARY KEY)")
+        .unwrap();
+
+    conn.execute("BEGIN").unwrap();
+    conn.execute("INSERT INTO t VALUES (1), (2), (3)").unwrap();
+    assert_eq!(
+        collect_ids_after_paused_commit(&conn, "SELECT id FROM t"),
+        vec![1, 2, 3]
+    );
+}
+
+fn collect_ids_after_paused_commit(conn: &Arc<crate::Connection>, sql: &str) -> Vec<i64> {
+    if conn.get_tx_state() == crate::connection::TransactionState::None {
+        conn.execute("BEGIN").unwrap();
+    }
+    let io = conn.pager.load().io.clone();
+    let mut stmt = conn.prepare(sql).unwrap();
+    assert!(matches!(
+        step_until_row_or_done(&mut stmt, io.as_ref()),
+        crate::StepResult::Row
+    ));
+    let mut ids = vec![stmt.row().unwrap().get_value(0).as_int().unwrap()];
+    conn.execute("COMMIT").unwrap();
+    drain_statement_ids(&mut stmt, io.as_ref(), &mut ids);
+    ids
+}
+
+fn drain_statement_ids(
+    stmt: &mut crate::Statement,
+    io: &dyn crate::io::IO,
+    ids: &mut Vec<i64>,
+) {
     loop {
-        match step_until_row_or_done(&mut stmt, io.as_ref()) {
+        match step_until_row_or_done(stmt, io) {
             crate::StepResult::Row => {
                 ids.push(stmt.row().unwrap().get_value(0).as_int().unwrap());
             }
@@ -23075,7 +23198,6 @@ fn assert_select_ids_after_commit(checkpoint_first: bool) {
             other => panic!("unexpected step after COMMIT: {other:?}"),
         }
     }
-    assert_eq!(ids, vec![1, 2, 3]);
 }
 
 fn step_until_row_or_done(
