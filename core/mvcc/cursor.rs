@@ -458,7 +458,7 @@ impl<A: ConcurrentAllocator> IndexShadowScan<A> {
         &mut self,
         db: &MvStore<Clock, A>,
         table_id: MVTableId,
-        tx_id: u64,
+        snapshot: MvccReadSnapshot,
         key: &Arc<SortableIndexKey>,
     ) -> bool {
         // Read the epoch before (re)seeding. If a key insert races past this
@@ -506,7 +506,7 @@ impl<A: ConcurrentAllocator> IndexShadowScan<A> {
                     // Version present at this key -> resolve the shadow bit now,
                     // on the one key that actually matches a B-tree row.
                     std::cmp::Ordering::Equal => {
-                        return !db.index_chain_invalidates_btree(versions, tx_id);
+                        return !db.index_chain_invalidates_btree(versions, snapshot);
                     }
                     // Scan is behind the B-tree (a version-only key). Catch up below.
                     std::cmp::Ordering::Less => {}
@@ -638,7 +638,7 @@ impl<Clock: LogicalClock + 'static, A: ConcurrentAllocator> MvccLazyCursor<Clock
         };
         let valid =
             self.index_shadow_scan
-                .btree_row_is_valid(&self.db, self.table_id, self.tx_id, rec);
+                .btree_row_is_valid(&self.db, self.table_id, self.snapshot, rec);
         // Debug-only cross-check: any scan divergence (e.g. a missed reset)
         // fails the test suite instead of shipping.
         #[cfg(debug_assertions)]
@@ -647,7 +647,7 @@ impl<Clock: LogicalClock + 'static, A: ConcurrentAllocator> MvccLazyCursor<Clock
             self.db.query_btree_version_is_valid(
                 self.table_id,
                 &RowKey::Record(rec.clone()),
-                self.tx_id
+                self.snapshot
             ),
             "index shadow scan diverged from query_btree_version_is_valid"
         );
@@ -831,7 +831,7 @@ impl<Clock: LogicalClock + 'static, A: ConcurrentAllocator> MvccLazyCursor<Clock
 
     fn query_btree_version_is_valid(&self, key: &RowKey) -> bool {
         self.db
-            .query_btree_version_is_valid(self.table_id, key, self.tx_id)
+            .query_btree_version_is_valid(self.table_id, key, self.snapshot)
     }
 
     /// Advance MVCC iterator and return next visible row key in the direction that the iterator was initialized in.

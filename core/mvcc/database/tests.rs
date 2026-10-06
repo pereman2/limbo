@@ -7990,12 +7990,13 @@ fn test_index_shadow_scan_no_spurious_dep_on_stepped_over_key() {
         .insert(key20, Arc::new(RwLock::new(tombstone_versions)));
 
     let mut scan = IndexShadowScan::default();
+    let snapshot = store.read_snapshot(reader_id).unwrap();
     // B-tree key 10: scan seeds at the first index key >= 10 (key 20), which is
     // ahead → row visible, predicate not evaluated.
-    assert!(scan.btree_row_is_valid(store, table_id, reader_id, &idx_key(10)));
+    assert!(scan.btree_row_is_valid(store, table_id, snapshot, &idx_key(10)));
     // B-tree key 30: scan (at key 20) is behind → steps over the tombstone.
     // It must advance past it WITHOUT evaluating the shadow predicate.
-    assert!(scan.btree_row_is_valid(store, table_id, reader_id, &idx_key(30)));
+    assert!(scan.btree_row_is_valid(store, table_id, snapshot, &idx_key(30)));
 
     let reader = store.txs.get(&reader_id).unwrap();
     assert_eq!(
@@ -23184,11 +23185,7 @@ fn collect_ids_after_paused_commit(conn: &Arc<crate::Connection>, sql: &str) -> 
     ids
 }
 
-fn drain_statement_ids(
-    stmt: &mut crate::Statement,
-    io: &dyn crate::io::IO,
-    ids: &mut Vec<i64>,
-) {
+fn drain_statement_ids(stmt: &mut crate::Statement, io: &dyn crate::io::IO, ids: &mut Vec<i64>) {
     loop {
         match step_until_row_or_done(stmt, io) {
             crate::StepResult::Row => {

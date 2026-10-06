@@ -5845,7 +5845,7 @@ impl<Clock: LogicalClock, A: ConcurrentAllocator> MvStore<Clock, A> {
         versions: &RowVersions<A>,
     ) -> Result<Option<Row>> {
         let versions = versions.read();
-        if let Some(rv) = self.find_visible_version(snapshot, &versions)? {
+        if let Some(rv) = self.find_visible_version(snapshot, &versions) {
             return Ok(Some(rv.row.clone()));
         }
         Ok(None)
@@ -5863,7 +5863,7 @@ impl<Clock: LogicalClock, A: ConcurrentAllocator> MvStore<Clock, A> {
         record: &mut ImmutableRecord,
     ) -> Result<bool> {
         let versions = versions.read();
-        if let Some(rv) = self.find_visible_version(snapshot, &versions)? {
+        if let Some(rv) = self.find_visible_version(snapshot, &versions) {
             record.invalidate();
             record.start_serialization(rv.row.payload())?;
             return Ok(true);
@@ -6024,7 +6024,7 @@ impl<Clock: LogicalClock, A: ConcurrentAllocator> MvStore<Clock, A> {
     }
 
     /// Whether an already-resolved index version chain shadows (invalidates) the
-    /// corresponding B-tree row for `tx_id`.
+    /// corresponding B-tree row for `snapshot`.
     ///
     /// This is exactly the predicate used by the `RowKey::Record` branch of
     /// [`Self::query_btree_version_is_valid`], but it takes the version chain
@@ -6035,35 +6035,25 @@ impl<Clock: LogicalClock, A: ConcurrentAllocator> MvStore<Clock, A> {
     pub(crate) fn index_chain_invalidates_btree(
         &self,
         versions: &RwLock<RowVersionChain<A>>,
-        tx_id: TxID,
+        snapshot: MvccReadSnapshot,
     ) -> bool {
-        let tx = self
-            .txs
-            .get(&tx_id)
-            .expect("transaction should exist in txs map");
-        let tx = tx.value();
         let versions = versions.read();
         if versions.is_empty() {
             return false;
         }
         let table_id = versions[0].row.id.table_id;
-        if self.btree_covers_chain_for_tx(tx, table_id, &versions) {
-            return false;
-        }
-        versions.iter().rev().any(|version| {
-            version.is_btree_invalidating_version(tx, &self.txs, &self.finalized_tx_states)
-        })
+        !self.chain_leaves_btree_row_valid(snapshot, table_id, &versions)
     }
 
-    /// Check if the B-tree version of a row should be shown to the given transaction.
+    /// Check if the B-tree version of a row should be shown to the given snapshot.
     ///
     /// Returns true if the B-tree version is valid (should be shown).
     /// Returns false if the B-tree version is shadowed or deleted by MVCC.
-    pub fn query_btree_version_is_valid(
+    pub(crate) fn query_btree_version_is_valid(
         &self,
         table_id: MVTableId,
         row_id: &RowKey,
-        tx_id: TxID,
+        snapshot: MvccReadSnapshot,
     ) -> bool {
         match row_id {
             RowKey::Int(_) => {
@@ -6076,7 +6066,7 @@ impl<Clock: LogicalClock, A: ConcurrentAllocator> MvStore<Clock, A> {
                     return true;
                 };
                 let versions = versions.value().read();
-                self.chain_leaves_btree_row_valid(tx_id, table_id, &versions)
+                self.chain_leaves_btree_row_valid(snapshot, table_id, &versions)
             }
             RowKey::Record(record) => {
                 // Dont allocate new SkipList here to avoid introducing concerns around error handling
@@ -6089,56 +6079,138 @@ impl<Clock: LogicalClock, A: ConcurrentAllocator> MvStore<Clock, A> {
                     return true;
                 };
                 let versions = versions.value().read();
-                self.chain_leaves_btree_row_valid(tx_id, table_id, &versions)
+                self.chain_leaves_btree_row_valid(snapshot, table_id, &versions)
             }
         }
     }
 
     fn chain_leaves_btree_row_valid(
         &self,
-        tx_id: TxID,
+        snapshot: MvccReadSnapshot,
         table_id: MVTableId,
         versions: &[RowVersion],
     ) -> bool {
-        let tx = self
-            .txs
-            .get(&tx_id)
-            .expect("transaction should exist in txs map");
-        let tx = tx.value();
-        if self.btree_covers_chain_for_tx(tx, table_id, versions) {
+        if self.btree_covers_chain_for_snapshot(snapshot, table_id, versions) {
             return true;
         }
-
-        // Check if any version invalidates the B-tree row
-        let btree_is_invalid = versions.iter().rev().any(|version| {
-            version.is_btree_invalidating_version(tx, &self.txs, &self.finalized_tx_states)
-        });
-
-        !btree_is_invalid
+        !versions
+            .iter()
+            .rev()
+            .any(|version| self.version_invalidates_btree_for_snapshot(snapshot, version))
     }
 
     fn find_visible_version<'a>(
         &self,
         snapshot: MvccReadSnapshot,
         versions: &'a [RowVersion],
-    ) -> Result<Option<&'a RowVersion>> {
-        for version in versions.iter().rev() {
-            match version.is_visible_at(snapshot.begin_ts) {
-                Some(true) => return Ok(Some(version)),
-                Some(false) => {}
-                None => {
-                    let tx = self.txs.get(&snapshot.tx_id).ok_or_else(|| {
-                        LimboError::NoSuchTransactionID(snapshot.tx_id.to_string())
-                    })?;
-                    let tx = tx.value();
-                    turso_assert_eq!(tx.state, TransactionState::Active);
-                    return Ok(versions.iter().rev().find(|version| {
-                        version.is_visible_to(tx, &self.txs, &self.finalized_tx_states)
-                    }));
+    ) -> Option<&'a RowVersion> {
+        versions
+            .iter()
+            .rev()
+            .find(|version| self.version_is_visible_to_snapshot(snapshot, version))
+    }
+
+    fn version_is_visible_to_snapshot(
+        &self,
+        snapshot: MvccReadSnapshot,
+        version: &RowVersion,
+    ) -> bool {
+        if let Some(tx) = self.txs.get(&snapshot.tx_id) {
+            let tx = tx.value();
+            if tx.state.load() == TransactionState::Active {
+                return version.is_visible_to(tx, &self.txs, &self.finalized_tx_states);
+            }
+        }
+        self.version_is_visible_after_reader_left(snapshot, version)
+    }
+
+    fn version_is_visible_after_reader_left(
+        &self,
+        snapshot: MvccReadSnapshot,
+        version: &RowVersion,
+    ) -> bool {
+        if self.snapshot_own_commit_ts(snapshot).is_none() {
+            if let Some(visible) = version.is_visible_at(snapshot.begin_ts) {
+                return visible;
+            }
+        }
+        self.snapshot_begin_is_visible(snapshot, version)
+            && self.snapshot_end_is_visible(snapshot, version)
+    }
+
+    fn snapshot_begin_is_visible(&self, snapshot: MvccReadSnapshot, version: &RowVersion) -> bool {
+        match version.begin() {
+            Some(TxTimestampOrID::Timestamp(ts)) => {
+                snapshot.begin_ts > ts || self.snapshot_own_commit_ts(snapshot) == Some(ts)
+            }
+            Some(TxTimestampOrID::TxID(tx_id)) => tx_id == snapshot.tx_id,
+            None => false,
+        }
+    }
+
+    fn snapshot_end_is_visible(&self, snapshot: MvccReadSnapshot, version: &RowVersion) -> bool {
+        match version.end() {
+            None => true,
+            Some(TxTimestampOrID::Timestamp(ts)) => {
+                snapshot.begin_ts < ts && self.snapshot_own_commit_ts(snapshot) != Some(ts)
+            }
+            Some(TxTimestampOrID::TxID(tx_id)) => {
+                if tx_id == snapshot.tx_id {
+                    return false;
+                }
+                match lookup_tx_state(&self.txs, &self.finalized_tx_states, tx_id) {
+                    Some(TransactionState::Committed(committed_ts)) => {
+                        snapshot.begin_ts < committed_ts
+                    }
+                    _ => true,
                 }
             }
         }
-        Ok(None)
+    }
+
+    fn version_invalidates_btree_for_snapshot(
+        &self,
+        snapshot: MvccReadSnapshot,
+        version: &RowVersion,
+    ) -> bool {
+        if let Some(tx) = self.txs.get(&snapshot.tx_id) {
+            let tx = tx.value();
+            if tx.state.load() == TransactionState::Active {
+                return version.is_btree_invalidating_version(
+                    tx,
+                    &self.txs,
+                    &self.finalized_tx_states,
+                );
+            }
+        }
+        if self.version_is_visible_after_reader_left(snapshot, version) {
+            return true;
+        }
+        match version.end() {
+            Some(TxTimestampOrID::Timestamp(end_ts)) => {
+                snapshot.begin_ts > end_ts || self.snapshot_own_commit_ts(snapshot) == Some(end_ts)
+            }
+            Some(TxTimestampOrID::TxID(end_tx_id)) => {
+                if end_tx_id == snapshot.tx_id {
+                    return true;
+                }
+                match lookup_tx_state(&self.txs, &self.finalized_tx_states, end_tx_id) {
+                    Some(TransactionState::Committed(committed_ts)) => {
+                        snapshot.begin_ts > committed_ts
+                    }
+                    Some(TransactionState::Preparing(end_ts)) => snapshot.begin_ts > end_ts,
+                    _ => false,
+                }
+            }
+            None => false,
+        }
+    }
+
+    fn snapshot_own_commit_ts(&self, snapshot: MvccReadSnapshot) -> Option<u64> {
+        match lookup_tx_state(&self.txs, &self.finalized_tx_states, snapshot.tx_id) {
+            Some(TransactionState::Committed(ts)) => Some(ts),
+            _ => None,
+        }
     }
 
     fn find_last_visible_version(
@@ -6153,9 +6225,7 @@ impl<Clock: LogicalClock, A: ConcurrentAllocator> MvStore<Clock, A> {
             if self.btree_covers_chain_for_snapshot(snapshot, row.key().table_id, &versions) {
                 return None;
             }
-            let occupying = self
-                .find_visible_version(snapshot, &versions)
-                .expect("transaction should exist while its cursor is active")?;
+            let occupying = self.find_visible_version(snapshot, &versions)?;
             take_payload.then(|| occupying.row.clone())
         };
         Some((row.key().clone(), versions_arc.clone(), payload))
@@ -6169,8 +6239,7 @@ impl<Clock: LogicalClock, A: ConcurrentAllocator> MvStore<Clock, A> {
         let versions_arc = row.value();
         let row_id = {
             let versions = versions_arc.read();
-            self.find_visible_version(snapshot, &versions)
-                .expect("transaction should exist while its cursor is active")?
+            self.find_visible_version(snapshot, &versions)?
                 .row
                 .id
                 .clone()
