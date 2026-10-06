@@ -23422,6 +23422,200 @@ fn paused_select_pins_lwm_until_statement_resets() {
     );
 }
 
+#[test]
+fn paused_read_blocks_vacuum_gate() {
+    let db = MvccTestDb::new();
+    let pager = db.conn.pager.load().clone();
+    let tx = db.mvcc_store.begin_tx(pager).unwrap();
+    let snapshot = db.mvcc_store.read_snapshot(tx).unwrap();
+    db.mvcc_store.register_paused_read(snapshot).unwrap();
+    commit_tx(db.mvcc_store.clone(), &db.conn, tx).unwrap();
+    assert!(
+        !db.mvcc_store.txs.contains_key(&tx),
+        "committed tx must have left txs"
+    );
+
+    assert!(
+        matches!(
+            db.mvcc_store.try_begin_vacuum_gate(),
+            Err(LimboError::Busy)
+        ),
+        "VACUUM gate must be Busy while a paused read is registered"
+    );
+
+    db.mvcc_store.unregister_paused_read(tx);
+    db.mvcc_store.try_begin_vacuum_gate().unwrap();
+    db.mvcc_store.release_vacuum_gate();
+}
+
+#[test]
+fn paused_select_blocks_vacuum_after_truncate() {
+    let db = MvccTestDbNoConn::new_with_random_db_with_opts(DatabaseOpts::new().with_vacuum(true));
+    let conn = db.connect();
+    conn.execute("CREATE TABLE t(id INTEGER PRIMARY KEY)")
+        .unwrap();
+    conn.execute("INSERT INTO t VALUES (1), (2), (3)").unwrap();
+
+    conn.execute("BEGIN").unwrap();
+    let io = conn.pager.load().io.clone();
+    let mut stmt = conn.prepare("SELECT id FROM t").unwrap();
+    assert!(matches!(
+        step_until_row_or_done(&mut stmt, io.as_ref()),
+        crate::StepResult::Row
+    ));
+    conn.execute("COMMIT").unwrap();
+
+    let other = db.connect();
+    other.execute("PRAGMA wal_checkpoint(TRUNCATE)").unwrap();
+    let vacuum = other.execute("VACUUM");
+    assert!(
+        matches!(vacuum, Err(LimboError::Busy)),
+        "VACUUM must return Busy while a paused SELECT pins versions, got {vacuum:?}"
+    );
+
+    drop(stmt);
+    other.execute("VACUUM").unwrap();
+}
+
+#[test]
+fn finished_select_does_not_pin_lwm() {
+    let db = MvccTestDbNoConn::new_with_random_db();
+    let conn = db.connect();
+    conn.execute("CREATE TABLE t(id INTEGER PRIMARY KEY)")
+        .unwrap();
+    conn.execute("INSERT INTO t VALUES (1), (2), (3)").unwrap();
+
+    let io = conn.pager.load().io.clone();
+    let mut stmt = conn.prepare("SELECT id FROM t").unwrap();
+    loop {
+        match step_until_row_or_done(&mut stmt, io.as_ref()) {
+            crate::StepResult::Row => {}
+            crate::StepResult::Done => break,
+            other => panic!("unexpected step: {other:?}"),
+        }
+    }
+
+    let store = db.get_mvcc_store();
+    assert_eq!(
+        store.compute_lwm(),
+        u64::MAX,
+        "a SELECT that reached Done must release the GC floor before reset"
+    );
+    drop(stmt);
+    assert_eq!(store.compute_lwm(), u64::MAX);
+}
+
+#[test]
+fn last_paused_read_unregister_does_not_force_gc() {
+    let db = MvccTestDb::new();
+    let pager = db.conn.pager.load().clone();
+    let tx = db.mvcc_store.begin_tx(pager).unwrap();
+    db.mvcc_store
+        .insert(tx, generate_simple_string_row((-2).into(), 1, "a"))
+        .unwrap();
+    let snapshot = db.mvcc_store.read_snapshot(tx).unwrap();
+    db.mvcc_store.register_paused_read(snapshot).unwrap();
+    commit_tx(db.mvcc_store.clone(), &db.conn, tx).unwrap();
+
+    db.mvcc_store.set_gc_threshold(-1);
+    assert!(
+        !db.mvcc_store.should_gc(),
+        "inline GC must stay off when the threshold is disabled"
+    );
+    let before = db.mvcc_store.debug_gc_snapshot();
+    db.mvcc_store.unregister_paused_read(tx);
+    assert_eq!(db.mvcc_store.compute_lwm(), u64::MAX);
+    let after = db.mvcc_store.debug_gc_snapshot();
+    assert_eq!(
+        before.live_versions_at_last_gc, after.live_versions_at_last_gc,
+        "last paused-read drop must not run GC when should_gc is false"
+    );
+    assert_eq!(before.rows_versions, after.rows_versions);
+}
+
+#[test]
+fn finished_select_does_not_run_ungated_gc() {
+    let db = MvccTestDbNoConn::new_with_random_db();
+    let conn = db.connect();
+    conn.execute("CREATE TABLE t(id INTEGER PRIMARY KEY)")
+        .unwrap();
+    conn.execute("INSERT INTO t VALUES (1), (2), (3)").unwrap();
+    conn.execute("PRAGMA wal_checkpoint(TRUNCATE)").unwrap();
+
+    let store = db.get_mvcc_store();
+    store.set_gc_threshold(-1);
+    let before = store.debug_gc_snapshot();
+    conn.execute("SELECT id FROM t").unwrap();
+    let after = store.debug_gc_snapshot();
+    assert_eq!(
+        before.live_versions_at_last_gc, after.live_versions_at_last_gc,
+        "a finished SELECT must not pay for a GC pass when should_gc is false"
+    );
+}
+
+#[test]
+fn aborted_insert_releases_lwm_before_reset() {
+    let db = MvccTestDbNoConn::new_with_random_db();
+    let conn = db.connect();
+    conn.execute("CREATE TABLE t(id INTEGER PRIMARY KEY)")
+        .unwrap();
+    conn.execute("INSERT INTO t VALUES (1)").unwrap();
+
+    let io = conn.pager.load().io.clone();
+    let mut stmt = conn.prepare("INSERT INTO t VALUES (1)").unwrap();
+    let mut saw_error = false;
+    for _ in 0..100_000 {
+        match stmt.step() {
+            Ok(crate::StepResult::IO | crate::StepResult::Yield) => io.step().unwrap(),
+            Ok(crate::StepResult::Done) => panic!("duplicate INSERT must fail"),
+            Ok(other) => panic!("unexpected step: {other:?}"),
+            Err(_) => {
+                saw_error = true;
+                break;
+            }
+        }
+    }
+    assert!(saw_error, "duplicate INSERT must fail");
+
+    let store = db.get_mvcc_store();
+    assert_eq!(
+        store.compute_lwm(),
+        u64::MAX,
+        "an aborted statement must release the GC floor before reset"
+    );
+    drop(stmt);
+}
+
+#[test]
+#[ignore = "paused B-tree cursor can lose its page after COMMIT ends the pager read tx and a later same-connection statement clears the cache; keep the WAL read lock (or an equivalent page pin) while the paused cursor is open"]
+fn paused_select_same_conn_read_after_other_truncate() {
+    let db = MvccTestDbNoConn::new_with_random_db();
+    let conn = db.connect();
+    conn.execute("CREATE TABLE t(id INTEGER PRIMARY KEY)")
+        .unwrap();
+    conn.execute("INSERT INTO t VALUES (1), (2), (3)").unwrap();
+    conn.execute("PRAGMA wal_checkpoint(TRUNCATE)").unwrap();
+
+    conn.execute("BEGIN").unwrap();
+    let io = conn.pager.load().io.clone();
+    let mut stmt = conn.prepare("SELECT id FROM t").unwrap();
+    assert!(matches!(
+        step_until_row_or_done(&mut stmt, io.as_ref()),
+        crate::StepResult::Row
+    ));
+    let mut ids = vec![stmt.row().unwrap().get_value(0).as_int().unwrap()];
+    conn.execute("COMMIT").unwrap();
+
+    let writer = db.connect();
+    writer.execute("INSERT INTO t VALUES (4)").unwrap();
+    writer.execute("PRAGMA wal_checkpoint(TRUNCATE)").unwrap();
+
+    conn.execute("SELECT count(*) FROM t").unwrap();
+
+    drain_statement_ids(&mut stmt, io.as_ref(), &mut ids);
+    assert_eq!(ids, vec![1, 2, 3]);
+}
+
 fn collect_ids_after_paused_commit(conn: &Arc<crate::Connection>, sql: &str) -> Vec<i64> {
     if conn.get_tx_state() == crate::connection::TransactionState::None {
         conn.execute("BEGIN").unwrap();
