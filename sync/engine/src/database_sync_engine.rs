@@ -5308,4 +5308,140 @@ mod tests {
             assert!(matches!(result, Ok(None)), "{name}: {result:?}");
         }
     }
+
+    #[test]
+    fn checkpoint_passive_upper_bound_on_mvcc_passive_db_keeps_rows() {
+        let main_file = NamedTempFile::new().unwrap();
+        let main_path = main_file.path().to_str().unwrap().to_string();
+        let io: Arc<dyn turso_core::IO> = Arc::new(turso_core::PlatformIO::new().unwrap());
+        let sync_engine_io = SyncEngineIoStats::new(Arc::new(NoopSyncEngineIo));
+        let mut opts = default_test_opts();
+        opts.bootstrap_if_empty = false;
+        opts.logical_mvcc_pull = Some(false);
+        opts.db_opts =
+            turso_core::DatabaseOpts::new().with_experimental_mvcc_passive_checkpoint(true);
+
+        let mut gen = genawaiter::sync::Gen::new({
+            let io = io.clone();
+            let main_path = main_path.clone();
+            move |coro| async move {
+                let coro: Coro<()> = coro.into();
+                let engine = DatabaseSyncEngine::create_db(
+                    &coro,
+                    io.clone(),
+                    sync_engine_io.clone(),
+                    &main_path,
+                    opts,
+                )
+                .await
+                .map_err(|error| {
+                    Error::DatabaseSyncEngineError(format!("test create_db failed: {error}"))
+                })?;
+                assert!(
+                    !engine.meta().logical_mvcc_pull_active(),
+                    "pages protocol must take the checkpoint_passive path"
+                );
+                engine.ensure_local_mvcc_journal_mode(&coro).await?;
+
+                let conn = engine.connect_rw(&coro).await.map_err(|error| {
+                    Error::DatabaseSyncEngineError(format!("test connect_rw failed: {error}"))
+                })?;
+                conn.execute("PRAGMA mvcc_checkpoint_threshold = -1")?;
+                conn.execute("CREATE TABLE items(id INTEGER PRIMARY KEY, value TEXT)")?;
+                conn.execute("INSERT INTO items VALUES (1, 'a'), (2, 'b')")?;
+                assert!(conn.mvcc_enabled());
+                assert!(conn.experimental_mvcc_passive_checkpoint_enabled());
+                drop(conn);
+
+                engine.checkpoint(&coro).await.map_err(|error| {
+                    Error::DatabaseSyncEngineError(format!(
+                        "checkpoint(Passive {{ upper_bound }}) on an MVCC passive DB failed: {error}"
+                    ))
+                })?;
+
+                let conn = engine.connect_rw(&coro).await.map_err(|error| {
+                    Error::DatabaseSyncEngineError(format!("test reconnect failed: {error}"))
+                })?;
+                let mut stmt = conn.prepare("SELECT id FROM items ORDER BY id")?;
+                let mut ids = Vec::new();
+                while let Some(row) = run_stmt_once(&coro, &mut stmt).await? {
+                    ids.push(row.get_value(0).as_int().unwrap());
+                }
+                assert_eq!(ids, vec![1, 2]);
+                Result::Ok(())
+            }
+        });
+
+        loop {
+            match gen.resume_with(Ok(())) {
+                genawaiter::GeneratorState::Yielded(..) => io.step().unwrap(),
+                genawaiter::GeneratorState::Complete(result) => break result.unwrap(),
+            }
+        }
+    }
+
+    #[test]
+    fn checkpoint_passive_stale_high_watermark_on_mvcc_passive_db() {
+        let main_file = NamedTempFile::new().unwrap();
+        let main_path = main_file.path().to_str().unwrap().to_string();
+        let io: Arc<dyn turso_core::IO> = Arc::new(turso_core::PlatformIO::new().unwrap());
+        let sync_engine_io = SyncEngineIoStats::new(Arc::new(NoopSyncEngineIo));
+        let mut opts = default_test_opts();
+        opts.bootstrap_if_empty = false;
+        opts.logical_mvcc_pull = Some(false);
+        opts.db_opts =
+            turso_core::DatabaseOpts::new().with_experimental_mvcc_passive_checkpoint(true);
+
+        let mut gen = genawaiter::sync::Gen::new({
+            let io = io.clone();
+            let main_path = main_path.clone();
+            move |coro| async move {
+                let coro: Coro<()> = coro.into();
+                let engine = DatabaseSyncEngine::create_db(
+                    &coro,
+                    io.clone(),
+                    sync_engine_io.clone(),
+                    &main_path,
+                    opts,
+                )
+                .await
+                .map_err(|error| {
+                    Error::DatabaseSyncEngineError(format!("test create_db failed: {error}"))
+                })?;
+
+                engine.ensure_local_mvcc_journal_mode(&coro).await?;
+
+                let conn = engine.connect_rw(&coro).await.map_err(|error| {
+                    Error::DatabaseSyncEngineError(format!("test connect_rw failed: {error}"))
+                })?;
+                conn.execute("PRAGMA mvcc_checkpoint_threshold = -1")?;
+                conn.execute("CREATE TABLE items(id INTEGER PRIMARY KEY, value TEXT)")?;
+                conn.execute("INSERT INTO items VALUES (1, 'a')")?;
+                drop(conn);
+
+                engine
+                    .update_meta(&coro, |meta| {
+                        meta.revert_since_wal_watermark = 9999;
+                    })
+                    .await
+                    .map_err(|error| {
+                        Error::DatabaseSyncEngineError(format!("test update_meta failed: {error}"))
+                    })?;
+
+                engine.checkpoint(&coro).await.map_err(|error| {
+                    Error::DatabaseSyncEngineError(format!(
+                        "stale WAL watermark must not fail checkpoint on an MVCC passive DB: {error}"
+                    ))
+                })?;
+                Result::Ok(())
+            }
+        });
+
+        loop {
+            match gen.resume_with(Ok(())) {
+                genawaiter::GeneratorState::Yielded(..) => io.step().unwrap(),
+                genawaiter::GeneratorState::Complete(result) => break result.unwrap(),
+            }
+        }
+    }
 }

@@ -412,3 +412,159 @@ fn page_export_after_retained_passive_misses_live_tail() {
         "a replica that starts from the Passive DB image must also receive the live log tail"
     );
 }
+
+#[test]
+#[should_panic(expected = "MVCC checkpoint supports only Truncate or Passive")]
+fn known_full_checkpoint_panics_when_passive_flag_on() {
+    let db = MvccTestDbNoConn::new_with_random_db_passive();
+    let conn = db.connect();
+    conn.execute("PRAGMA mvcc_checkpoint_threshold = -1")
+        .unwrap();
+    conn.execute("CREATE TABLE t(id INTEGER PRIMARY KEY)")
+        .unwrap();
+    conn.execute("INSERT INTO t VALUES (1)").unwrap();
+    let _ = conn.checkpoint(CheckpointMode::Full);
+}
+
+#[test]
+#[should_panic(expected = "MVCC checkpoint supports only Truncate or Passive")]
+fn known_restart_checkpoint_panics_when_passive_flag_on() {
+    let db = MvccTestDbNoConn::new_with_random_db_passive();
+    let conn = db.connect();
+    conn.execute("PRAGMA mvcc_checkpoint_threshold = -1")
+        .unwrap();
+    conn.execute("CREATE TABLE t(id INTEGER PRIMARY KEY)")
+        .unwrap();
+    conn.execute("INSERT INTO t VALUES (1)").unwrap();
+    let _ = conn.checkpoint(CheckpointMode::Restart);
+}
+
+#[test]
+fn sync_off_passive_checkpoint_keeps_rows_after_reopen() {
+    let mut db = MvccTestDbNoConn::new_with_random_db_passive();
+    {
+        let conn = db.connect();
+        conn.execute("PRAGMA mvcc_checkpoint_threshold = -1")
+            .unwrap();
+        conn.execute("PRAGMA synchronous=OFF").unwrap();
+        conn.execute("CREATE TABLE t(id INTEGER PRIMARY KEY, v TEXT)")
+            .unwrap();
+        conn.execute("INSERT INTO t VALUES (1, 'base')").unwrap();
+        conn.execute("PRAGMA wal_checkpoint(PASSIVE)").unwrap();
+        conn.execute("INSERT INTO t VALUES (2, 'tail')").unwrap();
+        conn.execute("PRAGMA wal_checkpoint(PASSIVE)").unwrap();
+        assert_eq!(ids(&conn), vec![1, 2]);
+    }
+    db.restart();
+    let conn = db.connect();
+    assert_eq!(
+        ids(&conn),
+        vec![1, 2],
+        "rows must survive reopen after Passive checkpoint with PRAGMA synchronous=OFF"
+    );
+}
+
+#[test]
+fn sync_engine_style_passive_upper_bound_keeps_committed_rows() {
+    let mut db = MvccTestDbNoConn::new_with_random_db_passive();
+    {
+        let conn = db.connect();
+        conn.execute("PRAGMA mvcc_checkpoint_threshold = -1")
+            .unwrap();
+        conn.execute("CREATE TABLE t(id INTEGER PRIMARY KEY, v TEXT)")
+            .unwrap();
+        conn.execute("INSERT INTO t VALUES (1, 'a')").unwrap();
+        conn.execute("INSERT INTO t VALUES (2, 'b')").unwrap();
+        let result = conn
+            .checkpoint(CheckpointMode::Passive {
+                upper_bound_inclusive: Some(1),
+            })
+            .expect("sync engine checkpoint_passive calls Connection::checkpoint(Passive { upper_bound })");
+        assert_eq!(ids(&conn), vec![1, 2]);
+        let _ = result;
+    }
+    db.restart();
+    let conn = db.connect();
+    assert_eq!(
+        ids(&conn),
+        vec![1, 2],
+        "Passive {{ upper_bound: Some(1) }} must not drop committed MVCC rows"
+    );
+}
+
+#[test]
+fn sync_engine_style_passive_zero_watermark_keeps_committed_rows() {
+    let mut db = MvccTestDbNoConn::new_with_random_db_passive();
+    {
+        let conn = db.connect();
+        conn.execute("PRAGMA mvcc_checkpoint_threshold = -1")
+            .unwrap();
+        conn.execute("CREATE TABLE t(id INTEGER PRIMARY KEY, v TEXT)")
+            .unwrap();
+        conn.execute("INSERT INTO t VALUES (1, 'a')").unwrap();
+        conn.checkpoint(CheckpointMode::Passive {
+            upper_bound_inclusive: Some(0),
+        })
+        .expect("default sync engine revert_since_wal_watermark is 0");
+        assert_eq!(ids(&conn), vec![1]);
+    }
+    db.restart();
+    let conn = db.connect();
+    assert_eq!(ids(&conn), vec![1]);
+}
+
+#[test]
+fn sync_engine_style_passive_stale_high_watermark_reports_enough_frames() {
+    let db = MvccTestDbNoConn::new_with_random_db_passive();
+    let conn = db.connect();
+    conn.execute("PRAGMA mvcc_checkpoint_threshold = -1")
+        .unwrap();
+    conn.execute("CREATE TABLE t(id INTEGER PRIMARY KEY, v TEXT)")
+        .unwrap();
+    conn.execute("INSERT INTO t VALUES (1, 'a')").unwrap();
+    let result = conn
+        .checkpoint(CheckpointMode::Passive {
+            upper_bound_inclusive: Some(9999),
+        })
+        .expect("Connection::checkpoint itself must not fail on a stale WAL watermark");
+    assert!(
+        result.wal_max_frame >= 9999,
+        "sync engine checkpoint_passive errors when wal_max_frame < watermark; got wal_max_frame={} watermark=9999",
+        result.wal_max_frame
+    );
+}
+
+#[test]
+fn second_open_with_passive_flag_must_not_reuse_flag_off_database() {
+    let dir = tempfile::TempDir::new().unwrap();
+    let path = dir.path().join("reuse.db");
+    let path_str = path.to_str().unwrap();
+    let io = Arc::new(PlatformIO::new().unwrap());
+    {
+        let mut manager = crate::DATABASE_MANAGER.lock();
+        manager.clear();
+    }
+    let off = Database::open_file_with_flags(
+        io.clone(),
+        path_str,
+        OpenFlags::default(),
+        DatabaseOpts::new(),
+        None,
+        Arc::new(SqliteDialect),
+    )
+    .unwrap();
+    assert!(!off.experimental_mvcc_passive_checkpoint_enabled());
+    let on = Database::open_file_with_flags(
+        io,
+        path_str,
+        OpenFlags::default(),
+        DatabaseOpts::new().with_experimental_mvcc_passive_checkpoint(true),
+        None,
+        Arc::new(SqliteDialect),
+    )
+    .unwrap();
+    assert!(
+        on.experimental_mvcc_passive_checkpoint_enabled(),
+        "a later open of the same file with the passive flag on must not keep the first open's flag-off Database"
+    );
+}

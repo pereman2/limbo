@@ -134,3 +134,34 @@ fn exported_db_file_after_retained_passive_is_missing_live_tail() {
         "a replica bootstrapped from the Passive DB file must also see the live log tail"
     );
 }
+
+#[test]
+fn sync_off_passive_checkpoint_keeps_committed_rows_after_reopen() {
+    let tmp = passive_db();
+    let conn = tmp.connect_limbo();
+    conn.execute("PRAGMA mvcc_checkpoint_threshold = -1")
+        .unwrap();
+    conn.execute("PRAGMA synchronous=OFF").unwrap();
+    conn.execute("CREATE TABLE t(id INTEGER PRIMARY KEY, v TEXT)")
+        .unwrap();
+    conn.execute("INSERT INTO t VALUES (1, 'a')").unwrap();
+    conn.execute("INSERT INTO t VALUES (2, 'b')").unwrap();
+    conn.execute("PRAGMA wal_checkpoint(PASSIVE)").unwrap();
+    conn.close().unwrap();
+
+    let db = Database::open_file_with_flags(
+        tmp.io.clone(),
+        tmp.path.to_str().unwrap(),
+        OpenFlags::default(),
+        DatabaseOpts::new().with_experimental_mvcc_passive_checkpoint(true),
+        None,
+        std::sync::Arc::new(SqliteDialect),
+    )
+    .unwrap();
+    let conn = db.connect().unwrap();
+    assert_eq!(
+        ids(&conn),
+        vec![1, 2],
+        "rows must survive reopen after Passive checkpoint with PRAGMA synchronous=OFF"
+    );
+}
