@@ -15131,6 +15131,45 @@ fn test_create_then_drop_index_in_one_tx_replays_on_reopen() {
     assert_eq!(&rows[0][0].to_string(), "ok");
 }
 
+#[test]
+fn test_create_then_drop_index_in_one_tx_with_more_index_entries_than_one_chunk_replays_on_reopen()
+{
+    let row_count = MVCC_COMMIT_BATCH_SIZE + 500;
+    let mut db = MvccTestDbNoConn::new_with_random_db();
+    {
+        let conn = db.connect();
+        conn.execute("CREATE TABLE t(v INTEGER)").unwrap();
+        conn.execute("BEGIN").unwrap();
+        for v in 0..row_count {
+            conn.execute(format!("INSERT INTO t VALUES ({v})")).unwrap();
+        }
+        conn.execute("COMMIT").unwrap();
+        conn.execute("PRAGMA wal_checkpoint(TRUNCATE)").unwrap();
+        conn.close().unwrap();
+    }
+    {
+        db.get_mvcc_store().set_checkpoint_threshold(-1);
+        let conn = db.connect();
+        conn.execute("BEGIN").unwrap();
+        conn.execute("CREATE INDEX idx ON t(v)").unwrap();
+        conn.execute("DROP INDEX idx").unwrap();
+        conn.execute("COMMIT").unwrap();
+        conn.close().unwrap();
+    }
+    db.restart();
+    let conn = db.connect();
+    let names: Vec<String> = get_rows(&conn, "SELECT name FROM sqlite_schema ORDER BY rowid")
+        .iter()
+        .map(|r| r[0].to_string())
+        .collect();
+    assert_eq!(names, vec!["__turso_internal_mvcc_meta", "t"]);
+    let rows = get_rows(&conn, "SELECT count(*) FROM t");
+    assert_eq!(rows[0][0].as_int().unwrap(), row_count as i64);
+    let rows = get_rows(&conn, "PRAGMA integrity_check");
+    assert_eq!(rows.len(), 1);
+    assert_eq!(&rows[0][0].to_string(), "ok");
+}
+
 /// These cases came from an adversarial DDL/DML matrix. They did not find a
 /// failure, but they cover schema-before/schema-after combinations that the
 /// frame-level recovery code must keep working: dropped indexes, newly-created

@@ -1547,6 +1547,8 @@ pub struct BuildLogRecordCtx {
     /// op after both row-version passes complete (preserves on-disk
     /// order: ops first, header last).
     pub pending_header: Option<DatabaseHeader>,
+    pub btree_ids_created_and_dropped_in_tx: HashSet<MVTableId>,
+    pub btree_ids_removed_from_schema_by_tx: HashSet<MVTableId>,
 }
 
 /// Iteration state for the chunked `RewriteLiveVersions` step.
@@ -2011,18 +2013,116 @@ impl<Clock: LogicalClock, A: ConcurrentAllocator> CommitStateMachine<Clock, A> {
             .txs
             .get(&self.tx_id)
             .ok_or_else(|| LimboError::NoSuchTransactionID(self.tx_id.to_string()))?;
-        let tx = tx.value();
+        self.start_build_log_record(mvcc_store, tx.value(), end_ts)
+    }
+
+    fn start_build_log_record(
+        &mut self,
+        mvcc_store: &Arc<MvStore<Clock, A>>,
+        tx: &Transaction<A>,
+        end_ts: u64,
+    ) -> Result<()> {
+        let tx_id = self.tx_id;
         let pending_header = if tx.header_dirty.load(Ordering::Acquire) {
             Some(*tx.header.read())
         } else {
             None
         };
+
+        // A sqlite_schema row that is inserted and deleted inside one
+        // transaction does not always mean the underlying table or index was
+        // inserted and deleted. ALTER TABLE can rewrite sqlite_schema several
+        // times for an existing root page. We only treat a root page as
+        // transaction-local when it has no schema row before the transaction and
+        // no schema row after it.
+
+        let is_our_begin = |row_version: &RowVersion| {
+            matches!(
+                row_version.begin(),
+                Some(TxTimestampOrID::TxID(vid)) if vid == tx_id
+            )
+        };
+        let is_our_end = |row_version: &RowVersion| {
+            matches!(
+                row_version.end(),
+                Some(TxTimestampOrID::TxID(vid)) if vid == tx_id
+            )
+        };
+
+        let mut btree_ids_created_and_dropped_in_tx: HashSet<MVTableId> = HashSet::default();
+        let mut btree_ids_removed_from_schema_by_tx: HashSet<MVTableId> = HashSet::default();
+        {
+            let write_set = tx.write_set.lock();
+            let frame_writes_schema = write_set
+                .entries
+                .iter()
+                .any(|(id, _)| id.table_id == SQLITE_SCHEMA_MVCC_TABLE_ID);
+
+            // Decoding sqlite_schema records is only needed for DDL frames.
+            // Normal DML frames do not touch sqlite_schema, so avoid parsing
+            // schema records while committing the common path.
+            if frame_writes_schema {
+                let mut schema_roots_created_and_deleted_in_tx: HashSet<i64> = HashSet::default();
+                let mut schema_roots_deleted_by_tx: HashSet<i64> = HashSet::default();
+                let mut schema_roots_present_before_tx: HashSet<i64> = HashSet::default();
+                let mut schema_roots_present_after_tx: HashSet<i64> = HashSet::default();
+
+                for (id, row_versions) in &write_set.entries {
+                    // Only sqlite_schema entries can yield a btree identity. The
+                    // common path (CREATE INDEX on a populated table, bulk DML)
+                    // has tens of thousands of write_set entries that are NOT
+                    // sqlite_schema; locking each and parsing every version was
+                    // the dominant cost of MVCC commit on this branch.
+                    if id.table_id != SQLITE_SCHEMA_MVCC_TABLE_ID {
+                        continue;
+                    }
+                    for row_version in row_versions.read().iter() {
+                        let Some(identity) = sqlite_schema_btree_identity(row_version) else {
+                            continue;
+                        };
+                        let our_begin = is_our_begin(row_version);
+                        let our_end = is_our_end(row_version);
+                        if !our_begin {
+                            schema_roots_present_before_tx.insert(identity.root_page);
+                        }
+                        if our_end {
+                            schema_roots_deleted_by_tx.insert(identity.root_page);
+                        }
+                        if !our_end {
+                            schema_roots_present_after_tx.insert(identity.root_page);
+                        }
+                        if our_begin && our_end && !row_version.btree_resident {
+                            schema_roots_created_and_deleted_in_tx.insert(identity.root_page);
+                        }
+                    }
+                }
+
+                for root_page in schema_roots_deleted_by_tx {
+                    if !schema_roots_present_after_tx.contains(&root_page) {
+                        btree_ids_removed_from_schema_by_tx
+                            .insert(mvcc_store.get_table_id_from_root_page(root_page));
+                    }
+                }
+
+                for root_page in schema_roots_created_and_deleted_in_tx {
+                    if !schema_roots_present_before_tx.contains(&root_page)
+                        && !schema_roots_present_after_tx.contains(&root_page)
+                    {
+                        btree_ids_created_and_dropped_in_tx
+                            .insert(mvcc_store.get_table_id_from_root_page(root_page));
+                    }
+                }
+            }
+        }
+
         self.state = CommitState::BuildLogRecord(BuildLogRecordCtx {
             end_ts,
             log_record: LogRecord::new(end_ts, mvcc_store.logical_log_allocator())?,
             cursor: 0,
             schema_process: true,
             pending_header,
+            btree_ids_created_and_dropped_in_tx,
+            btree_ids_removed_from_schema_by_tx,
         });
         Ok(())
     }
@@ -2384,13 +2484,8 @@ impl<Clock: LogicalClock, A: ConcurrentAllocator> CommitStateMachine<Clock, A> {
             unreachable!("step_build_log_record requires BuildLogRecord state")
         };
         let end_ts = ctx.end_ts;
-
-        // A sqlite_schema row that is inserted and deleted inside one
-        // transaction does not always mean the underlying table or index was
-        // inserted and deleted. ALTER TABLE can rewrite sqlite_schema several
-        // times for an existing root page. We only treat a root page as
-        // transaction-local when it has no schema row before the transaction and
-        // no schema row after it.
+        let btree_ids_created_and_dropped_in_tx = &ctx.btree_ids_created_and_dropped_in_tx;
+        let btree_ids_removed_from_schema_by_tx = &ctx.btree_ids_removed_from_schema_by_tx;
 
         let is_our_begin = |row_version: &RowVersion| {
             matches!(
@@ -2404,72 +2499,6 @@ impl<Clock: LogicalClock, A: ConcurrentAllocator> CommitStateMachine<Clock, A> {
                 Some(TxTimestampOrID::TxID(vid)) if vid == tx_id
             )
         };
-
-        let mut btree_ids_created_and_dropped_in_tx: HashSet<MVTableId> = HashSet::default();
-        let mut btree_ids_removed_from_schema_by_tx: HashSet<MVTableId> = HashSet::default();
-        {
-            let write_set = tx.write_set.lock();
-            let frame_writes_schema = write_set
-                .entries
-                .iter()
-                .any(|(id, _)| id.table_id == SQLITE_SCHEMA_MVCC_TABLE_ID);
-
-            // Decoding sqlite_schema records is only needed for DDL frames.
-            // Normal DML frames do not touch sqlite_schema, so avoid parsing
-            // schema records while committing the common path.
-            if frame_writes_schema {
-                let mut schema_roots_created_and_deleted_in_tx: HashSet<i64> = HashSet::default();
-                let mut schema_roots_deleted_by_tx: HashSet<i64> = HashSet::default();
-                let mut schema_roots_present_before_tx: HashSet<i64> = HashSet::default();
-                let mut schema_roots_present_after_tx: HashSet<i64> = HashSet::default();
-
-                for (id, row_versions) in &write_set.entries {
-                    // Only sqlite_schema entries can yield a btree identity. The
-                    // common path (CREATE INDEX on a populated table, bulk DML)
-                    // has tens of thousands of write_set entries that are NOT
-                    // sqlite_schema; locking each and parsing every version was
-                    // the dominant cost of MVCC commit on this branch.
-                    if id.table_id != SQLITE_SCHEMA_MVCC_TABLE_ID {
-                        continue;
-                    }
-                    for row_version in row_versions.read().iter() {
-                        let Some(identity) = sqlite_schema_btree_identity(row_version) else {
-                            continue;
-                        };
-                        let our_begin = is_our_begin(row_version);
-                        let our_end = is_our_end(row_version);
-                        if !our_begin {
-                            schema_roots_present_before_tx.insert(identity.root_page);
-                        }
-                        if our_end {
-                            schema_roots_deleted_by_tx.insert(identity.root_page);
-                        }
-                        if !our_end {
-                            schema_roots_present_after_tx.insert(identity.root_page);
-                        }
-                        if our_begin && our_end && !row_version.btree_resident {
-                            schema_roots_created_and_deleted_in_tx.insert(identity.root_page);
-                        }
-                    }
-                }
-
-                for root_page in schema_roots_deleted_by_tx {
-                    if !schema_roots_present_after_tx.contains(&root_page) {
-                        btree_ids_removed_from_schema_by_tx
-                            .insert(mvcc_store.get_table_id_from_root_page(root_page));
-                    }
-                }
-
-                for root_page in schema_roots_created_and_deleted_in_tx {
-                    if !schema_roots_present_before_tx.contains(&root_page)
-                        && !schema_roots_present_after_tx.contains(&root_page)
-                    {
-                        btree_ids_created_and_dropped_in_tx
-                            .insert(mvcc_store.get_table_id_from_root_page(root_page));
-                    }
-                }
-            }
-        }
 
         // Remap a table_id to its canonical form for the log. After checkpoint,
         // a table's in-memory table_id (e.g. -53) may differ from -(root_page)
@@ -3370,18 +3399,7 @@ impl<Clock: LogicalClock, A: ConcurrentAllocator> StateTransition for CommitStat
                 // snapshot the dirty header for the tail of the payload.
                 // Live row versions stay on TxID references until CommitEnd
                 // so rollback of an abandoned commit can still match them.
-                let pending_header = if tx.header_dirty.load(Ordering::Acquire) {
-                    Some(*tx.header.read())
-                } else {
-                    None
-                };
-                self.state = CommitState::BuildLogRecord(BuildLogRecordCtx {
-                    end_ts,
-                    log_record: LogRecord::new(end_ts, mvcc_store.logical_log_allocator())?,
-                    cursor: 0,
-                    schema_process: true,
-                    pending_header,
-                });
+                self.start_build_log_record(mvcc_store, tx, end_ts)?;
                 return Ok(TransitionResult::Continue);
             }
             // Chunked: yields every MVCC_COMMIT_BATCH_SIZE rowids. Pulled out
