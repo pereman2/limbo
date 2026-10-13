@@ -1510,9 +1510,8 @@ pub enum CommitState<Clock: LogicalClock, A: ConcurrentAllocator = TursoAllocato
         end_ts: u64,
     },
     Checkpoint {
-        // TODO: if and when we transform this code to async we won't be needing this explicit state machine nor
-        // the mutex
-        state_machine: Box<Mutex<StateMachine<CheckpointStateMachine<Clock, A>>>>,
+        // TODO: if and when we transform this code to async we won't be needing this explicit state machine
+        state_machine: Box<StateMachine<CheckpointStateMachine<Clock, A>>>,
     },
     CommitEnd {
         end_ts: u64,
@@ -1727,7 +1726,6 @@ impl<Clock: LogicalClock, A: ConcurrentAllocator> CommitStateMachine<Clock, A> {
     pub(crate) fn cleanup_mvcc_checkpoint_state(&mut self) {
         if let CommitState::Checkpoint { state_machine } = &mut self.state {
             let _ = state_machine
-                .lock()
                 .inner_mut()
                 .cleanup_after_external_io_error(LimboError::InternalError(
                     "mvcc: cleanup_unfinished_commit".to_string(),
@@ -3010,7 +3008,7 @@ impl<Clock: LogicalClock, A: ConcurrentAllocator> CommitStateMachine<Clock, A> {
         let tx_id = self.tx_id;
         let tx = self.committing_tx(mvcc_store).ok_or_else(|| {
             LimboError::NoSuchTransactionID(format!(
-                "tx id {tx_id} not found in step_build_logical_record"
+                "tx id {tx_id} not found in step_rewrite_live_versions"
             ))
         })?;
         let write_set = tx.write_set.lock();
@@ -3040,6 +3038,15 @@ impl<Clock: LogicalClock, A: ConcurrentAllocator> CommitStateMachine<Clock, A> {
         }
         self.state = CommitState::FinalizeCommit { end_ts };
         Ok(TransitionResult::Continue)
+    }
+
+    fn take_log_record(&mut self, next_state: CommitState<Clock, A>) -> LogRecord {
+        match std::mem::replace(&mut self.state, next_state) {
+            CommitState::BeginCommitLogicalLog { log_record, .. }
+            | CommitState::UpgradeLogicalLogHeader { log_record, .. }
+            | CommitState::WriteLogicalLog { log_record, .. } => log_record,
+            _ => unreachable!("take_log_record requires a state that holds a log record"),
+        }
     }
 }
 
@@ -3393,11 +3400,7 @@ impl<Clock: LogicalClock, A: ConcurrentAllocator> StateTransition for CommitStat
                 let is_exclusive = mvcc_store.is_exclusive_tx(&self.tx_id);
                 if !is_exclusive && self.commit_coordinator.group_commit_enabled() {
                     let end_ts = *end_ts;
-                    let log_record = match std::mem::replace(&mut self.state, CommitState::Initial)
-                    {
-                        CommitState::BeginCommitLogicalLog { log_record, .. } => log_record,
-                        _ => unreachable!(),
-                    };
+                    let log_record = self.take_log_record(CommitState::Initial);
                     let ticket =
                         self.commit_coordinator
                             .enqueue(self.tx_id, log_record, self.sync_mode);
@@ -3416,16 +3419,7 @@ impl<Clock: LogicalClock, A: ConcurrentAllocator> StateTransition for CommitStat
                     tx.pager_commit_lock_held.store(true, Ordering::Release);
                 }
                 let end_ts = *end_ts;
-                let log_record = match std::mem::replace(
-                    &mut self.state,
-                    CommitState::UpgradeLogicalLogHeader {
-                        end_ts,
-                        log_record: LogRecord::empty(end_ts, mvcc_store.logical_log_allocator()),
-                    },
-                ) {
-                    CommitState::BeginCommitLogicalLog { log_record, .. } => log_record,
-                    _ => unreachable!(),
-                };
+                let log_record = self.take_log_record(CommitState::Initial);
                 self.state = CommitState::UpgradeLogicalLogHeader { end_ts, log_record };
                 Ok(TransitionResult::Continue)
             }
@@ -3448,28 +3442,14 @@ impl<Clock: LogicalClock, A: ConcurrentAllocator> StateTransition for CommitStat
                     return Ok(TransitionResult::Io(IOCompletions(c)));
                 }
                 let end_ts = *end_ts;
-                let log_record = match std::mem::replace(
-                    &mut self.state,
-                    CommitState::WriteLogicalLog {
-                        end_ts,
-                        log_record: LogRecord::empty(end_ts, mvcc_store.logical_log_allocator()),
-                    },
-                ) {
-                    CommitState::UpgradeLogicalLogHeader { log_record, .. } => log_record,
-                    _ => unreachable!(),
-                };
+                let log_record = self.take_log_record(CommitState::Initial);
                 self.state = CommitState::WriteLogicalLog { end_ts, log_record };
                 Ok(TransitionResult::Continue)
             }
             CommitState::WriteLogicalLog { end_ts, .. } => {
                 let end_ts = *end_ts;
-                let log_record = match std::mem::replace(
-                    &mut self.state,
-                    CommitState::FinishLogicalLogWrite { end_ts },
-                ) {
-                    CommitState::WriteLogicalLog { log_record, .. } => log_record,
-                    _ => unreachable!(),
-                };
+                let log_record =
+                    self.take_log_record(CommitState::FinishLogicalLogWrite { end_ts });
                 if self
                     .group_batch
                     .as_ref()
@@ -3712,8 +3692,9 @@ impl<Clock: LogicalClock, A: ConcurrentAllocator> StateTransition for CommitStat
                         self.db_id,
                         auto_checkpoint_mode,
                     ));
-                    let state_machine = Box::new(Mutex::new(state_machine));
-                    self.state = CommitState::Checkpoint { state_machine };
+                    self.state = CommitState::Checkpoint {
+                        state_machine: Box::new(state_machine),
+                    };
                     return Ok(TransitionResult::Continue);
                 }
                 // Not checkpointing this commit. Reclaim invisible versions
@@ -3730,15 +3711,14 @@ impl<Clock: LogicalClock, A: ConcurrentAllocator> StateTransition for CommitStat
                 self.finalize(mvcc_store)?;
                 Ok(TransitionResult::Done(()))
             }
-            CommitState::Checkpoint { state_machine } => {
-                let step_result = {
-                    let mut sm = state_machine.lock();
-                    // Step the checkpoint SM directly so a passive publish retry can return
-                    // `Continue` and yield the commit executor (the `StateMachine` wrapper would
-                    // spin on `Continue` internally and starve pinned readers on the same thread).
-                    sm.inner_mut().step(&())
+            CommitState::Checkpoint { .. } => {
+                let CommitState::Checkpoint { state_machine } = &mut self.state else {
+                    unreachable!()
                 };
-                match step_result {
+                // Step the checkpoint SM directly so a passive publish retry can return
+                // `Continue` and yield the commit executor (the `StateMachine` wrapper would
+                // spin on `Continue` internally and starve pinned readers on the same thread).
+                match state_machine.inner_mut().step(&()) {
                     Ok(TransitionResult::Continue) => {
                         return Ok(TransitionResult::Continue);
                     }
@@ -3746,7 +3726,7 @@ impl<Clock: LogicalClock, A: ConcurrentAllocator> StateTransition for CommitStat
                         return Ok(TransitionResult::Io(iocompletions));
                     }
                     Ok(TransitionResult::Done(_)) => {
-                        state_machine.lock().finalize(&())?;
+                        state_machine.finalize(&())?;
                     }
                     Err(err) => {
                         // Auto-checkpoint errors should not surface to the committed statement.
