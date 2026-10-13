@@ -1860,7 +1860,6 @@ impl<Clock: LogicalClock, A: ConcurrentAllocator> CheckpointStateMachine<Clock, 
         };
         let mut index = next_index;
         let mut processed = 0;
-        let drop_current_if_in_btree = true;
         while index < self.write_set.len() {
             let current = index;
             index += 1;
@@ -1881,13 +1880,9 @@ impl<Clock: LogicalClock, A: ConcurrentAllocator> CheckpointStateMachine<Clock, 
                         );
                     }
                 }
-                let dropped = self.mvstore.gc_chain_now(
-                    &mut versions,
-                    lwm,
-                    ckpt_max,
-                    min_reader_mark,
-                    drop_current_if_in_btree,
-                );
+                let dropped =
+                    self.mvstore
+                        .gc_chain_now(&mut versions, lwm, ckpt_max, min_reader_mark);
                 self.mvstore.dec_live_version_count_approx(dropped);
             } else {
                 // The MVCC metadata table row (persistent_tx_ts_max) is staged
@@ -1927,7 +1922,6 @@ impl<Clock: LogicalClock, A: ConcurrentAllocator> CheckpointStateMachine<Clock, 
         };
         let mut index = next_index;
         let mut processed = 0;
-        let drop_current_if_in_btree = true;
         while index < self.index_write_set.len() {
             let current = index;
             index += 1;
@@ -1954,13 +1948,9 @@ impl<Clock: LogicalClock, A: ConcurrentAllocator> CheckpointStateMachine<Clock, 
                         snapshot_ts,
                     );
                 }
-                let dropped = self.mvstore.gc_chain_now(
-                    &mut versions,
-                    lwm,
-                    ckpt_max,
-                    min_reader_mark,
-                    drop_current_if_in_btree,
-                );
+                let dropped =
+                    self.mvstore
+                        .gc_chain_now(&mut versions, lwm, ckpt_max, min_reader_mark);
                 self.mvstore.dec_live_version_count_approx(dropped);
             }
             processed += 1;

@@ -7906,7 +7906,6 @@ impl<Clock: LogicalClock, A: ConcurrentAllocator> MvStore<Clock, A> {
         lwm: u64,
         ckpt_max: u64,
         min_reader_mark: WalPos,
-        drop_current_if_in_btree: bool,
     ) -> usize {
         let lwm = if lwm == u64::MAX {
             self.compute_lwm()
@@ -7919,7 +7918,6 @@ impl<Clock: LogicalClock, A: ConcurrentAllocator> MvStore<Clock, A> {
             ckpt_max,
             self.experimental_mvcc_passive_checkpoint,
             min_reader_mark,
-            drop_current_if_in_btree,
         )
     }
 
@@ -7928,21 +7926,21 @@ impl<Clock: LogicalClock, A: ConcurrentAllocator> MvStore<Clock, A> {
     /// Covers both table rows (`self.rows`) and index rows (`self.index_rows`).
     /// Returns the number of removed versions.
     pub fn drop_unused_row_versions(&self) -> usize {
-        self.drop_unused_row_versions_inner(false, true, WalPos::STAGED)
+        self.drop_unused_row_versions_inner(false, WalPos::STAGED)
     }
 
     /// Like [`Self::drop_unused_row_versions`], and remove emptied SkipMap slots.
     /// Also drops last currents already in the B-tree (Truncate Finalize).
     /// Writers retry if GC unlinks their Arc (`insert_version` / `insert_index_version`).
     pub fn drop_unused_row_versions_and_slots(&self) -> usize {
-        self.drop_unused_row_versions_inner(true, true, WalPos::STAGED)
+        self.drop_unused_row_versions_inner(true, WalPos::STAGED)
     }
 
     /// Drop old versions and empty SkipMap slots, including the latest copy of each
     /// row once the B-tree has it (Rule 3). Passive Finalize uses this.
     /// `reader_mark_floor` should include pager-held readers, not only `txs`.
     pub fn drop_unused_row_versions_unlink_empty_at(&self, reader_mark_floor: WalPos) -> usize {
-        self.drop_unused_row_versions_inner(true, true, reader_mark_floor)
+        self.drop_unused_row_versions_inner(true, reader_mark_floor)
     }
 
     /// Incremental GC on the commit path: reclaim up to `max_chains` table chains
@@ -7989,7 +7987,6 @@ impl<Clock: LogicalClock, A: ConcurrentAllocator> MvStore<Clock, A> {
         let _gate = GcGate(&self.gc_in_progress);
 
         let passive = self.experimental_mvcc_passive_checkpoint;
-        let drop_current_if_in_btree = true;
         let lwm = self.sample_gc_lwm();
 
         // Short-circuit when a long-running transaction has pinned the LWM at
@@ -8030,13 +8027,7 @@ impl<Clock: LogicalClock, A: ConcurrentAllocator> MvStore<Clock, A> {
             // GC floor: retain rows of a freshly-materialized btree not yet visible to all readers.
             if !self.rootpage_gc_protected(&entry.key().table_id, min_reader_mark) {
                 let mut versions = entry.value().write();
-                dropped += self.gc_chain_now(
-                    &mut versions,
-                    lwm,
-                    ckpt_max,
-                    min_reader_mark,
-                    drop_current_if_in_btree,
-                );
+                dropped += self.gc_chain_now(&mut versions, lwm, ckpt_max, min_reader_mark);
                 if !passive && versions.is_empty() {
                     entry.remove();
                 }
@@ -8096,7 +8087,6 @@ impl<Clock: LogicalClock, A: ConcurrentAllocator> MvStore<Clock, A> {
     /// after the saved key; later indexes start from their first key.
     fn gc_index_incremental(&self, lwm: u64, ckpt_max: u64, max_chains: usize) -> usize {
         let passive = self.experimental_mvcc_passive_checkpoint;
-        let drop_current_if_in_btree = true;
         let mut dropped = 0;
         let mut processed = 0;
         let mut last: Option<(MVTableId, Arc<SortableIndexKey>)> = None;
@@ -8132,13 +8122,7 @@ impl<Clock: LogicalClock, A: ConcurrentAllocator> MvStore<Clock, A> {
                     break 'outer;
                 }
                 let mut versions = inner_entry.value().write();
-                dropped += self.gc_chain_now(
-                    &mut versions,
-                    lwm,
-                    ckpt_max,
-                    min_reader_mark,
-                    drop_current_if_in_btree,
-                );
+                dropped += self.gc_chain_now(&mut versions, lwm, ckpt_max, min_reader_mark);
                 if !passive && versions.is_empty() {
                     self.bump_index_rows_epoch();
                     inner_entry.remove();
@@ -8157,7 +8141,6 @@ impl<Clock: LogicalClock, A: ConcurrentAllocator> MvStore<Clock, A> {
     fn drop_unused_row_versions_inner(
         &self,
         remove_empty_slots: bool,
-        drop_current_if_in_btree: bool,
         reader_mark_floor: WalPos,
     ) -> usize {
         let ckpt_max = self.durable_txid_max.load(Ordering::SeqCst);
@@ -8169,14 +8152,12 @@ impl<Clock: LogicalClock, A: ConcurrentAllocator> MvStore<Clock, A> {
             ckpt_max,
             &mut referenced_tx_ids,
             remove_empty_slots,
-            drop_current_if_in_btree,
             reader_mark_floor,
         ) + self.gc_index_row_versions(
             lwm,
             ckpt_max,
             &mut referenced_tx_ids,
             remove_empty_slots,
-            drop_current_if_in_btree,
             reader_mark_floor,
         );
         self.dec_live_version_count_approx(dropped);
@@ -8197,7 +8178,6 @@ impl<Clock: LogicalClock, A: ConcurrentAllocator> MvStore<Clock, A> {
         ckpt_max: u64,
         referenced_tx_ids: &mut HashSet<TxID>,
         remove_empty_slots: bool,
-        drop_current_if_in_btree: bool,
         reader_mark_floor: WalPos,
     ) -> usize {
         let mut dropped = 0;
@@ -8216,13 +8196,7 @@ impl<Clock: LogicalClock, A: ConcurrentAllocator> MvStore<Clock, A> {
                 continue;
             }
             let mut versions = entry.value().write();
-            dropped += self.gc_chain_now(
-                &mut versions,
-                lwm,
-                ckpt_max,
-                min_reader_mark,
-                drop_current_if_in_btree,
-            );
+            dropped += self.gc_chain_now(&mut versions, lwm, ckpt_max, min_reader_mark);
             Self::collect_referenced_txids(&versions, referenced_tx_ids);
             if remove_empty_slots && versions.is_empty() {
                 entry.remove();
@@ -8237,7 +8211,6 @@ impl<Clock: LogicalClock, A: ConcurrentAllocator> MvStore<Clock, A> {
         ckpt_max: u64,
         referenced_tx_ids: &mut HashSet<TxID>,
         remove_empty_slots: bool,
-        drop_current_if_in_btree: bool,
         reader_mark_floor: WalPos,
     ) -> usize {
         let mut dropped = 0;
@@ -8259,13 +8232,7 @@ impl<Clock: LogicalClock, A: ConcurrentAllocator> MvStore<Clock, A> {
 
             for inner_entry in inner_map.iter() {
                 let mut versions = inner_entry.value().write();
-                dropped += self.gc_chain_now(
-                    &mut versions,
-                    lwm,
-                    ckpt_max,
-                    min_reader_mark,
-                    drop_current_if_in_btree,
-                );
+                dropped += self.gc_chain_now(&mut versions, lwm, ckpt_max, min_reader_mark);
                 Self::collect_referenced_txids(&versions, referenced_tx_ids);
                 if remove_empty_slots && versions.is_empty() {
                     self.bump_index_rows_epoch();
@@ -8318,10 +8285,10 @@ impl<Clock: LogicalClock, A: ConcurrentAllocator> MvStore<Clock, A> {
     ///         checkpointed yet, or a B-tree-resident version whose physical
     ///         delete/overwrite hasn't been checkpointed.
     /// Rule 3: last remaining current (end unpacks as None) — drop it when
-    ///         `drop_current_if_in_btree` is true, the B-tree already has it
-    ///         (stamped, and for Truncate inside `ckpt_max`), and
-    ///         `lwm == u64::MAX`. Idle-only on both Passive and Truncate: a
-    ///         dual-cursor can lose the row if the SkipMap empties mid-scan.
+    ///         the B-tree already has it (stamped, and for Truncate inside
+    ///         `ckpt_max`), and `lwm == u64::MAX`. Idle-only on both Passive
+    ///         and Truncate: a dual-cursor can lose the row if the SkipMap
+    ///         empties mid-scan.
     ///
     /// Passive gates Rule 2 on `materialized_at` + `min_reader_mark`. Blocking
     /// Truncate uses `ckpt_max` instead. Both require `materialized_at` before
@@ -8333,7 +8300,6 @@ impl<Clock: LogicalClock, A: ConcurrentAllocator> MvStore<Clock, A> {
         ckpt_max: u64,
         passive: bool,
         min_reader_mark: WalPos,
-        drop_current_if_in_btree: bool,
     ) -> usize {
         let before = versions.len();
 
@@ -8375,7 +8341,7 @@ impl<Clock: LogicalClock, A: ConcurrentAllocator> MvStore<Clock, A> {
         // already skipped the key as shadowed. `lwm == MAX` is the proof that
         // no snapshot (hence no dual-cursor) is open. Under load, Rule 2 still
         // reclaims superseded history; last currents wait for quiescence.
-        if drop_current_if_in_btree && versions.len() == 1 {
+        if versions.len() == 1 {
             if let (Some(TxTimestampOrID::Timestamp(b)), None) =
                 (&versions[0].begin(), &versions[0].end())
             {
