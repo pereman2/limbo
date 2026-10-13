@@ -1501,7 +1501,7 @@ impl Statement {
             return;
         };
         if mv_store.is_tx_rollbackable(pending.inner_tx_id) {
-            mv_store.rollback_tx(pending.inner_tx_id, self.pager.clone(), &conn, pending.db);
+            mv_store.rollback_tx(pending.inner_tx_id, &conn, pending.db);
         }
         conn.set_mv_tx_for_db(pending.db, pending.saved_outer);
         // When the inner tx aborted via the vdbe's catch-all error path

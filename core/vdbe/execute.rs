@@ -3884,7 +3884,7 @@ pub fn halt(
                 vtab_rollback_all(&program.connection)?;
                 if let Some(mv_store) = mv_store.as_ref() {
                     if let Some(tx_id) = program.connection.get_mv_tx_id() {
-                        mv_store.rollback_tx(tx_id, pager.clone(), &program.connection, MAIN_DB_ID);
+                        mv_store.rollback_tx(tx_id, &program.connection, MAIN_DB_ID);
                     }
                     pager.end_read_tx();
                 } else {
@@ -5323,7 +5323,7 @@ pub fn op_auto_commit(
             TxOp::Rollback => {
                 if let Some(mv_store) = mv_store.as_ref() {
                     if let Some(tx_id) = conn.get_mv_tx_id() {
-                        mv_store.rollback_tx(tx_id, pager.clone(), &conn, MAIN_DB_ID);
+                        mv_store.rollback_tx(tx_id, &conn, MAIN_DB_ID);
                     }
                     pager.end_read_tx();
                     conn.rollback_attached_mvcc_txs(true);
@@ -14860,7 +14860,7 @@ pub fn op_sequence_commit_inner_tx(
     program: &Program,
     state: &mut ProgramState,
     insn: &Insn,
-    pager: &Arc<Pager>,
+    _pager: &Arc<Pager>,
 ) -> InsnResult {
     load_insn!(
         SequenceCommitInnerTx {
@@ -14947,7 +14947,7 @@ pub fn op_sequence_commit_inner_tx(
             // no-op (e.g. self-aborted); `is_tx_rollbackable` guards.
             if let Some((inner_tx_id, _)) = conn.get_mv_tx_for_db(*db) {
                 if mv_store.is_tx_rollbackable(inner_tx_id) {
-                    mv_store.rollback_tx(inner_tx_id, pager.clone(), &conn, *db);
+                    mv_store.rollback_tx(inner_tx_id, &conn, *db);
                 }
             }
             state.sequence_inner_tx_pending = None;
@@ -14985,7 +14985,7 @@ pub fn op_sequence_commit_inner_tx(
             state.sequence_inner_commit = None;
             if let Some((inner_tx_id, _)) = conn.get_mv_tx_for_db(*db) {
                 if mv_store.is_tx_rollbackable(inner_tx_id) {
-                    mv_store.rollback_tx(inner_tx_id, pager.clone(), &conn, *db);
+                    mv_store.rollback_tx(inner_tx_id, &conn, *db);
                 }
             }
             state.sequence_inner_tx_pending = None;

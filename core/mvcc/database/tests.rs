@@ -568,7 +568,7 @@ fn mvcc_active_write_tx_blocks_vacuum_gate() {
     let pager = db.conn.pager.load().clone();
     let tx_id = db
         .mvcc_store
-        .begin_exclusive_tx(pager.clone(), None, &db.conn, None)
+        .begin_exclusive_tx(pager, None, &db.conn, None)
         .unwrap();
 
     assert!(matches!(
@@ -577,7 +577,7 @@ fn mvcc_active_write_tx_blocks_vacuum_gate() {
     ));
 
     db.mvcc_store
-        .rollback_tx(tx_id, pager, &db.conn, crate::MAIN_DB_ID);
+        .rollback_tx(tx_id, &db.conn, crate::MAIN_DB_ID);
     db.mvcc_store.try_begin_vacuum_gate().unwrap();
     db.mvcc_store.release_vacuum_gate();
 }
@@ -6368,12 +6368,7 @@ fn test_rollback() {
         .unwrap()
         .unwrap();
     assert_eq!(row3, row4);
-    db.mvcc_store.rollback_tx(
-        tx1,
-        db.conn.pager.load().clone(),
-        &db.conn,
-        crate::MAIN_DB_ID,
-    );
+    db.mvcc_store.rollback_tx(tx1, &db.conn, crate::MAIN_DB_ID);
     let tx2 = db
         .mvcc_store
         .begin_tx(db.conn.pager.load().clone())
@@ -6626,8 +6621,7 @@ fn test_lost_update() {
         Err(LimboError::WriteWriteConflict)
     ));
     // hack: in the actual tursodb database we rollback the mvcc tx ourselves, so manually roll it back here
-    db.mvcc_store
-        .rollback_tx(tx3, conn3.pager.load().clone(), &conn3, crate::MAIN_DB_ID);
+    db.mvcc_store.rollback_tx(tx3, &conn3, crate::MAIN_DB_ID);
 
     commit_tx(db.mvcc_store.clone(), &conn2, tx2).unwrap();
     assert!(matches!(
@@ -6874,8 +6868,7 @@ fn test_mvcc_cursor_next_yields_with_injected_yield() {
         cursor.next().unwrap(),
         IOResult::IO(io) if io.is_explicit_yield()
     );
-    db.mvcc_store
-        .rollback_tx(tx_id, db.conn.pager.load().clone(), db.conn.as_ref(), 0);
+    db.mvcc_store.rollback_tx(tx_id, db.conn.as_ref(), 0);
 
     assert!(
         saw_yield,
@@ -6933,7 +6926,7 @@ fn test_sequence_watermark_tracks_lowest_active_allocation() {
 
     mv_store.set_sequence_watermark("turso_cdc_pk_autoincrement", 13);
     let tx1 = mv_store.begin_tx(pager.clone()).unwrap();
-    let tx2 = mv_store.begin_tx(pager.clone()).unwrap();
+    let tx2 = mv_store.begin_tx(pager).unwrap();
     mv_store
         .register_sequence_allocation(tx1, "turso_cdc_pk_autoincrement", 10)
         .unwrap();
@@ -6955,7 +6948,7 @@ fn test_sequence_watermark_tracks_lowest_active_allocation() {
         Some(12)
     );
 
-    mv_store.rollback_tx(tx2, pager, conn.as_ref(), crate::MAIN_DB_ID);
+    mv_store.rollback_tx(tx2, conn.as_ref(), crate::MAIN_DB_ID);
     assert_eq!(
         mv_store.sequence_watermark("turso_cdc_pk_autoincrement"),
         Some(13)
@@ -6976,7 +6969,7 @@ fn test_sequence_watermark_function_returns_current_watermark_without_active_all
     assert_eq!(rows.len(), 1);
     assert_eq!(rows[0][0].as_int().unwrap(), 42);
 
-    let tx_id = mv_store.begin_tx(pager.clone()).unwrap();
+    let tx_id = mv_store.begin_tx(pager).unwrap();
     mv_store
         .register_sequence_allocation(tx_id, "s", 10)
         .unwrap();
@@ -6984,7 +6977,7 @@ fn test_sequence_watermark_function_returns_current_watermark_without_active_all
 
     assert_eq!(rows[0][0].as_int().unwrap(), 10);
 
-    mv_store.rollback_tx(tx_id, pager, conn.as_ref(), crate::MAIN_DB_ID);
+    mv_store.rollback_tx(tx_id, conn.as_ref(), crate::MAIN_DB_ID);
     let rows = get_rows(&conn, "SELECT sequence_watermark_experimental('s')");
 
     assert_eq!(rows[0][0].as_int().unwrap(), 42);
@@ -8134,12 +8127,7 @@ fn test_commit_dep_threaded_abort_cascades() {
     signal_rx.recv().unwrap();
 
     // Abort writer → cascade: sets AbortNow on reader, decrements counter
-    mvcc_store.rollback_tx(
-        writer_tx_id,
-        writer_conn.pager.load().clone(),
-        &writer_conn,
-        crate::MAIN_DB_ID,
-    );
+    mvcc_store.rollback_tx(writer_tx_id, &writer_conn, crate::MAIN_DB_ID);
 
     let (rows, commit_result) = reader_handle.join().unwrap();
 
@@ -8243,12 +8231,7 @@ fn test_commit_dep_threaded_multiple_dependents_abort() {
     barrier.wait();
 
     // Abort writer → cascade to ALL readers
-    mvcc_store.rollback_tx(
-        writer_tx_id,
-        writer_conn.pager.load().clone(),
-        &writer_conn,
-        crate::MAIN_DB_ID,
-    );
+    mvcc_store.rollback_tx(writer_tx_id, &writer_conn, crate::MAIN_DB_ID);
 
     for handle in handles {
         let (rows, commit_result) = handle.join().unwrap();
@@ -8444,12 +8427,7 @@ fn test_commit_dep_threaded_readonly_abort_cascades() {
     signal_rx.recv().unwrap();
 
     // Abort writer → cascade to read-only reader
-    mvcc_store.rollback_tx(
-        writer_tx_id,
-        writer_conn.pager.load().clone(),
-        &writer_conn,
-        crate::MAIN_DB_ID,
-    );
+    mvcc_store.rollback_tx(writer_tx_id, &writer_conn, crate::MAIN_DB_ID);
 
     let (rows, commit_result) = reader_handle.join().unwrap();
 
@@ -9363,12 +9341,7 @@ fn test_auto_checkpoint_busy_is_ignored() {
     commit_tx(db.mvcc_store.clone(), &db.conn, tx1).unwrap();
 
     // Cleanup: release the read lock held by tx2.
-    db.mvcc_store.rollback_tx(
-        tx2,
-        db.conn.pager.load().clone(),
-        &db.conn,
-        crate::MAIN_DB_ID,
-    );
+    db.mvcc_store.rollback_tx(tx2, &db.conn, crate::MAIN_DB_ID);
 }
 
 /// What this test checks: Core MVCC read/write semantics hold for this operation sequence.
@@ -11351,12 +11324,7 @@ fn transaction_rollback_removes_created_versions_immediately() {
             .unwrap();
         let row = generate_simple_string_row((-2).into(), 1, "will_rollback");
         db.mvcc_store.insert(tx, row).unwrap();
-        db.mvcc_store.rollback_tx(
-            tx,
-            db.conn.pager.load().clone(),
-            &db.conn,
-            crate::MAIN_DB_ID,
-        );
+        db.mvcc_store.rollback_tx(tx, &db.conn, crate::MAIN_DB_ID);
     }
 
     let entry = db.mvcc_store.rows.get(&row_id);
@@ -11639,12 +11607,7 @@ fn test_gc_with_slot_removal_drops_empty_skipmap_entries() {
         .unwrap();
     let row = generate_simple_string_row((-2).into(), 1, "will_rollback");
     db.mvcc_store.insert(tx1, row).unwrap();
-    db.mvcc_store.rollback_tx(
-        tx1,
-        db.conn.pager.load().clone(),
-        &db.conn,
-        crate::MAIN_DB_ID,
-    );
+    db.mvcc_store.rollback_tx(tx1, &db.conn, crate::MAIN_DB_ID);
 
     let row_id = RowID::new((-2).into(), RowKey::Int(1));
     let entry = db.mvcc_store.rows.get(&row_id).unwrap();
@@ -12217,7 +12180,7 @@ fn test_gc_incremental_lazy_leaves_empty_slots() {
     mvcc_store
         .insert(tx, generate_simple_string_row(table_id, 1, "rollback"))
         .unwrap();
-    mvcc_store.rollback_tx(tx, conn.pager.load().clone(), &conn, crate::MAIN_DB_ID);
+    mvcc_store.rollback_tx(tx, &conn, crate::MAIN_DB_ID);
 
     let row_id = RowID::new(table_id, RowKey::Int(1));
     let entry = mvcc_store.rows.get(&row_id).unwrap();
@@ -18985,8 +18948,7 @@ fn test_begin_tx_schema_generation_gate() {
         .mvcc_store
         .begin_tx_with_schema_generation(pager.clone(), Some(generation))
         .unwrap();
-    db.mvcc_store
-        .rollback_tx(tx, pager.clone(), &db.conn, crate::MAIN_DB_ID);
+    db.mvcc_store.rollback_tx(tx, &db.conn, crate::MAIN_DB_ID);
 
     // Stale (mismatched) generation: forced reprepare.
     let err = db
@@ -19001,10 +18963,9 @@ fn test_begin_tx_schema_generation_gate() {
     // No gate: begins normally.
     let tx = db
         .mvcc_store
-        .begin_tx_with_schema_generation(pager.clone(), None)
+        .begin_tx_with_schema_generation(pager, None)
         .unwrap();
-    db.mvcc_store
-        .rollback_tx(tx, pager, &db.conn, crate::MAIN_DB_ID);
+    db.mvcc_store.rollback_tx(tx, &db.conn, crate::MAIN_DB_ID);
 }
 
 /// Passive mode: freelist fields must come from the pager's live page 1, not a stale MVCC header.

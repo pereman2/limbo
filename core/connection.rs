@@ -589,7 +589,7 @@ impl Drop for Connection {
                 if let Some(tx_id) = self.get_mv_tx_id() {
                     let pager = self.pager.load();
                     if mv_store.is_tx_rollbackable(tx_id) {
-                        mv_store.rollback_tx(tx_id, pager.clone(), self, MAIN_DB_ID);
+                        mv_store.rollback_tx(tx_id, self, MAIN_DB_ID);
                     } else {
                         self.set_mv_tx(None);
                     }
@@ -1374,7 +1374,7 @@ impl Connection {
         };
         if let Some(mv_store) = self.mv_store().as_ref() {
             if mv_store.is_tx_rollbackable(tx_id) {
-                mv_store.rollback_tx(tx_id, pager.clone(), self, MAIN_DB_ID);
+                mv_store.rollback_tx(tx_id, self, MAIN_DB_ID);
             } else {
                 self.set_mv_tx(None);
             }
@@ -2336,7 +2336,7 @@ impl Connection {
                 // remove all non-commited changes in case if WAL session left some suffix without commit frame
                 if let Some(mv_store) = self.mv_store().as_ref() {
                     if let Some(tx_id) = self.get_mv_tx_id() {
-                        mv_store.rollback_tx(tx_id, pager.clone(), self, MAIN_DB_ID);
+                        mv_store.rollback_tx(tx_id, self, MAIN_DB_ID);
                     }
                 }
                 pager.rollback(false, self, true);
@@ -2434,7 +2434,7 @@ impl Connection {
                 if self.mvcc_enabled() {
                     if let Some(mv_store) = self.mv_store().as_ref() {
                         if let Some(tx_id) = self.get_mv_tx_id() {
-                            mv_store.rollback_tx(tx_id, pager.clone(), self, MAIN_DB_ID);
+                            mv_store.rollback_tx(tx_id, self, MAIN_DB_ID);
                         }
                     }
                     pager.end_read_tx();
@@ -2537,8 +2537,7 @@ impl Connection {
         let Some(tx_id) = self.get_mv_tx_id() else {
             return;
         };
-        let pager = self.pager.load();
-        mv_store.rollback_tx(tx_id, pager.clone(), self, MAIN_DB_ID);
+        mv_store.rollback_tx(tx_id, self, MAIN_DB_ID);
     }
 
     /// Discard the main-db MVCC transaction left by a sync raw-WAL session
@@ -3723,7 +3722,7 @@ impl Connection {
 
         if let Some((tx_id, _mode)) = self.get_mv_tx_for_db(database_id) {
             if let Some(mv_store) = self.mv_store_for_db(database_id) {
-                mv_store.rollback_tx(tx_id, pager.clone(), self, database_id);
+                mv_store.rollback_tx(tx_id, self, database_id);
                 pager.end_read_tx();
             }
             self.set_mv_tx_for_db(database_id, None);
@@ -5011,7 +5010,7 @@ impl Connection {
                     .get_pager_from_database_index(&db_id)
                     .expect("attached MVCC transaction should always have a pager");
                 if attached_mv_store.is_tx_rollbackable(tx_id) {
-                    attached_mv_store.rollback_tx(tx_id, attached_pager.clone(), self, db_id);
+                    attached_mv_store.rollback_tx(tx_id, self, db_id);
                 } else {
                     self.set_mv_tx_for_db(db_id, None);
                 }
@@ -5241,7 +5240,7 @@ impl Connection {
             if let Some(tx_id) = self.get_mv_tx_id() {
                 self.auto_commit.store(true, Ordering::SeqCst);
                 if mv_store.is_tx_rollbackable(tx_id) {
-                    mv_store.rollback_tx(tx_id, pager.clone(), self, crate::MAIN_DB_ID);
+                    mv_store.rollback_tx(tx_id, self, crate::MAIN_DB_ID);
                 } else {
                     self.set_mv_tx(None);
                 }

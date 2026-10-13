@@ -3722,14 +3722,13 @@ impl Program {
                 "sequence inner transaction has no MV store during conflict rollback".to_string(),
             )
         })?;
-        let pager = self.connection.get_pager_from_database_index(&db)?;
         if !mv_store.is_tx_rollbackable(outer_tx_id) {
             return Err(LimboError::InternalError(format!(
                 "saved sequence outer transaction {outer_tx_id} is not rollbackable during \
                  conflict rollback"
             )));
         }
-        mv_store.rollback_tx(outer_tx_id, pager, &self.connection, db);
+        mv_store.rollback_tx(outer_tx_id, &self.connection, db);
         // `rollback_tx` clears the connection's MVCC tx slot for this db. The caller's
         // generic rollback then has no current tx to inspect, so it will not flip
         // autocommit for us.

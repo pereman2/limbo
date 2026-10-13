@@ -52,7 +52,6 @@ use rustc_hash::FxHashMap as HashMap;
 use rustc_hash::FxHashSet as HashSet;
 use std::collections::{BTreeSet, HashMap as StdHashMap};
 use std::fmt::Debug;
-use std::marker::PhantomData;
 use std::ops::Bound;
 #[cfg(any(test, injected_yields))]
 use strum::EnumCount;
@@ -491,12 +490,6 @@ pub struct RowVersion {
     pub(crate) materialized_at: WalPos,
 }
 
-#[derive(Debug)]
-pub enum RowVersionState {
-    LiveVersion,
-    NotFound,
-    Deleted,
-}
 pub type TxID = u64;
 
 /// A log record contains all durable effects of a committed transaction,
@@ -1679,7 +1672,6 @@ pub struct CommitStateMachine<Clock: LogicalClock, A: ConcurrentAllocator = Turs
     wrote_logical_log: bool,
     /// The synchronous mode for fsync operations. When set to Off, fsync is skipped.
     sync_mode: SyncMode,
-    _phantom: PhantomData<Clock>,
 }
 
 impl<Clock: LogicalClock, A: ConcurrentAllocator> Debug for CommitStateMachine<Clock, A> {
@@ -1793,7 +1785,6 @@ impl<Clock: LogicalClock, A: ConcurrentAllocator> CommitStateMachine<Clock, A> {
             group_batch: None,
             wrote_logical_log: false,
             sync_mode,
-            _phantom: PhantomData,
         })
     }
 
@@ -4386,7 +4377,6 @@ pub struct MvStore<Clock: LogicalClock, A: ConcurrentAllocator = TursoAllocator>
     logical_log_alloc: DynAllocator,
     tx_ids: AtomicU64,
     version_id_counter: AtomicU64,
-    next_rowid: AtomicU64,
     next_table_id: AtomicI64,
     clock: Clock,
 
@@ -4606,7 +4596,6 @@ impl<Clock: LogicalClock, A: ConcurrentAllocator> MvStore<Clock, A> {
             logical_log_alloc,
             tx_ids: AtomicU64::new(1), // let's reserve transaction 0 for special purposes
             version_id_counter: AtomicU64::new(1), // Reserve 0 for special purposes
-            next_rowid: AtomicU64::new(0), // TODO: determine this from B-Tree
             next_table_id: AtomicI64::new(-2), // table id -1 / root page 1 is always sqlite_schema.
             clock,
             storage,
@@ -4715,16 +4704,6 @@ impl<Clock: LogicalClock, A: ConcurrentAllocator> MvStore<Clock, A> {
             begin_ts: tx.begin_ts,
             read_mark: tx.read_mark,
         })
-    }
-
-    /// This transaction's frozen WAL read mark, or [`WalPos::STAGED`] (sees everything published)
-    /// if untracked. The physical-reachability coordinate of the btree-read gate. See
-    /// [`Self::is_btree_readable_at`].
-    pub fn read_tx_mark(&self, tx_id: TxID) -> WalPos {
-        self.txs
-            .get(&tx_id)
-            .map(|tx| tx.value().read_mark)
-            .unwrap_or(WalPos::STAGED)
     }
 
     /// Bump `next_table_id` below `table_id` (and below `-root_page` for a checkpointed root) so
@@ -5365,10 +5344,6 @@ impl<Clock: LogicalClock, A: ConcurrentAllocator> MvStore<Clock, A> {
         }
     }
 
-    pub fn get_next_rowid(&self) -> i64 {
-        self.next_rowid.fetch_add(1, Ordering::SeqCst) as i64
-    }
-
     /// Inserts a new row into a table in the database.
     ///
     /// This function inserts a new `row` into the database within the context
@@ -5856,43 +5831,6 @@ impl<Clock: LogicalClock, A: ConcurrentAllocator> MvStore<Clock, A> {
             return Ok(true);
         }
         Ok(false)
-    }
-
-    /// Gets all row ids in the database.
-    pub fn scan_row_ids(&self) -> Result<Vec<RowID>> {
-        tracing::trace!("scan_row_ids");
-        let keys = self.rows.iter().map(|entry| entry.key().clone());
-        Ok(keys.collect())
-    }
-
-    pub fn get_row_id_range(
-        &self,
-        table_id: MVTableId,
-        start: i64,
-        bucket: &mut Vec<RowID>,
-        max_items: u64,
-    ) -> Result<()> {
-        tracing::trace!(
-            "get_row_id_in_range(table_id={}, range_start={})",
-            table_id,
-            start,
-        );
-        let start_id = RowID {
-            table_id,
-            row_id: RowKey::Int(start),
-        };
-
-        let end_id = RowID {
-            table_id,
-            row_id: RowKey::Int(i64::MAX),
-        };
-
-        self.rows
-            .range(start_id..end_id)
-            .take(max_items as usize)
-            .for_each(|entry| bucket.push(entry.key().clone()));
-
-        Ok(())
     }
 
     pub(crate) fn advance_cursor_and_get_row_id_for_table(
@@ -7030,7 +6968,7 @@ impl<Clock: LogicalClock, A: ConcurrentAllocator> MvStore<Clock, A> {
     ///
     /// * `tx_id` - The ID of the transaction to abort.
     /// * `db` - The database index this transaction belongs to.
-    pub fn rollback_tx(&self, tx_id: TxID, _pager: Arc<Pager>, connection: &Connection, db: usize) {
+    pub fn rollback_tx(&self, tx_id: TxID, connection: &Connection, db: usize) {
         self.rollback_tx_inner(tx_id, Some(connection), db);
     }
 
@@ -7653,11 +7591,6 @@ impl<Clock: LogicalClock, A: ConcurrentAllocator> MvStore<Clock, A> {
     /// Generates next unique version ID for RowVersion tracking.
     pub fn get_version_id(&self) -> u64 {
         self.version_id_counter.fetch_add(1, Ordering::SeqCst)
-    }
-
-    /// Generate a begin timestamp. No side-effect needed alongside generation.
-    pub fn get_begin_timestamp(&self) -> u64 {
-        self.clock.get_timestamp(crate::mvcc::clock::no_op)
     }
 
     /// Generate a commit timestamp and call `f` with it while the clock
@@ -8803,23 +8736,6 @@ impl<Clock: LogicalClock, A: ConcurrentAllocator> MvStore<Clock, A> {
                 }));
             }
         }
-    }
-
-    pub fn get_last_table_rowid_without_visibility_check(
-        &self,
-        table_id: MVTableId,
-    ) -> Option<RowKey> {
-        let max_rowid = RowID {
-            table_id,
-            row_id: RowKey::Int(i64::MAX),
-        };
-        let range = create_seek_range(Bound::Included(max_rowid), IterationDirection::Backwards);
-        let mut range = self.rows.range(range).rev();
-        let entry = range.next()?;
-        if entry.key().table_id != table_id {
-            return None;
-        }
-        Some(entry.key().row_id.clone())
     }
 
     pub fn get_last_index_rowid(
