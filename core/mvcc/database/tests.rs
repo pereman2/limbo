@@ -14956,6 +14956,69 @@ fn test_checkpoint_deletes_checkpointed_view_and_trigger_schema_rows_after_recov
     assert_eq!(&rows[0][0].to_string(), "ok");
 }
 
+/// A rename rewrites the checkpointed trigger and view rows, so the newest
+/// version of each row is not in the DB file. The drop must still reach the B-tree.
+/// See https://github.com/tursodatabase/turso/issues/9284
+#[test]
+fn test_checkpoint_deletes_view_and_trigger_rewritten_by_rename() {
+    let mut db = MvccTestDbNoConn::new_with_random_db();
+    {
+        let conn = db.connect();
+        conn.execute("CREATE TABLE t1(id INTEGER PRIMARY KEY, a)")
+            .unwrap();
+        conn.execute("CREATE TABLE log(x)").unwrap();
+        conn.execute("CREATE VIEW v AS SELECT a FROM t1").unwrap();
+        conn.execute(
+            "CREATE TRIGGER tr AFTER INSERT ON t1 BEGIN INSERT INTO log VALUES(new.id); END",
+        )
+        .unwrap();
+        conn.execute("PRAGMA wal_checkpoint(TRUNCATE)").unwrap();
+        conn.execute("ALTER TABLE t1 RENAME TO t2").unwrap();
+        conn.execute("ALTER TABLE t2 RENAME TO t1").unwrap();
+        conn.execute("DROP TRIGGER tr").unwrap();
+        conn.execute("DROP VIEW v").unwrap();
+        conn.execute("PRAGMA wal_checkpoint(TRUNCATE)").unwrap();
+        let rows = get_rows(
+            &conn,
+            "SELECT name FROM sqlite_schema WHERE type IN ('trigger', 'view')",
+        );
+        assert!(rows.is_empty(), "dropped objects came back: {rows:?}");
+        conn.close().unwrap();
+    }
+
+    db.restart();
+    let conn = db.connect();
+    conn.execute("INSERT INTO t1 VALUES(1, 1)").unwrap();
+    let rows = get_rows(&conn, "SELECT * FROM log");
+    assert!(rows.is_empty(), "dropped trigger fired: {rows:?}");
+}
+
+/// After a restart, a new trigger reuses the sqlite_schema rowid of a dropped,
+/// checkpointed trigger. Checkpoint must still delete the old row from the B-tree.
+/// See https://github.com/tursodatabase/turso/issues/9284
+#[test]
+fn test_checkpoint_deletes_trigger_row_reused_after_restart() {
+    let mut db = MvccTestDbNoConn::new_with_random_db();
+    {
+        let conn = db.connect();
+        conn.execute("CREATE TABLE t(x)").unwrap();
+        conn.execute("CREATE TRIGGER tr1 AFTER INSERT ON t BEGIN SELECT 1; END")
+            .unwrap();
+        conn.execute("PRAGMA wal_checkpoint(TRUNCATE)").unwrap();
+        conn.execute("DROP TRIGGER tr1").unwrap();
+        conn.close().unwrap();
+    }
+
+    db.restart();
+    let conn = db.connect();
+    conn.execute("CREATE TRIGGER tr2 AFTER INSERT ON t BEGIN SELECT 2; END")
+        .unwrap();
+    conn.execute("DROP TRIGGER tr2").unwrap();
+    conn.execute("PRAGMA wal_checkpoint(TRUNCATE)").unwrap();
+    let rows = get_rows(&conn, "SELECT name FROM sqlite_schema WHERE type='trigger'");
+    assert!(rows.is_empty(), "dropped trigger came back: {rows:?}");
+}
+
 /// Reproducer for "sqlite_schema contains index for missing table 't'".
 ///
 /// A single transaction deletes a row from t and then runs
