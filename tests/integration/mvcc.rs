@@ -1730,3 +1730,44 @@ fn mvcc_passive_checkpoint_must_not_leak_commits_into_pinned_snapshot() {
         "a pinned BEGIN CONCURRENT snapshot must not see a commit that happened after it"
     );
 }
+
+/// DDL in BEGIN CONCURRENT upgrades the transaction to exclusive. An
+/// AUTOINCREMENT CREATE + INSERT + ROLLBACK must leave other connections
+/// usable, and a committed upgrade must survive a reopen.
+#[turso_macros::test]
+fn test_mvcc_concurrent_ddl_upgrade_then_recover(db: TempDatabase) -> anyhow::Result<()> {
+    let path = db.path.clone();
+    let io = db.io.clone();
+
+    {
+        let conn1 = db.connect_limbo();
+        conn1.pragma_update("journal_mode", "'mvcc'")?;
+        let conn2 = db.connect_limbo();
+        conn1.execute("CREATE TABLE t(x INTEGER)")?;
+        let rows: Vec<(i64,)> = conn2.exec_rows("SELECT count(*) FROM t");
+        assert_eq!(rows, vec![(0,)]);
+
+        conn1.execute("BEGIN CONCURRENT")?;
+        conn1.execute("CREATE TABLE a(id INTEGER PRIMARY KEY AUTOINCREMENT, v TEXT)")?;
+        conn1.execute("INSERT INTO a(v) VALUES ('rolled back')")?;
+        conn1.execute("ROLLBACK")?;
+        conn2.execute("INSERT INTO t VALUES (1)")?;
+
+        conn2.execute("BEGIN CONCURRENT")?;
+        conn2.execute("INSERT INTO t VALUES (2)")?;
+        conn2.execute("CREATE TABLE a(id INTEGER PRIMARY KEY AUTOINCREMENT, v TEXT)")?;
+        conn2.execute("INSERT INTO a(v) VALUES ('kept')")?;
+        conn2.execute("COMMIT")?;
+        let rows: Vec<(i64, String)> = conn1.exec_rows("SELECT id, v FROM a");
+        assert_eq!(rows, vec![(1, "kept".to_string())]);
+    }
+    drop(db);
+
+    let db = Database::open_file(io, path.to_str().unwrap(), Arc::new(SqliteDialect))?;
+    let conn = db.connect(ConnectOpts::new())?;
+    let rows: Vec<(i64,)> = conn.exec_rows("SELECT x FROM t ORDER BY x");
+    assert_eq!(rows, vec![(1,), (2,)]);
+    let rows: Vec<(i64, String)> = conn.exec_rows("SELECT id, v FROM a");
+    assert_eq!(rows, vec![(1, "kept".to_string())]);
+    Ok(())
+}

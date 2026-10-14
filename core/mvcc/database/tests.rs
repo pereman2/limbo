@@ -3712,6 +3712,266 @@ fn test_mvcc_header_updates_allow_autocommit_statement_tx() {
     assert_eq!(rows[0][0].as_int().unwrap(), 19);
 }
 
+fn table_count(conn: &Arc<Connection>, name: &str) -> i64 {
+    let rows = get_rows(
+        conn,
+        &format!("SELECT count(*) FROM sqlite_schema WHERE name = '{name}'"),
+    );
+    rows[0][0].as_int().unwrap()
+}
+
+/// What this test checks: DDL inside BEGIN CONCURRENT upgrades the transaction to exclusive and
+/// commits together with the writes made before and after the DDL.
+/// Why this matters: Schema changes have no row-level conflict keys, so the transaction must
+/// run them with single-writer semantics instead of rejecting them.
+#[test]
+fn test_mvcc_concurrent_ddl_upgrades_to_exclusive_and_commits() {
+    let db = MvccTestDbNoConn::new_with_random_db();
+    let conn = db.connect();
+    conn.execute("CREATE TABLE t(x INTEGER)").unwrap();
+
+    conn.execute("BEGIN CONCURRENT").unwrap();
+    conn.execute("INSERT INTO t VALUES (1)").unwrap();
+    let tx_id = conn.get_mv_tx_id().unwrap();
+    assert!(!db.get_mvcc_store().is_exclusive_tx(&tx_id));
+    conn.execute("CREATE TABLE u(y INTEGER)").unwrap();
+    assert!(db.get_mvcc_store().is_exclusive_tx(&tx_id));
+    conn.execute("CREATE INDEX u_y ON u(y)").unwrap();
+    conn.execute("INSERT INTO u VALUES (2)").unwrap();
+    conn.execute("COMMIT").unwrap();
+    assert!(!db.get_mvcc_store().is_exclusive_tx(&tx_id));
+
+    let conn2 = db.connect();
+    assert_eq!(
+        get_rows(&conn2, "SELECT x FROM t"),
+        vec![vec![Value::from_i64(1)]]
+    );
+    assert_eq!(
+        get_rows(&conn2, "SELECT y FROM u"),
+        vec![vec![Value::from_i64(2)]]
+    );
+    assert_eq!(table_count(&conn2, "u_y"), 1);
+}
+
+/// What this test checks: The DDL upgrade returns Busy when a commit happened after the
+/// concurrent transaction began, or when another transaction holds the exclusive lock. Once
+/// upgraded, other concurrent writers cannot commit.
+/// Why this matters: Upgrading a stale snapshot would build the schema change on rows the
+/// transaction cannot see, and two exclusive writers would break single-writer semantics.
+#[test]
+fn test_mvcc_concurrent_ddl_busy_on_conflicting_writer() {
+    let db = MvccTestDbNoConn::new_with_random_db();
+    let conn1 = db.connect();
+    let conn2 = db.connect();
+    conn1.execute("CREATE TABLE t(x INTEGER)").unwrap();
+
+    // A commit after BEGIN CONCURRENT makes the snapshot stale.
+    conn1.execute("BEGIN CONCURRENT").unwrap();
+    conn1.execute("INSERT INTO t VALUES (1)").unwrap();
+    conn2.execute("INSERT INTO t VALUES (2)").unwrap();
+    let err = conn1.execute("CREATE TABLE u(y INTEGER)").unwrap_err();
+    assert!(matches!(err, LimboError::Busy), "got: {err:?}");
+    conn1.execute("ROLLBACK").unwrap();
+    assert_eq!(table_count(&conn1, "u"), 0);
+
+    // Another transaction holds the exclusive lock.
+    conn2.execute("BEGIN").unwrap();
+    conn2.execute("INSERT INTO t VALUES (3)").unwrap();
+    conn1.execute("BEGIN CONCURRENT").unwrap();
+    let err = conn1.execute("CREATE TABLE u(y INTEGER)").unwrap_err();
+    assert!(matches!(err, LimboError::Busy), "got: {err:?}");
+    conn1.execute("ROLLBACK").unwrap();
+    conn2.execute("COMMIT").unwrap();
+
+    // After the upgrade, a concurrent writer that commits is aborted, as with plain BEGIN.
+    conn1.execute("BEGIN CONCURRENT").unwrap();
+    conn1.execute("CREATE TABLE u(y INTEGER)").unwrap();
+    conn2.execute("BEGIN CONCURRENT").unwrap();
+    conn2.execute("INSERT INTO t VALUES (4)").unwrap();
+    let err = conn2.execute("COMMIT").unwrap_err();
+    assert!(
+        matches!(err, LimboError::WriteWriteConflict),
+        "got: {err:?}"
+    );
+    assert!(conn2.get_auto_commit());
+    conn1.execute("COMMIT").unwrap();
+
+    assert_eq!(table_count(&conn2, "u"), 1);
+    assert_eq!(
+        get_rows(&conn2, "SELECT x FROM t ORDER BY x"),
+        vec![vec![Value::from_i64(2)], vec![Value::from_i64(3)]]
+    );
+}
+
+/// What this test checks: ROLLBACK of a concurrent transaction that ran DDL restores the schema
+/// for the same connection and for other connections.
+/// Why this matters: A rolled-back CREATE or DROP must not leave the in-memory schema out of sync
+/// with the committed sqlite_schema rows.
+#[test]
+fn test_mvcc_concurrent_ddl_rollback_restores_schema() {
+    let db = MvccTestDbNoConn::new_with_random_db();
+    let conn1 = db.connect();
+    let conn2 = db.connect();
+    conn1.execute("CREATE TABLE t(x INTEGER)").unwrap();
+    conn1.execute("INSERT INTO t VALUES (1)").unwrap();
+    let schema_version = get_rows(&conn1, "PRAGMA schema_version");
+
+    conn1.execute("BEGIN CONCURRENT").unwrap();
+    conn1.execute("CREATE TABLE u(y INTEGER)").unwrap();
+    conn1.execute("INSERT INTO u VALUES (1)").unwrap();
+    conn1.execute("DROP TABLE t").unwrap();
+    conn1.execute("ROLLBACK").unwrap();
+
+    for conn in [&conn1, &conn2] {
+        assert_eq!(table_count(conn, "u"), 0);
+        assert!(conn.execute("SELECT * FROM u").is_err());
+        assert_eq!(
+            get_rows(conn, "SELECT x FROM t"),
+            vec![vec![Value::from_i64(1)]]
+        );
+        assert_eq!(get_rows(conn, "PRAGMA schema_version"), schema_version);
+    }
+    conn2.execute("CREATE TABLE u(z TEXT)").unwrap();
+    conn1.execute("INSERT INTO u VALUES ('ok')").unwrap();
+}
+
+/// What this test checks: The database opens after restart and shows the result of committed
+/// and rolled-back DDL from BEGIN CONCURRENT transactions.
+/// Why this matters: The logical log must replay the upgraded transaction like any exclusive
+/// DDL transaction.
+#[test]
+fn test_mvcc_concurrent_ddl_survives_restart() {
+    let mut db = MvccTestDbNoConn::new_with_random_db();
+    {
+        let conn = db.connect();
+        conn.execute("CREATE TABLE t(x INTEGER)").unwrap();
+        conn.execute("BEGIN CONCURRENT").unwrap();
+        conn.execute("INSERT INTO t VALUES (1)").unwrap();
+        conn.execute("CREATE TABLE u(id INTEGER PRIMARY KEY AUTOINCREMENT, y TEXT)")
+            .unwrap();
+        conn.execute("CREATE INDEX u_y ON u(y)").unwrap();
+        conn.execute("INSERT INTO u(y) VALUES ('a')").unwrap();
+        conn.execute("COMMIT").unwrap();
+
+        conn.execute("BEGIN CONCURRENT").unwrap();
+        conn.execute("CREATE TABLE gone(z INTEGER)").unwrap();
+        conn.execute("DROP TABLE t").unwrap();
+        conn.execute("ROLLBACK").unwrap();
+        conn.close().unwrap();
+    }
+
+    db.restart();
+    let conn = db.connect();
+    assert_eq!(
+        get_rows(&conn, "SELECT x FROM t"),
+        vec![vec![Value::from_i64(1)]]
+    );
+    assert_eq!(
+        get_rows(&conn, "SELECT id, y FROM u"),
+        vec![vec![Value::from_i64(1), Value::build_text("a")]]
+    );
+    assert_eq!(table_count(&conn, "u_y"), 1);
+    assert_eq!(table_count(&conn, "gone"), 0);
+    conn.execute("INSERT INTO u(y) VALUES ('b')").unwrap();
+    assert_eq!(
+        get_rows(&conn, "SELECT max(id) FROM u"),
+        vec![vec![Value::from_i64(2)]]
+    );
+}
+
+/// What this test checks: CREATE TABLE with AUTOINCREMENT, an INSERT and a ROLLBACK inside
+/// BEGIN CONCURRENT leave every connection able to prepare and run statements.
+/// Why this matters: The create makes sqlite_sequence inline. If the rollback leaves a schema
+/// that no committed state matches, connections keep failing with SchemaUpdated.
+#[test]
+fn test_mvcc_concurrent_autoincrement_ddl_rollback_no_schema_updated() {
+    let mut db = MvccTestDbNoConn::new_with_random_db();
+    {
+        let conn1 = db.connect();
+        let conn2 = db.connect();
+        conn1.execute("CREATE TABLE t(x INTEGER)").unwrap();
+        // conn2 caches a prepared schema before the DDL runs.
+        assert!(get_rows(&conn2, "SELECT x FROM t").is_empty());
+
+        conn1.execute("BEGIN CONCURRENT").unwrap();
+        conn1
+            .execute("CREATE TABLE a(id INTEGER PRIMARY KEY AUTOINCREMENT, v TEXT)")
+            .unwrap();
+        conn1.execute("INSERT INTO a(v) VALUES ('x')").unwrap();
+        conn1.execute("ROLLBACK").unwrap();
+
+        for conn in [&conn1, &conn2] {
+            assert_eq!(table_count(conn, "a"), 0);
+            assert_eq!(table_count(conn, "sqlite_sequence"), 0);
+            conn.execute("INSERT INTO t VALUES (1)").unwrap();
+        }
+        let conn3 = db.connect();
+        assert_eq!(
+            get_rows(&conn3, "SELECT count(*) FROM t"),
+            vec![vec![Value::from_i64(2)]]
+        );
+        conn2
+            .execute("CREATE TABLE a(id INTEGER PRIMARY KEY AUTOINCREMENT, v TEXT)")
+            .unwrap();
+        conn1.execute("INSERT INTO a(v) VALUES ('y')").unwrap();
+        conn1.close().unwrap();
+        conn2.close().unwrap();
+        conn3.close().unwrap();
+    }
+
+    db.restart();
+    let conn = db.connect();
+    assert_eq!(
+        get_rows(&conn, "SELECT id, v FROM a"),
+        vec![vec![Value::from_i64(1), Value::build_text("y")]]
+    );
+}
+
+/// What this test checks: DDL inside BEGIN DEFERRED under MVCC upgrades the read transaction to
+/// exclusive, commits, rolls back, and returns Busy when its snapshot is stale.
+/// Why this matters: BEGIN DEFERRED is the default transaction type, so DDL in it must follow
+/// the same rules as DDL in BEGIN CONCURRENT.
+#[test]
+fn test_mvcc_deferred_ddl_upgrades_to_exclusive() {
+    let mut db = MvccTestDbNoConn::new_with_random_db();
+    {
+        let conn1 = db.connect();
+        let conn2 = db.connect();
+        conn1.execute("CREATE TABLE t(x INTEGER)").unwrap();
+
+        conn1.execute("BEGIN DEFERRED").unwrap();
+        assert!(get_rows(&conn1, "SELECT x FROM t").is_empty());
+        conn1.execute("CREATE TABLE u(y INTEGER)").unwrap();
+        let tx_id = conn1.get_mv_tx_id().unwrap();
+        assert!(db.get_mvcc_store().is_exclusive_tx(&tx_id));
+        conn1.execute("INSERT INTO u VALUES (1)").unwrap();
+        conn1.execute("COMMIT").unwrap();
+
+        conn1.execute("BEGIN").unwrap();
+        conn1.execute("CREATE TABLE gone(z INTEGER)").unwrap();
+        conn1.execute("ROLLBACK").unwrap();
+        assert_eq!(table_count(&conn2, "gone"), 0);
+
+        conn1.execute("BEGIN DEFERRED").unwrap();
+        assert!(get_rows(&conn1, "SELECT x FROM t").is_empty());
+        conn2.execute("INSERT INTO t VALUES (1)").unwrap();
+        let err = conn1.execute("CREATE TABLE v(z INTEGER)").unwrap_err();
+        assert!(matches!(err, LimboError::Busy), "got: {err:?}");
+        conn1.execute("ROLLBACK").unwrap();
+        conn1.close().unwrap();
+        conn2.close().unwrap();
+    }
+
+    db.restart();
+    let conn = db.connect();
+    assert_eq!(
+        get_rows(&conn, "SELECT y FROM u"),
+        vec![vec![Value::from_i64(1)]]
+    );
+    assert_eq!(table_count(&conn, "gone"), 0);
+    assert_eq!(table_count(&conn, "v"), 0);
+}
+
 /// Missing/corrupt metadata with logical-log frames and no WAL causes fail-closed startup.
 #[test]
 #[cfg_attr(
