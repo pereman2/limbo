@@ -24226,6 +24226,9 @@ mod group_commit_tests;
 #[path = "group_commit_sync_mode_tests.rs"]
 mod group_commit_sync_mode_tests;
 
+#[path = "ddl_lock_bug_tests.rs"]
+mod ddl_lock_bug_tests;
+
 /// Drive a statement until it yields or finishes; IO is pumped, an explicit
 /// yield is handed back so the test can observe it.
 fn step_until_yield_or_done_pumping_io(
