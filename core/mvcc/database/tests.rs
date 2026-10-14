@@ -13052,7 +13052,7 @@ fn test_gc_retire_snapshot_stable_with_overlapping_writers() {
 }
 
 /// Index rows live in a separate SkipMap from table rows and go through their own
-/// GC path (gc_index_row_versions). This SQL-level test creates an indexed table,
+/// GC loop (in drop_unused_row_versions_inner). This SQL-level test creates an indexed table,
 /// checkpoints, updates the row (creating superseded index versions), checkpoints
 /// again, and verifies the index still returns correct results. Catches regressions
 /// where index GC removes versions that the dual cursor still needs.

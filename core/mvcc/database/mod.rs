@@ -8163,22 +8163,47 @@ impl<Clock: LogicalClock, A: ConcurrentAllocator> MvStore<Clock, A> {
         let ckpt_max = self.durable_txid_max.load(Ordering::SeqCst);
         let lwm = self.sample_gc_lwm();
         let mut referenced_tx_ids = HashSet::default();
+        let mut dropped = 0;
+        let mut gc_chain = |versions: &mut RowVersionChain<A>, min_reader_mark: WalPos| {
+            dropped += self.gc_chain_now(
+                versions,
+                lwm,
+                ckpt_max,
+                min_reader_mark,
+                drop_current_if_in_btree,
+            );
+            Self::collect_referenced_txids(versions, &mut referenced_tx_ids);
+            remove_empty_slots && versions.is_empty()
+        };
 
-        let dropped = self.gc_table_row_versions(
-            lwm,
-            ckpt_max,
-            &mut referenced_tx_ids,
-            remove_empty_slots,
-            drop_current_if_in_btree,
-            reader_mark_floor,
-        ) + self.gc_index_row_versions(
-            lwm,
-            ckpt_max,
-            &mut referenced_tx_ids,
-            remove_empty_slots,
-            drop_current_if_in_btree,
-            reader_mark_floor,
-        );
+        let min_reader_mark = self.gc_min_reader_mark(reader_mark_floor);
+        for entry in self.rows.iter() {
+            // GC floor: retain rows of a freshly-materialized btree not yet visible to all readers.
+            if self.rootpage_gc_protected(&entry.key().table_id, min_reader_mark) {
+                continue;
+            }
+            let mut versions = entry.value().write();
+            if gc_chain(&mut versions, min_reader_mark) {
+                entry.remove();
+            }
+        }
+
+        let min_reader_mark = self.gc_min_reader_mark(reader_mark_floor);
+        for outer_entry in self.index_rows.iter() {
+            // GC floor: retain a freshly-materialized index not yet visible to all readers.
+            if self.rootpage_gc_protected(outer_entry.key(), min_reader_mark) {
+                continue;
+            }
+            for inner_entry in outer_entry.value().iter() {
+                let mut versions = inner_entry.value().write();
+                if gc_chain(&mut versions, min_reader_mark) {
+                    self.bump_index_rows_epoch();
+                    // Inner key only — the outer per-index map stays (bounded by index count).
+                    inner_entry.remove();
+                }
+            }
+        }
+
         self.dec_live_version_count_approx(dropped);
         let pruned_finalized = self.prune_finalized_tx_states(&referenced_tx_ids);
 
@@ -8191,90 +8216,14 @@ impl<Clock: LogicalClock, A: ConcurrentAllocator> MvStore<Clock, A> {
         dropped
     }
 
-    fn gc_table_row_versions(
-        &self,
-        lwm: u64,
-        ckpt_max: u64,
-        referenced_tx_ids: &mut HashSet<TxID>,
-        remove_empty_slots: bool,
-        drop_current_if_in_btree: bool,
-        reader_mark_floor: WalPos,
-    ) -> usize {
-        let mut dropped = 0;
+    fn gc_min_reader_mark(&self, reader_mark_floor: WalPos) -> WalPos {
         // Bound by the backfill boundary: never reclaim a version materialized in un-backfilled
         // WAL frames — a db-file reader (present or future) needs the version-store copy.
         // `reader_mark_floor` additionally covers pager-pinned readers not yet published as
         // MVCC transactions (see `drop_unused_row_versions_unlink_empty_at`).
-        let min_reader_mark = self
-            .compute_min_reader_mark()
+        self.compute_min_reader_mark()
             .min(*self.backfill_floor.read())
-            .min(reader_mark_floor);
-
-        for entry in self.rows.iter() {
-            // GC floor: retain rows of a freshly-materialized btree not yet visible to all readers.
-            if self.rootpage_gc_protected(&entry.key().table_id, min_reader_mark) {
-                continue;
-            }
-            let mut versions = entry.value().write();
-            dropped += self.gc_chain_now(
-                &mut versions,
-                lwm,
-                ckpt_max,
-                min_reader_mark,
-                drop_current_if_in_btree,
-            );
-            Self::collect_referenced_txids(&versions, referenced_tx_ids);
-            if remove_empty_slots && versions.is_empty() {
-                entry.remove();
-            }
-        }
-        dropped
-    }
-
-    fn gc_index_row_versions(
-        &self,
-        lwm: u64,
-        ckpt_max: u64,
-        referenced_tx_ids: &mut HashSet<TxID>,
-        remove_empty_slots: bool,
-        drop_current_if_in_btree: bool,
-        reader_mark_floor: WalPos,
-    ) -> usize {
-        let mut dropped = 0;
-        // Bound by the backfill boundary: never reclaim a version materialized in un-backfilled
-        // WAL frames — a db-file reader (present or future) needs the version-store copy.
-        // `reader_mark_floor` additionally covers pager-pinned readers not yet published as
-        // MVCC transactions (see `drop_unused_row_versions_unlink_empty_at`).
-        let min_reader_mark = self
-            .compute_min_reader_mark()
-            .min(*self.backfill_floor.read())
-            .min(reader_mark_floor);
-
-        for outer_entry in self.index_rows.iter() {
-            // GC floor: retain a freshly-materialized index not yet visible to all readers.
-            if self.rootpage_gc_protected(outer_entry.key(), min_reader_mark) {
-                continue;
-            }
-            let inner_map = outer_entry.value();
-
-            for inner_entry in inner_map.iter() {
-                let mut versions = inner_entry.value().write();
-                dropped += self.gc_chain_now(
-                    &mut versions,
-                    lwm,
-                    ckpt_max,
-                    min_reader_mark,
-                    drop_current_if_in_btree,
-                );
-                Self::collect_referenced_txids(&versions, referenced_tx_ids);
-                if remove_empty_slots && versions.is_empty() {
-                    self.bump_index_rows_epoch();
-                    // Inner key only — the outer per-index map stays (bounded by index count).
-                    inner_entry.remove();
-                }
-            }
-        }
-        dropped
+            .min(reader_mark_floor)
     }
 
     fn collect_referenced_txids(versions: &[RowVersion], referenced_tx_ids: &mut HashSet<TxID>) {
