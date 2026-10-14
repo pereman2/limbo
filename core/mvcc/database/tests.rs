@@ -23248,3 +23248,121 @@ fn dropping_connect_async_state_mid_wait_does_not_block() {
     let conn = db.connect();
     assert!(conn.schema.read().analyze_stats.table_stats("t1").is_some());
 }
+
+fn step_collecting_rows(
+    stmt: &mut crate::Statement,
+    max_steps: usize,
+    rows: &mut Vec<Vec<Value>>,
+) -> bool {
+    for _ in 0..max_steps {
+        match stmt.step().unwrap() {
+            StepResult::Row => rows.push(stmt.row().unwrap().get_values().cloned().collect()),
+            StepResult::Done => return true,
+            StepResult::IO => stmt.get_pager().io.step().unwrap(),
+            _ => {}
+        }
+    }
+    false
+}
+
+/// Leaves conn_a's `BEGIN; DROP INDEX i; INSERT (2,'b'); COMMIT` paused while the
+/// transaction is Preparing, before its schema change is published.
+fn pause_drop_index_commit_while_preparing(
+    db: &MvccTestDbNoConn,
+    conn_a: &Arc<Connection>,
+) -> crate::Statement {
+    let setup = db.connect();
+    setup
+        .execute("CREATE TABLE t(id INTEGER PRIMARY KEY, p TEXT)")
+        .unwrap();
+    setup.execute("CREATE INDEX i ON t(p)").unwrap();
+    setup.execute("INSERT INTO t VALUES (1, 'a')").unwrap();
+    setup.execute("PRAGMA wal_checkpoint(TRUNCATE)").unwrap();
+    setup.close().unwrap();
+
+    conn_a.execute("BEGIN").unwrap();
+    conn_a.execute("DROP INDEX i").unwrap();
+    conn_a.execute("INSERT INTO t VALUES (2, 'b')").unwrap();
+    let tx_a_id = conn_a.get_mv_tx_id().unwrap();
+    conn_a.set_yield_injector(Some(FixedYieldInjector::new([
+        CommitYieldPoint::LogRecordPrepared.point(),
+    ])));
+    let mut commit_a = conn_a.prepare("COMMIT").unwrap();
+    loop {
+        match commit_a.step().unwrap() {
+            StepResult::Yield => break,
+            StepResult::IO => commit_a.get_pager().io.step().unwrap(),
+            other => panic!("COMMIT must yield at LogRecordPrepared, got {other:?}"),
+        }
+    }
+    assert!(matches!(
+        db.get_mvcc_store()
+            .txs
+            .get(&tx_a_id)
+            .unwrap()
+            .value()
+            .state
+            .load(),
+        TransactionState::Preparing(_)
+    ));
+    commit_a
+}
+
+/// Regression test for issue #9495.
+#[test]
+fn integrity_check_during_drop_index_commit_sees_no_missing_index_rows() {
+    let db = MvccTestDbNoConn::new_with_random_db();
+    let conn_a = db.connect();
+    let conn_b = db.connect();
+    let mut commit_a = pause_drop_index_commit_while_preparing(&db, &conn_a);
+
+    let mut check = conn_b.prepare("PRAGMA integrity_check").unwrap();
+    let mut rows = Vec::new();
+    let finished_while_a_paused = step_collecting_rows(&mut check, 10_000, &mut rows);
+
+    conn_a.set_yield_injector(None);
+    commit_a.run_ignore_rows().unwrap();
+    if !finished_while_a_paused {
+        assert!(step_collecting_rows(&mut check, 10_000, &mut rows));
+    }
+    assert_eq!(rows, vec![vec![Value::build_text("ok")]]);
+}
+
+/// Regression test for issue #9495.
+#[test]
+fn select_during_drop_index_commit_finds_row_inserted_after_drop() {
+    let db = MvccTestDbNoConn::new_with_random_db();
+    let conn_a = db.connect();
+    let conn_b = db.connect();
+    let mut commit_a = pause_drop_index_commit_while_preparing(&db, &conn_a);
+
+    type Rows = Vec<Vec<Value>>;
+    conn_b.execute("BEGIN").unwrap();
+    let read_both = || -> Result<(Rows, Rows)> {
+        let mut out = Vec::new();
+        for sql in [
+            "SELECT id FROM t NOT INDEXED WHERE p = 'b'",
+            "SELECT id FROM t WHERE p = 'b'",
+        ] {
+            let mut rows = Vec::new();
+            conn_b.prepare(sql)?.run_with_row_callback(|row| {
+                rows.push(row.get_values().cloned().collect());
+                Ok(())
+            })?;
+            out.push(rows);
+        }
+        let index_lookup = out.pop().unwrap();
+        Ok((out.pop().unwrap(), index_lookup))
+    };
+    match read_both() {
+        Ok((full_scan, index_lookup)) => assert_eq!(full_scan, index_lookup),
+        Err(LimboError::Busy) => {}
+        Err(e) => panic!("unexpected error while the DDL commit is paused: {e:?}"),
+    }
+
+    conn_a.set_yield_injector(None);
+    commit_a.run_ignore_rows().unwrap();
+    let (full_scan, index_lookup) = read_both().unwrap();
+    assert_eq!(full_scan, vec![vec![Value::from_i64(2)]]);
+    assert_eq!(index_lookup, full_scan);
+}
