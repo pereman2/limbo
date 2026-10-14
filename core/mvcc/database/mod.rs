@@ -1971,6 +1971,9 @@ impl<Clock: LogicalClock, A: ConcurrentAllocator> CommitStateMachine<Clock, A> {
         tx.value().state.store(TransactionState::Committed(end_ts));
         drop(tx);
         mvcc_store.rewrite_live_versions_for_committed_tx(owner_tx, end_ts);
+        mvcc_store
+            .last_committed_tx_ts
+            .fetch_max(end_ts, Ordering::AcqRel);
         if let Some(tx) = mvcc_store.txs.get(&owner_tx) {
             mvcc_store.unlock_commit_lock_if_held(tx.value());
         }
@@ -3609,7 +3612,7 @@ impl<Clock: LogicalClock, A: ConcurrentAllocator> StateTransition for CommitStat
             CommitState::CommitEnd { end_ts } => {
                 // The record is in the log and marked written since MarkLogRecordWritten.
                 // Order of operations from here:
-                // 1. Mark transaction Committed
+                // 1. Mark transaction Committed and bump last_committed_tx_ts
                 // 2. Rewrite live row versions from TxID to Timestamp (chunked
                 //    in `RewriteLiveVersions` so 2M-row write sets don't stall)
                 // 3. Notify dependents
@@ -3625,6 +3628,12 @@ impl<Clock: LogicalClock, A: ConcurrentAllocator> StateTransition for CommitStat
                 tx_unlocked
                     .state
                     .store(TransactionState::Committed(*end_ts));
+                // Publish the watermark together with Committed. Otherwise an
+                // older txn can pass acquire_exclusive_tx while our rows are
+                // already visible (#7481).
+                mvcc_store
+                    .last_committed_tx_ts
+                    .fetch_max(*end_ts, Ordering::AcqRel);
 
                 // Hand off to the chunked rewriter. Between chunks readers
                 // resolve any unwritten TxID refs via `txs[tx_id]` which now
@@ -7194,6 +7203,8 @@ impl<Clock: LogicalClock, A: ConcurrentAllocator> MvStore<Clock, A> {
                 // visibility/conflict checks would find versions pointing at a
                 // removed TxID (https://github.com/tursodatabase/turso/issues/7477).
                 self.rewrite_live_versions_for_committed_tx(tx_id, end_ts);
+                self.last_committed_tx_ts
+                    .fetch_max(end_ts, Ordering::AcqRel);
                 if let Some(tx) = self.txs.get(&tx_id) {
                     self.notify_committed_dependents(tx.value());
                     self.unlock_commit_lock_if_held(tx.value());
