@@ -1731,9 +1731,6 @@ fn mvcc_passive_checkpoint_must_not_leak_commits_into_pinned_snapshot() {
     );
 }
 
-/// DDL in BEGIN CONCURRENT upgrades the transaction to exclusive. An
-/// AUTOINCREMENT CREATE + INSERT + ROLLBACK must leave other connections
-/// usable, and a committed upgrade must survive a reopen.
 #[turso_macros::test]
 fn test_mvcc_concurrent_ddl_upgrade_then_recover(db: TempDatabase) -> anyhow::Result<()> {
     let path = db.path.clone();

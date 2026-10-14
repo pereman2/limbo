@@ -4930,10 +4930,6 @@ pub fn op_transaction_inner(
                             }
                         }
                         if let Some((tx_id, TransactionMode::Concurrent)) = current_mv_tx {
-                            // DDL has no row-level conflict keys, so a concurrent transaction
-                            // runs it as the exclusive writer. The upgrade returns Busy if
-                            // another transaction holds the exclusive lock, is committing, or
-                            // committed after this transaction began.
                             if program.schema_write_databases.get(*db)
                                 && !mv_store.is_exclusive_tx(&tx_id)
                             {

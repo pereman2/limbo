@@ -3720,10 +3720,6 @@ fn table_count(conn: &Arc<Connection>, name: &str) -> i64 {
     rows[0][0].as_int().unwrap()
 }
 
-/// What this test checks: DDL inside BEGIN CONCURRENT upgrades the transaction to exclusive and
-/// commits together with the writes made before and after the DDL.
-/// Why this matters: Schema changes have no row-level conflict keys, so the transaction must
-/// run them with single-writer semantics instead of rejecting them.
 #[test]
 fn test_mvcc_concurrent_ddl_upgrades_to_exclusive_and_commits() {
     let db = MvccTestDbNoConn::new_with_random_db();
@@ -3753,11 +3749,6 @@ fn test_mvcc_concurrent_ddl_upgrades_to_exclusive_and_commits() {
     assert_eq!(table_count(&conn2, "u_y"), 1);
 }
 
-/// What this test checks: The DDL upgrade returns Busy when a commit happened after the
-/// concurrent transaction began, or when another transaction holds the exclusive lock. Once
-/// upgraded, other concurrent writers cannot commit.
-/// Why this matters: Upgrading a stale snapshot would build the schema change on rows the
-/// transaction cannot see, and two exclusive writers would break single-writer semantics.
 #[test]
 fn test_mvcc_concurrent_ddl_busy_on_conflicting_writer() {
     let db = MvccTestDbNoConn::new_with_random_db();
@@ -3765,7 +3756,6 @@ fn test_mvcc_concurrent_ddl_busy_on_conflicting_writer() {
     let conn2 = db.connect();
     conn1.execute("CREATE TABLE t(x INTEGER)").unwrap();
 
-    // A commit after BEGIN CONCURRENT makes the snapshot stale.
     conn1.execute("BEGIN CONCURRENT").unwrap();
     conn1.execute("INSERT INTO t VALUES (1)").unwrap();
     conn2.execute("INSERT INTO t VALUES (2)").unwrap();
@@ -3774,7 +3764,6 @@ fn test_mvcc_concurrent_ddl_busy_on_conflicting_writer() {
     conn1.execute("ROLLBACK").unwrap();
     assert_eq!(table_count(&conn1, "u"), 0);
 
-    // Another transaction holds the exclusive lock.
     conn2.execute("BEGIN").unwrap();
     conn2.execute("INSERT INTO t VALUES (3)").unwrap();
     conn1.execute("BEGIN CONCURRENT").unwrap();
@@ -3783,7 +3772,6 @@ fn test_mvcc_concurrent_ddl_busy_on_conflicting_writer() {
     conn1.execute("ROLLBACK").unwrap();
     conn2.execute("COMMIT").unwrap();
 
-    // After the upgrade, a concurrent writer that commits is aborted, as with plain BEGIN.
     conn1.execute("BEGIN CONCURRENT").unwrap();
     conn1.execute("CREATE TABLE u(y INTEGER)").unwrap();
     conn2.execute("BEGIN CONCURRENT").unwrap();
@@ -3803,10 +3791,6 @@ fn test_mvcc_concurrent_ddl_busy_on_conflicting_writer() {
     );
 }
 
-/// What this test checks: ROLLBACK of a concurrent transaction that ran DDL restores the schema
-/// for the same connection and for other connections.
-/// Why this matters: A rolled-back CREATE or DROP must not leave the in-memory schema out of sync
-/// with the committed sqlite_schema rows.
 #[test]
 fn test_mvcc_concurrent_ddl_rollback_restores_schema() {
     let db = MvccTestDbNoConn::new_with_random_db();
@@ -3835,10 +3819,6 @@ fn test_mvcc_concurrent_ddl_rollback_restores_schema() {
     conn1.execute("INSERT INTO u VALUES ('ok')").unwrap();
 }
 
-/// What this test checks: The database opens after restart and shows the result of committed
-/// and rolled-back DDL from BEGIN CONCURRENT transactions.
-/// Why this matters: The logical log must replay the upgraded transaction like any exclusive
-/// DDL transaction.
 #[test]
 fn test_mvcc_concurrent_ddl_survives_restart() {
     let mut db = MvccTestDbNoConn::new_with_random_db();
@@ -3879,10 +3859,6 @@ fn test_mvcc_concurrent_ddl_survives_restart() {
     );
 }
 
-/// What this test checks: CREATE TABLE with AUTOINCREMENT, an INSERT and a ROLLBACK inside
-/// BEGIN CONCURRENT leave every connection able to prepare and run statements.
-/// Why this matters: The create makes sqlite_sequence inline. If the rollback leaves a schema
-/// that no committed state matches, connections keep failing with SchemaUpdated.
 #[test]
 fn test_mvcc_concurrent_autoincrement_ddl_rollback_no_schema_updated() {
     let mut db = MvccTestDbNoConn::new_with_random_db();
@@ -3890,7 +3866,6 @@ fn test_mvcc_concurrent_autoincrement_ddl_rollback_no_schema_updated() {
         let conn1 = db.connect();
         let conn2 = db.connect();
         conn1.execute("CREATE TABLE t(x INTEGER)").unwrap();
-        // conn2 caches a prepared schema before the DDL runs.
         assert!(get_rows(&conn2, "SELECT x FROM t").is_empty());
 
         conn1.execute("BEGIN CONCURRENT").unwrap();
@@ -3927,10 +3902,6 @@ fn test_mvcc_concurrent_autoincrement_ddl_rollback_no_schema_updated() {
     );
 }
 
-/// What this test checks: DDL inside BEGIN DEFERRED under MVCC upgrades the read transaction to
-/// exclusive, commits, rolls back, and returns Busy when its snapshot is stale.
-/// Why this matters: BEGIN DEFERRED is the default transaction type, so DDL in it must follow
-/// the same rules as DDL in BEGIN CONCURRENT.
 #[test]
 fn test_mvcc_deferred_ddl_upgrades_to_exclusive() {
     let mut db = MvccTestDbNoConn::new_with_random_db();

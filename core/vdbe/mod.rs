@@ -1884,9 +1884,7 @@ pub struct PreparedProgram {
     pub write_databases: BitSet,
     /// Set of attached database indices that need read transactions.
     pub read_databases: BitSet,
-    /// Databases whose sqlite_schema this statement opens for writing (DDL).
-    /// Under MVCC, the Transaction opcode upgrades a BEGIN CONCURRENT
-    /// transaction on these databases to exclusive before the statement runs.
+    /// Databases whose sqlite_schema (root page 1) this statement opens for writing.
     pub schema_write_databases: BitSet,
 }
 

@@ -2353,8 +2353,7 @@ impl ProgramBuilder {
         self.resolve_labels()?;
 
         let mut schema_write_databases = BitSet::default();
-        // Fill in the is_index field on Next and Prev, now that we know all cursor types.
-        // Also collect the databases whose sqlite_schema (root page 1) is opened for writing.
+        // Fill in the is_index field on Next and Prev, now that we know all cursor types
         for (insn, _) in self.insns.iter_mut() {
             if let Insn::OpenWrite {
                 root_page: super::insn::RegisterOrLiteral::Literal(1),
