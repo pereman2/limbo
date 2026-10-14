@@ -221,6 +221,10 @@ Concurrent transactions can coexist with exclusive transactions (deferred and im
 
 This design allows concurrent transactions to make progress during an exclusive transaction, but ensures that exclusive transactions truly have exclusive write access when needed (for example, schema changes).
 
+#### Schema changes in concurrent transactions
+
+A schema change (`CREATE`, `DROP`, `ALTER`) inside a concurrent transaction upgrades that transaction to an exclusive transaction. The upgrade fails with `SQLITE_BUSY` if another exclusive transaction is active, if another transaction is committing, or if another transaction committed after this transaction began. If the upgrade fails, roll back the transaction and retry it. After the upgrade, other concurrent transactions cannot commit until this transaction commits or rolls back.
+
 **Best practice**: For maximum concurrency in MVCC mode, use `BEGIN CONCURRENT` for all write transactions. Only use `BEGIN IMMEDIATE` or `BEGIN DEFERRED` when you need exclusive write access that prevents any concurrent commits.
 
 ## The SQL language
