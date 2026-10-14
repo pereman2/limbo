@@ -6668,6 +6668,7 @@ impl<Clock: LogicalClock, A: ConcurrentAllocator> MvStore<Clock, A> {
         pager.mvcc_refresh_if_db_changed();
         let read_mark = WalPos::from_pair(pager.wal_pos());
         let mut schema_stale = false;
+        let mut schema_change_unpublished = false;
         let begin_ts = self.clock.get_timestamp(|ts| {
             // Capture header (cookie) + schema_generation INSIDE the clock so they are
             // consistent with the root map at insert time: a passive publish runs under this
@@ -6684,6 +6685,14 @@ impl<Clock: LogicalClock, A: ConcurrentAllocator> MvStore<Clock, A> {
                 .global_header
                 .read()
                 .expect("global_header initialized above");
+            // A schema-changing transaction that is Preparing has an end_ts below
+            // ts, so we would see its rows, but its schema is published only in
+            // EndCommitLogicalLog. Wait until then instead of pairing new rows
+            // with the old schema.
+            if self.has_unpublished_schema_change(&header) {
+                schema_change_unpublished = true;
+                return;
+            }
             self.txs.insert(
                 tx_id,
                 Transaction::new(tx_id, ts, header, read_mark, schema_generation),
@@ -6694,6 +6703,12 @@ impl<Clock: LogicalClock, A: ConcurrentAllocator> MvStore<Clock, A> {
                 self.blocking_checkpoint_lock.unlock();
             }
             return Err(LimboError::SchemaUpdated);
+        }
+        if schema_change_unpublished {
+            if !passive {
+                self.blocking_checkpoint_lock.unlock();
+            }
+            return Err(LimboError::Busy);
         }
         if !passive {
             if let Some(entry) = self.txs.get(&tx_id) {
@@ -7540,6 +7555,21 @@ impl<Clock: LogicalClock, A: ConcurrentAllocator> MvStore<Clock, A> {
     #[inline]
     fn has_exclusive_tx(&self) -> bool {
         self.exclusive_tx.load(Ordering::Acquire) != NO_EXCLUSIVE_TX
+    }
+
+    /// Returns true if the exclusive transaction is Preparing with a schema
+    /// cookie that differs from the published `global_header`.
+    fn has_unpublished_schema_change(&self, global_header: &DatabaseHeader) -> bool {
+        let tx_id = self.exclusive_tx.load(Ordering::Acquire);
+        if tx_id == NO_EXCLUSIVE_TX {
+            return false;
+        }
+        let Some(entry) = self.txs.get(&tx_id) else {
+            return false;
+        };
+        let tx = entry.value();
+        matches!(tx.state.load(), TransactionState::Preparing(_))
+            && tx.header.read().schema_cookie.get() != global_header.schema_cookie.get()
     }
 
     fn has_preparing_tx_other_than(&self, tx_id: TxID) -> bool {
