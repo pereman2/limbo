@@ -11662,6 +11662,86 @@ fn test_gc_with_slot_removal_drops_empty_skipmap_entries() {
     );
 }
 
+fn rolled_back_insert_into_indexed_table(
+    mvcc_store: &crate::MvStore,
+    conn: &Arc<Connection>,
+) -> (RowID, MVTableId) {
+    conn.execute("CREATE TABLE t(id INTEGER PRIMARY KEY, v TEXT UNIQUE)")
+        .unwrap();
+    conn.execute("BEGIN CONCURRENT").unwrap();
+    conn.execute("INSERT INTO t VALUES (1, 'a')").unwrap();
+    conn.execute("ROLLBACK").unwrap();
+    let row_id = mvcc_store
+        .rows
+        .iter()
+        .map(|entry| entry.key().clone())
+        .find(|row_id| row_id.row_id == RowKey::Int(1) && row_id.table_id != (-1).into())
+        .unwrap();
+    let index_id = *mvcc_store.index_rows.front().unwrap().key();
+    (row_id, index_id)
+}
+
+fn index_slot_count(mvcc_store: &crate::MvStore, index_id: MVTableId) -> usize {
+    mvcc_store.index_rows.get(&index_id).unwrap().value().len()
+}
+
+#[test]
+fn test_gc_with_slot_removal_bumps_index_rows_epoch_per_removed_index_slot() {
+    let db = MvccTestDbNoConn::new_with_random_db();
+    let conn = db.connect();
+    let mvcc_store = db.get_mvcc_store();
+    let (row_id, index_id) = rolled_back_insert_into_indexed_table(&mvcc_store, &conn);
+    assert_eq!(index_slot_count(&mvcc_store, index_id), 1);
+    let epoch_before = mvcc_store.index_rows_epoch();
+
+    mvcc_store.drop_unused_row_versions_and_slots();
+
+    assert!(mvcc_store.rows.get(&row_id).is_none());
+    assert_eq!(index_slot_count(&mvcc_store, index_id), 0);
+    assert_eq!(mvcc_store.index_rows_epoch(), epoch_before + 1);
+}
+
+#[test]
+fn test_gc_keeps_slots_of_btrees_not_yet_visible_to_all_readers() {
+    let db = MvccTestDbNoConn::new_with_random_db();
+    let conn = db.connect();
+    let mvcc_store = db.get_mvcc_store();
+    let (row_id, index_id) = rolled_back_insert_into_indexed_table(&mvcc_store, &conn);
+    let after_backfill_floor = WalPos::from_pair((0, 1));
+    mvcc_store.record_rootpage_alloc(row_id.table_id, 1000, 0, after_backfill_floor);
+    mvcc_store.record_rootpage_alloc(index_id, 1001, 0, after_backfill_floor);
+    let epoch_before = mvcc_store.index_rows_epoch();
+
+    mvcc_store.drop_unused_row_versions_and_slots();
+
+    assert!(mvcc_store.rows.get(&row_id).is_some());
+    assert_eq!(index_slot_count(&mvcc_store, index_id), 1);
+    assert_eq!(mvcc_store.index_rows_epoch(), epoch_before);
+}
+
+#[test]
+fn test_gc_keeps_finalized_tx_state_referenced_by_a_row_version() {
+    let db = MvccTestDbNoConn::new_with_random_db();
+    let conn = db.connect();
+    let mvcc_store = db.get_mvcc_store();
+    let (row_id, _) = rolled_back_insert_into_indexed_table(&mvcc_store, &conn);
+    let finalized_tx_id: TxID = 1_000_000;
+    mvcc_store
+        .insert_finalized_tx_state(finalized_tx_id, 5)
+        .unwrap();
+    let entry = mvcc_store.rows.get(&row_id).unwrap();
+    mvcc_store
+        .insert_version_raw(
+            &mut entry.value().write(),
+            make_rv(Some(TxTimestampOrID::TxID(finalized_tx_id)), None),
+        )
+        .unwrap();
+
+    mvcc_store.drop_unused_row_versions();
+
+    assert!(lookup_finalized_tx_state(&mvcc_store.finalized_tx_states, finalized_tx_id).is_some());
+}
+
 /// The low-water mark (LWM) is the minimum begin_ts of all active readers. GC
 /// must not remove any version that an active reader might still need. This test
 /// opens a reader, writes a new version that supersedes the reader's snapshot,
