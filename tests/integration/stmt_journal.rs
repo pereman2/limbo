@@ -351,7 +351,7 @@ fn cascade_depth_error_restores_rows(tmp_db: TempDatabase) -> anyhow::Result<()>
     )?;
     for depth in [1001, 2000] {
         for explicit_transaction in [false, true] {
-            conn.execute(&format!(
+            conn.execute(format!(
                 "WITH RECURSIVE s(x) AS (SELECT 1 UNION ALL SELECT x+1 FROM s WHERE x<{depth})
                  INSERT INTO t SELECT x, CASE WHEN x>1 THEN x-1 END FROM s"
             ))?;
@@ -378,7 +378,9 @@ fn cascade_depth_error_restores_rows(tmp_db: TempDatabase) -> anyhow::Result<()>
                 );
             }
             conn.execute("UPDATE t SET k=NULL WHERE id=1001")?;
-            conn.execute("DELETE FROM t")?;
+            conn.execute("DELETE FROM t WHERE id=1")?;
+            conn.execute("DELETE FROM t WHERE id=1001")?;
+            conn.execute("DELETE FROM t WHERE id=3000")?;
             assert_eq!(query_rows(&conn, "SELECT count(*) FROM t"), ["0"]);
         }
     }
@@ -434,7 +436,7 @@ fn cascade_resumes_or_aborts_after_deep_io() -> anyhow::Result<()> {
         }
         conn.execute("COMMIT")?;
         assert_eq!(query_rows(&conn, "PRAGMA integrity_check"), ["ok"]);
-        conn.execute("DELETE FROM t")?;
+        conn.execute("DELETE FROM t WHERE id=1")?;
         assert_eq!(query_rows(&conn, "SELECT count(*) FROM t"), ["0"]);
     }
     Ok(())

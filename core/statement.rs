@@ -26,7 +26,7 @@ use crate::{
         },
         ProgramStep,
     },
-    Connection, EqpFormat, LimboError, MvStore, Pager, QueryMode, Result, TransactionState, Value,
+    EqpFormat, LimboError, MvStore, Pager, QueryMode, Result, TransactionState, Value,
     EXPLAIN_COLUMNS, EXPLAIN_QUERY_PLAN_COLUMNS, EXPLAIN_QUERY_PLAN_JSON_COLUMNS,
 };
 
@@ -393,25 +393,6 @@ impl std::fmt::Debug for Statement {
 }
 
 impl Statement {
-    pub(crate) fn prepare_index_methods(&mut self) -> crate::types::IOResultOr<()> {
-        crate::vdbe::execute::index_method_stage_statement_all(&mut self.state)
-    }
-
-    pub(crate) fn abort_index_methods(&mut self) {
-        crate::vdbe::execute::index_method_abort_statement_all(&mut self.state);
-    }
-
-    pub(crate) fn commit_index_methods(&mut self) {
-        crate::vdbe::execute::index_method_on_transaction_committed_all(
-            &mut self.state,
-            &self.program.connection,
-        );
-    }
-
-    pub(crate) fn register_index_methods(&mut self, connection: &Connection) -> Result<()> {
-        crate::vdbe::execute::index_method_register_transaction_all(&mut self.state, connection)
-    }
-
     pub fn new(
         program: vdbe::Program,
         pager: Arc<Pager>,
@@ -873,7 +854,7 @@ impl Statement {
         self._step(Some(waker))
     }
 
-    /// Fast step for trigger/FK subprograms: skips reprepare checks, timeout
+    /// Fast step for materialized view subprograms: skips reprepare checks, timeout
     /// arming, busy handler, metrics recording, and schema retry.
     /// The parent statement handles all of those concerns.
     #[inline]
@@ -893,6 +874,18 @@ impl Statement {
         let result = self.program.abort(&self.pager, err, &mut self.state, false);
         self.state.execution_state = vdbe::ProgramExecutionState::Failed;
         result
+    }
+
+    pub(crate) fn step_frame(&mut self) -> vdbe::ProgramStep {
+        self.program.normal_step(&mut self.state, &self.pager, None)
+    }
+
+    pub(crate) fn program_state(&self) -> &vdbe::ProgramState {
+        &self.state
+    }
+
+    pub(crate) fn program_state_mut(&mut self) -> &mut vdbe::ProgramState {
+        &mut self.state
     }
 
     pub fn run_ignore_rows(&mut self) -> Result<()> {
@@ -1709,7 +1702,8 @@ impl Statement {
                             break;
                         }
                         Ok(vdbe::execute::InsnFunctionStepResult::Row)
-                        | Ok(vdbe::execute::InsnFunctionStepResult::Step) => {
+                        | Ok(vdbe::execute::InsnFunctionStepResult::Step)
+                        | Ok(vdbe::execute::InsnFunctionStepResult::Call) => {
                             capture_reset_error(
                                 &mut reset_error,
                                 LimboError::InternalError(

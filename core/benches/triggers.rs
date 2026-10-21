@@ -80,7 +80,7 @@ fn setup_rusqlite(temp_dir: &TempDir, schema: &str) -> rusqlite::Connection {
     conn
 }
 
-/// Multi-row INSERT with AFTER INSERT trigger (tests statement caching + step_subprogram)
+/// Multi-row INSERT with AFTER INSERT trigger (tests statement caching)
 #[turso_macros::codspeed_criterion_benchmark]
 fn bench_multirow_insert_with_trigger(criterion: &mut Criterion) {
     let enable_rusqlite =

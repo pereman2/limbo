@@ -47,14 +47,14 @@ use crate::vdbe::affinity::{
 use crate::vdbe::hash_table::{
     HashEntry, HashInsertResult, HashTable, HashTableConfig, PendingHashInsert, DEFAULT_MEM_BUDGET,
 };
-use crate::vdbe::insn::{AlterColumnData, InsertFlags};
+use crate::vdbe::insn::{AlterColumnData, InsertFlags, Subprogram};
 use crate::vdbe::metrics::HashJoinMetrics;
 use crate::vdbe::vacuum::VacuumInPlaceOpContext;
 use crate::vdbe::value::ComparisonOp;
 use crate::vdbe::ValueIteratorExt;
 use crate::vdbe::{
     decode_serial_type_into_register, registers_to_ref_values, DeferredSeekState, EndStatement,
-    OpHashBuildState, OpHashProbeState, StepResult, TxnCleanup, VacuumOpState,
+    OpHashBuildState, OpHashProbeState, ProgramStep, StepResult, TxnCleanup, VacuumOpState,
 };
 use crate::vector::{
     vector1bit, vector32, vector32_sparse, vector64, vector8, vector_concat, vector_distance_cos,
@@ -466,6 +466,7 @@ pub enum InsnFunctionStepResult {
     IO,
     Row,
     Step,
+    Call,
 }
 
 pub fn op_init(
@@ -4095,7 +4096,40 @@ pub(crate) fn index_method_stage_statement_all(state: &mut ProgramState) -> IORe
     return stage_statement_all_cold(state);
 
     #[inline(never)]
-    fn stage_statement_all_cold(state: &mut ProgramState) -> IOResultOr<()> {
+    fn stage_statement_all_cold(root: &mut ProgramState) -> IOResultOr<()> {
+        let mut path = Vec::new();
+        loop {
+            let state = cached_subprogram_state(root, &path);
+            if !state.index_methods_finalized && has_index_method_work(state) {
+                match stage_statement_cursors(state)? {
+                    IOResult::Done(()) => {}
+                    IOResult::IO(io) => return Ok(IOResult::IO(io)),
+                }
+                let subprogram_keys = state
+                    .index_method_finalize_subprogram_keys
+                    .get_or_insert_with(|| {
+                        let mut keys = state
+                            .subprogram_stmt_cache
+                            .keys()
+                            .copied()
+                            .collect::<Vec<_>>();
+                        keys.sort_unstable();
+                        keys
+                    });
+                if let Some(&key) = subprogram_keys.get(state.index_method_finalize_subprogram) {
+                    path.push(key);
+                    continue;
+                }
+                state.index_methods_finalized = true;
+            }
+            if path.pop().is_none() {
+                return Ok(IOResult::Done(()));
+            }
+            cached_subprogram_state(root, &path).index_method_finalize_subprogram += 1;
+        }
+    }
+
+    fn stage_statement_cursors(state: &mut ProgramState) -> IOResultOr<()> {
         while state.index_method_finalize_cursor < state.cursors.len() {
             let cursor_id = state.index_method_finalize_cursor;
             if matches!(
@@ -4128,32 +4162,21 @@ pub(crate) fn index_method_stage_statement_all(state: &mut ProgramState) -> IORe
             }
             state.index_method_finalize_cursor += 1;
         }
-
-        let subprogram_keys = state
-            .index_method_finalize_subprogram_keys
-            .get_or_insert_with(|| {
-                let mut keys = state
-                    .subprogram_stmt_cache
-                    .keys()
-                    .copied()
-                    .collect::<Vec<_>>();
-                keys.sort_unstable();
-                keys
-            });
-        while state.index_method_finalize_subprogram < subprogram_keys.len() {
-            let key = subprogram_keys[state.index_method_finalize_subprogram];
-            let statement = state
-                .subprogram_stmt_cache
-                .get_mut(&key)
-                .expect("finalization key must reference a cached subprogram");
-            match statement.prepare_index_methods()? {
-                IOResult::Done(()) => state.index_method_finalize_subprogram += 1,
-                IOResult::IO(io) => return Ok(IOResult::IO(io)),
-            }
-        }
-
-        state.index_methods_finalized = true;
         Ok(IOResult::Done(()))
+    }
+
+    fn cached_subprogram_state<'a>(
+        mut state: &'a mut ProgramState,
+        path: &[usize],
+    ) -> &'a mut ProgramState {
+        for key in path {
+            state = state
+                .subprogram_stmt_cache
+                .get_mut(key)
+                .expect("finalization key must reference a cached subprogram")
+                .program_state_mut();
+        }
+        state
     }
 }
 
@@ -4161,6 +4184,13 @@ pub(crate) fn index_method_stage_statement_all(state: &mut ProgramState) -> IORe
 /// transaction is rolled back. Hooks are deliberately infallible and may not
 /// perform I/O.
 pub(crate) fn index_method_abort_statement_all(state: &mut ProgramState) {
+    abort_statement_index_methods(state);
+    state.for_each_subprogram_mut(|statement| {
+        abort_statement_index_methods(statement.program_state_mut())
+    });
+}
+
+fn abort_statement_index_methods(state: &mut ProgramState) {
     for (cursor_id, cursor_opt) in state.cursors.iter_mut().enumerate() {
         let Some(Cursor::IndexMethod(cursor)) = cursor_opt else {
             continue;
@@ -4178,9 +4208,6 @@ pub(crate) fn index_method_abort_statement_all(state: &mut ProgramState) {
     }
     for (cursor, context) in &mut state.closed_index_method_cursors {
         cursor.abort_statement(context);
-    }
-    for statement in state.subprogram_stmt_cache.values_mut() {
-        statement.abort_index_methods();
     }
     state.index_method_finalize_cursor = 0;
     state.index_method_finalize_subprogram_keys = None;
@@ -4207,6 +4234,14 @@ pub(crate) fn index_method_on_transaction_committed_all(
         connection.index_methods_on_transaction_committed();
         return;
     }
+    publish_statement_index_methods(state);
+    state.for_each_subprogram_mut(|statement| {
+        publish_statement_index_methods(statement.program_state_mut())
+    });
+    connection.index_methods_on_transaction_committed();
+}
+
+fn publish_statement_index_methods(state: &mut ProgramState) {
     for (cursor_id, cursor_opt) in state.cursors.iter_mut().enumerate() {
         let Some(Cursor::IndexMethod(cursor)) = cursor_opt else {
             continue;
@@ -4225,10 +4260,6 @@ pub(crate) fn index_method_on_transaction_committed_all(
     for (cursor, context) in &mut state.closed_index_method_cursors {
         cursor.on_transaction_committed(context);
     }
-    for statement in state.subprogram_stmt_cache.values_mut() {
-        statement.commit_index_methods();
-    }
-    connection.index_methods_on_transaction_committed();
 }
 
 /// Transfer the final prepared cursor for every attachment touched by this
@@ -4252,6 +4283,29 @@ fn register_index_method_transactions(
     connection: &Connection,
 ) -> crate::Result<()> {
     let mut registered = 0usize;
+    let mut result = register_statement_index_methods(state, connection, &mut registered);
+    state.for_each_subprogram_mut(|statement| {
+        if result.is_ok() {
+            result = register_statement_index_methods(
+                statement.program_state_mut(),
+                connection,
+                &mut registered,
+            );
+        }
+    });
+    result?;
+    tracing::trace!(
+        registered,
+        "retained statement index-method cursors for transaction outcome"
+    );
+    Ok(())
+}
+
+fn register_statement_index_methods(
+    state: &mut ProgramState,
+    connection: &Connection,
+    registered: &mut usize,
+) -> crate::Result<()> {
     for cursor_id in 0..state.cursors.len() {
         if !matches!(state.cursors[cursor_id], Some(Cursor::IndexMethod(_))) {
             continue;
@@ -4269,21 +4323,14 @@ fn register_index_method_transactions(
         connection.register_index_method_transaction_cursor(
             crate::index_method::TransactionIndexMethodCursor { cursor, context },
         );
-        registered += 1;
+        *registered += 1;
     }
     for (cursor, context) in state.closed_index_method_cursors.drain(..) {
         connection.register_index_method_transaction_cursor(
             crate::index_method::TransactionIndexMethodCursor { cursor, context },
         );
-        registered += 1;
+        *registered += 1;
     }
-    for statement in state.subprogram_stmt_cache.values_mut() {
-        statement.register_index_methods(connection)?;
-    }
-    tracing::trace!(
-        registered,
-        "retained statement index-method cursors for transaction outcome"
-    );
     Ok(())
 }
 
@@ -5899,20 +5946,31 @@ pub fn op_integer(
     Ok(InsnFunctionStepResult::Step)
 }
 
+const MAX_TRIGGER_DEPTH: usize = 1000;
+
+pub struct SubprogramFrame {
+    /// Whether the subprogram is a trigger (vs FK action subprogram)
+    pub(super) is_trigger: bool,
+    pub(super) statement: Box<Statement>,
+    /// Saved last_insert_rowid to restore after trigger subprogram completes.
+    /// Per SQLite docs, trigger-body INSERTs must not overwrite the top-level rowid.
+    pub(super) saved_last_insert_rowid: Option<i64>,
+    /// Saved connection-level `changes()` value to restore after a trigger subprogram.
+    /// Trigger-body statements temporarily replace it via ResetCount, but the caller's
+    /// value becomes visible again once the trigger returns.
+    pub(super) saved_changes_value: Option<i64>,
+}
+
 pub enum OpProgramState {
     Start,
-    /// Step state tracks whether we're executing a trigger subprogram (vs FK action subprogram)
-    Step {
-        is_trigger: bool,
-        statement: Box<Statement>,
-        /// Saved last_insert_rowid to restore after trigger subprogram completes.
-        /// Per SQLite docs, trigger-body INSERTs must not overwrite the top-level rowid.
-        saved_last_insert_rowid: Option<i64>,
-        /// Saved connection-level `changes()` value to restore after a trigger subprogram.
-        /// Trigger-body statements temporarily replace it via ResetCount, but the caller's
-        /// value becomes visible again once the trigger returns.
-        saved_changes_value: Option<i64>,
+    Run(Vec<SubprogramFrame>),
+    Call(SubprogramFrame),
+    Calling,
+    Return {
+        finished: Option<Box<Statement>>,
+        raise_ignore: bool,
     },
+    Failed(Box<LimboError>),
 }
 
 impl Default for OpProgramState {
@@ -5921,33 +5979,26 @@ impl Default for OpProgramState {
     }
 }
 
-fn finish_subprogram(
-    program: &Program,
-    statement: &Statement,
-    is_trigger: bool,
-    subprogram_aborted: bool,
-    saved_last_insert_rowid: Option<i64>,
-    saved_changes_value: Option<i64>,
-) {
-    let pending_changes = statement.n_total_change();
+fn finish_subprogram(program: &Program, frame: &SubprogramFrame, subprogram_aborted: bool) {
+    let pending_changes = frame.statement.n_total_change();
     if pending_changes != 0 {
         program.connection.add_total_changes(pending_changes);
     }
 
     // Only end trigger execution for normal completion. Error paths
     // already called end_trigger_execution() via abort() in the subprogram.
-    if is_trigger && !subprogram_aborted {
+    if frame.is_trigger && !subprogram_aborted {
         program.connection.end_trigger_execution();
     }
 
     // Restore last_insert_rowid after trigger execution, per SQLite semantics:
     // trigger-body INSERTs must not overwrite the top-level rowid.
-    if let Some(rowid) = saved_last_insert_rowid {
+    if let Some(rowid) = frame.saved_last_insert_rowid {
         program.connection.update_last_rowid(rowid);
     }
 
     // Restore `changes()`, but not `total_changes()`
-    if let Some(changes) = saved_changes_value {
+    if let Some(changes) = frame.saved_changes_value {
         program.connection.set_changes(changes);
     }
 }
@@ -5999,151 +6050,41 @@ pub fn op_program(
         },
         insn
     );
-    let subprogram = subprogram.prepared_program()?;
     loop {
         match std::mem::take(state.active_op_state.program()) {
             OpProgramState::Start => {
-                // Try to reuse a cached statement for this PC, otherwise create a new one.
-                // When we have triggers or fk-actions with multi-row inserts, we can re-use
-                // cached statements by storing them key'd by the state.pc if we are in a loop
-                let pc_key = state.pc as usize;
-                let mut statement =
-                    if let Some(mut cached) = state.subprogram_stmt_cache.remove(&pc_key) {
-                        cached.reset_for_subprogram_reuse();
-                        cached
-                    } else {
-                        Box::new(Statement::new_with_origin(
-                            Program::from_prepared(subprogram.clone(), program.connection.clone()),
-                            pager.clone(),
-                            QueryMode::Normal,
-                            0,
-                            crate::statement::StatementOrigin::Subprogram,
-                            false,
-                            crate::connection::PrepareOptions::default(),
-                        ))
-                    };
-
-                // Check if this is a trigger subprogram - if so, track execution
-                // and save last_insert_rowid so it can be restored after the trigger finishes.
-                let (is_trigger, saved_last_insert_rowid, saved_last_changes_value) =
-                    if let Some(ref trigger) = statement.get_trigger() {
-                        program.connection.start_trigger_execution(trigger.clone());
-                        (
-                            true,
-                            Some(program.connection.last_insert_rowid()),
-                            Some(program.connection.changes()),
-                        )
-                    } else {
-                        (false, None, None)
-                    };
-
-                // Copy parameter values from parent registers into the subprogram's parameters.
-                for (param_idx, &parent_reg) in param_registers.iter().enumerate() {
-                    let value = state.registers[parent_reg].get_value().clone();
-                    let param_index = NonZero::<usize>::new(param_idx + 1)
-                        .expect("param_idx + 1 should be non-zero");
-                    statement.bind_at(param_index, value)?;
+                let frame = prepare_subprogram(program, state, param_registers, subprogram, pager)?;
+                if state.subprogram_depth > 0 {
+                    *state.active_op_state.program() = OpProgramState::Call(frame);
+                    return Ok(InsnFunctionStepResult::Call);
                 }
-
-                *state.active_op_state.program() = OpProgramState::Step {
-                    is_trigger,
-                    statement,
-                    saved_last_insert_rowid,
-                    saved_changes_value: saved_last_changes_value,
-                };
+                *state.active_op_state.program() = OpProgramState::Run(vec![frame]);
             }
-            OpProgramState::Step {
-                is_trigger,
-                mut statement,
-                saved_last_insert_rowid,
-                saved_changes_value: saved_last_changes_value,
-            } => {
-                let mut raise_ignore = false;
-                // Track whether the subprogram aborted with an error. When abort()
-                // runs inside the subprogram, it already calls end_trigger_execution(),
-                // so we must not call it again after the loop.
-                let mut subprogram_aborted = false;
-                loop {
-                    let now = *state
-                        .current_time
-                        .get_or_insert_with(|| pager.io.current_time_wall_clock());
-                    statement.set_current_time(now);
-                    let res = statement.step_subprogram();
-                    match res {
-                        Ok(step_result) => match step_result {
-                            StepResult::Done => break,
-                            StepResult::IO | StepResult::Yield | StepResult::Sleep { .. } => {
-                                let io = statement
-                                    .take_io_completions()
-                                    .unwrap_or_else(|| IOCompletions(Completion::new_yield()));
-                                *state.active_op_state.program() = OpProgramState::Step {
-                                    is_trigger,
-                                    statement,
-                                    saved_last_insert_rowid,
-                                    saved_changes_value: saved_last_changes_value,
-                                };
-                                return Ok(state.suspend_on_io(io));
-                            }
-                            StepResult::Row => continue,
-                            StepResult::Interrupt | StepResult::Busy => {
-                                *state.active_op_state.program() = OpProgramState::Step {
-                                    is_trigger,
-                                    statement,
-                                    saved_last_insert_rowid,
-                                    saved_changes_value: saved_last_changes_value,
-                                };
-                                return Err(LimboError::Busy.into());
-                            }
-                        },
-                        Err(LimboError::Constraint(constraint_err)) => {
-                            if program.resolve_type != ResolveType::Ignore {
-                                subprogram_aborted = true;
-                                finish_subprogram(
-                                    program,
-                                    &statement,
-                                    is_trigger,
-                                    subprogram_aborted,
-                                    saved_last_insert_rowid,
-                                    saved_last_changes_value,
-                                );
-                                return Err(LimboError::Constraint(constraint_err).into());
-                            }
-                            subprogram_aborted = true;
-                            break;
-                        }
-                        Err(LimboError::RaiseIgnore) => {
-                            raise_ignore = true;
-                            subprogram_aborted = true;
-                            break;
-                        }
-                        Err(err) => {
-                            subprogram_aborted = true;
-                            finish_subprogram(
-                                program,
-                                &statement,
-                                is_trigger,
-                                subprogram_aborted,
-                                saved_last_insert_rowid,
-                                saved_last_changes_value,
-                            );
-                            return Err(err.into());
-                        }
+            OpProgramState::Run(mut frames) => {
+                match run_subprograms(program, state, &mut frames, pager)? {
+                    SubprogramOutcome::Suspended(io) => {
+                        *state.active_op_state.program() = OpProgramState::Run(frames);
+                        return Ok(state.suspend_on_io(io));
+                    }
+                    SubprogramOutcome::Busy => {
+                        *state.active_op_state.program() = OpProgramState::Run(frames);
+                        return Err(LimboError::Busy.into());
+                    }
+                    SubprogramOutcome::Returned(returned) => {
+                        *state.active_op_state.program() = returned;
                     }
                 }
-                finish_subprogram(
-                    program,
-                    &statement,
-                    is_trigger,
-                    subprogram_aborted,
-                    saved_last_insert_rowid,
-                    saved_last_changes_value,
-                );
-
+            }
+            OpProgramState::Failed(err) => return Err(err),
+            OpProgramState::Return {
+                finished,
+                raise_ignore,
+            } => {
                 // Cache the statement for reuse on subsequent fires of this
                 // same Program instruction (e.g. next row in an INSERT loop).
                 // Only cache on clean completion - aborted statements have dirty
                 // internal state and cannot be safely reused.
-                if !subprogram_aborted {
+                if let Some(statement) = finished {
                     let pc_key = state.pc as usize;
                     state.subprogram_stmt_cache.insert(pc_key, statement);
                 }
@@ -6155,6 +6096,11 @@ pub fn op_program(
                 }
                 state.active_op_state.clear();
                 return Ok(InsnFunctionStepResult::Step);
+            }
+            OpProgramState::Call(_) | OpProgramState::Calling => {
+                unreachable!(
+                    "a nested Program instruction ran while the root statement owns its subprogram"
+                )
             }
         }
     }
@@ -6170,25 +6116,182 @@ pub(super) fn abort_active_subprogram(
     };
     let subprogram = std::mem::take(subprogram);
     state.active_op_state.clear();
-    if let OpProgramState::Step {
+    match subprogram {
+        OpProgramState::Run(frames) => unwind_subprograms(program, frames, err),
+        OpProgramState::Call(frame) => unwind_subprograms(program, vec![frame], err),
+        OpProgramState::Return { finished, .. } => {
+            drop_subprogram_statements(finished);
+            Ok(())
+        }
+        OpProgramState::Start | OpProgramState::Calling | OpProgramState::Failed(_) => Ok(()),
+    }
+}
+
+fn prepare_subprogram(
+    program: &Program,
+    state: &mut ProgramState,
+    param_registers: &[usize],
+    subprogram: &Subprogram,
+    pager: &Arc<Pager>,
+) -> Result<SubprogramFrame, Box<LimboError>> {
+    if state.subprogram_depth >= MAX_TRIGGER_DEPTH {
+        return Err(
+            LimboError::SqlError("too many levels of trigger recursion".to_string()).into(),
+        );
+    }
+    let subprogram = subprogram.prepared_program()?;
+    // Try to reuse a cached statement for this PC, otherwise create a new one.
+    // When we have triggers or fk-actions with multi-row inserts, we can re-use
+    // cached statements by storing them key'd by the state.pc if we are in a loop
+    let pc_key = state.pc as usize;
+    let mut statement = if let Some(mut cached) = state.subprogram_stmt_cache.remove(&pc_key) {
+        cached.reset_for_subprogram_reuse();
+        cached
+    } else {
+        Box::new(Statement::new_with_origin(
+            Program::from_prepared(subprogram, program.connection.clone()),
+            pager.clone(),
+            QueryMode::Normal,
+            0,
+            crate::statement::StatementOrigin::Subprogram,
+            false,
+            crate::connection::PrepareOptions::default(),
+        ))
+    };
+    statement.program_state_mut().subprogram_depth = state.subprogram_depth + 1;
+
+    // Check if this is a trigger subprogram - if so, track execution
+    // and save last_insert_rowid so it can be restored after the trigger finishes.
+    let (is_trigger, saved_last_insert_rowid, saved_changes_value) =
+        if let Some(trigger) = statement.get_trigger() {
+            program.connection.start_trigger_execution(trigger);
+            (
+                true,
+                Some(program.connection.last_insert_rowid()),
+                Some(program.connection.changes()),
+            )
+        } else {
+            (false, None, None)
+        };
+
+    // Copy parameter values from parent registers into the subprogram's parameters.
+    for (param_idx, &parent_reg) in param_registers.iter().enumerate() {
+        let value = state.registers[parent_reg].get_value().clone();
+        let param_index =
+            NonZero::<usize>::new(param_idx + 1).expect("param_idx + 1 should be non-zero");
+        statement.bind_at(param_index, value)?;
+    }
+    Ok(SubprogramFrame {
         is_trigger,
-        mut statement,
+        statement,
         saved_last_insert_rowid,
         saved_changes_value,
-    } = subprogram
-    {
-        let result = statement.abort_subprogram(err);
-        finish_subprogram(
-            program,
-            &statement,
-            is_trigger,
-            true,
-            saved_last_insert_rowid,
-            saved_changes_value,
-        );
-        result
-    } else {
-        Ok(())
+    })
+}
+
+enum SubprogramOutcome {
+    Returned(OpProgramState),
+    Suspended(IOCompletions),
+    Busy,
+}
+
+fn run_subprograms(
+    program: &Program,
+    state: &mut ProgramState,
+    frames: &mut Vec<SubprogramFrame>,
+    pager: &Arc<Pager>,
+) -> Result<SubprogramOutcome, Box<LimboError>> {
+    let now = *state
+        .current_time
+        .get_or_insert_with(|| pager.io.current_time_wall_clock());
+    loop {
+        let depth = frames.len();
+        let frame = &mut frames[depth - 1];
+        frame.statement.set_current_time(now);
+        let returned = match frame.statement.step_frame() {
+            ProgramStep::Row => continue,
+            ProgramStep::Call => {
+                let child = frame.statement.program_state_mut().take_called_subprogram();
+                frames.push(child);
+                continue;
+            }
+            ProgramStep::IO | ProgramStep::Yield => {
+                let io = frame
+                    .statement
+                    .take_io_completions()
+                    .unwrap_or_else(|| IOCompletions(Completion::new_yield()));
+                return Ok(SubprogramOutcome::Suspended(io));
+            }
+            ProgramStep::Interrupt | ProgramStep::Busy => return Ok(SubprogramOutcome::Busy),
+            ProgramStep::Done => {
+                let frame = frames
+                    .pop()
+                    .expect("the finished frame is still on the stack");
+                finish_subprogram(program, &frame, false);
+                OpProgramState::Return {
+                    finished: Some(frame.statement),
+                    raise_ignore: false,
+                }
+            }
+            ProgramStep::Error(err) => {
+                let parent_resolve_type = match depth {
+                    1 => program.resolve_type,
+                    _ => frames[depth - 2].statement.get_program().resolve_type,
+                };
+                let frame = frames
+                    .pop()
+                    .expect("the failed frame is still on the stack");
+                finish_subprogram(program, &frame, true);
+                drop_subprogram_statements([frame.statement]);
+                match *err {
+                    LimboError::Constraint(_) if parent_resolve_type == ResolveType::Ignore => {
+                        OpProgramState::Return {
+                            finished: None,
+                            raise_ignore: false,
+                        }
+                    }
+                    LimboError::RaiseIgnore => OpProgramState::Return {
+                        finished: None,
+                        raise_ignore: true,
+                    },
+                    _ => OpProgramState::Failed(err),
+                }
+            }
+        };
+        match frames.last_mut() {
+            None => return Ok(SubprogramOutcome::Returned(returned)),
+            Some(parent) => parent
+                .statement
+                .program_state_mut()
+                .resume_after_subprogram(returned),
+        }
+    }
+}
+
+fn unwind_subprograms(
+    program: &Program,
+    frames: Vec<SubprogramFrame>,
+    err: Option<&LimboError>,
+) -> Result<()> {
+    let mut abort_error = None;
+    let mut statements = Vec::with_capacity(frames.len());
+    for mut frame in frames.into_iter().rev() {
+        if let Err(err) = frame.statement.abort_subprogram(err) {
+            abort_error.get_or_insert(err);
+        }
+        finish_subprogram(program, &frame, true);
+        statements.push(frame.statement);
+    }
+    statements.reverse();
+    drop_subprogram_statements(statements);
+    abort_error.map_or(Ok(()), Err)
+}
+
+pub(super) fn drop_subprogram_statements(statements: impl IntoIterator<Item = Box<Statement>>) {
+    let mut pending = statements.into_iter().collect::<Vec<_>>();
+    while let Some(mut statement) = pending.pop() {
+        pending.extend(statement.program_state_mut().take_cached_subprograms());
+        drop(statement);
     }
 }
 
@@ -20006,7 +20109,11 @@ pub fn op_vacuum_into(
             // Waiting for I/O, keep state for resumption
             Ok(InsnFunctionStepResult::IO)
         }
-        Ok(InsnFunctionStepResult::Done | InsnFunctionStepResult::Row) => {
+        Ok(
+            InsnFunctionStepResult::Done
+            | InsnFunctionStepResult::Row
+            | InsnFunctionStepResult::Call,
+        ) => {
             unreachable!("op_vacuum_into_inner only returns Step or IO")
         }
         Err(err) => {

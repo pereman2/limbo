@@ -60,7 +60,7 @@ use crate::{
             OpAttachState, OpClearBtreeState, OpColumnState, OpDeleteState, OpDeleteSubState,
             OpDestroyState, OpIdxInsertState, OpInitCdcVersionState, OpInsertState,
             OpInsertSubState, OpJournalModeState, OpNewRowidState, OpNoConflictState,
-            OpParseSchemaState, OpProgramState, OpSeekState, OpTransactionState,
+            OpParseSchemaState, OpProgramState, OpSeekState, OpTransactionState, SubprogramFrame,
             VacuumIntoOpContext,
         },
         hash_table::HashTable,
@@ -368,6 +368,7 @@ pub(crate) enum ProgramStep {
     Interrupt,
     Busy,
     Yield,
+    Call,
     Error(Box<LimboError>),
 }
 
@@ -380,6 +381,10 @@ impl From<ProgramStep> for Result<StepResult, Box<LimboError>> {
             ProgramStep::Interrupt => Ok(StepResult::Interrupt),
             ProgramStep::Busy => Ok(StepResult::Busy),
             ProgramStep::Yield => Ok(StepResult::Yield),
+            ProgramStep::Call => Err(LimboError::InternalError(
+                "a nested Program instruction ran outside the root statement".to_string(),
+            )
+            .into()),
             ProgramStep::Error(err) => Err(err),
         }
     }
@@ -1155,6 +1160,7 @@ pub struct ProgramState {
     /// Cached subprogram Statements keyed by the PC of the Program instruction.
     /// Avoids re-allocating ProgramState on each trigger/FK-action fire.
     pub(crate) subprogram_stmt_cache: HashMap<usize, Box<Statement>>,
+    pub(crate) subprogram_depth: usize,
     /// RowSet objects stored by register index
     rowsets: HashMap<usize, RowSet>,
     // Cache of unused allocated Vecs
@@ -1276,6 +1282,7 @@ impl ProgramState {
             halt_in_progress: false,
             pending_cdc_info: None,
             subprogram_stmt_cache: HashMap::default(),
+            subprogram_depth: 0,
             mv_store_cache: None,
         }
     }
@@ -1447,7 +1454,10 @@ impl ProgramState {
         self.pending_fail_prepare_error = None;
         self.halt_in_progress = false;
         self.pending_cdc_info = None;
-        self.subprogram_stmt_cache.clear();
+        if !self.subprogram_stmt_cache.is_empty() {
+            execute::drop_subprogram_statements(self.take_cached_subprograms());
+        }
+        self.subprogram_depth = 0;
     }
 
     pub(crate) fn record_statement_change(&self) {
@@ -1609,11 +1619,7 @@ impl ProgramState {
     /// Runs `f` on the metrics of this statement including its active and
     /// cached subprograms, without copying them when there is no subprogram.
     pub(crate) fn with_metrics<R>(&self, f: impl FnOnce(&StatementMetrics) -> R) -> R {
-        let has_subprograms = matches!(
-            self.active_op_state.program_ref(),
-            Some(OpProgramState::Step { .. })
-        ) || !self.subprogram_stmt_cache.is_empty();
-        if has_subprograms {
+        if self.direct_subprograms().next().is_some() {
             f(&self.metrics())
         } else {
             f(&self.metrics)
@@ -1622,41 +1628,115 @@ impl ProgramState {
 
     pub(crate) fn metrics(&self) -> StatementMetrics {
         let mut metrics = self.metrics.clone();
-        if let Some(OpProgramState::Step { statement, .. }) = self.active_op_state.program_ref() {
-            metrics.merge(&statement.metrics());
-        }
-        for statement in self.subprogram_stmt_cache.values() {
-            metrics.merge(&statement.metrics());
-        }
+        self.for_each_subprogram(|statement| metrics.merge(&statement.program_state().metrics));
         metrics
     }
 
     pub(crate) fn reset_metrics(&mut self) {
         self.metrics.reset();
-        if let Some(OpProgramState::Step { statement, .. }) = self.active_op_state.program_mut() {
-            statement.reset_metrics();
-        }
-        for statement in self.subprogram_stmt_cache.values_mut() {
-            statement.reset_metrics();
-        }
+        self.for_each_subprogram_mut(|statement| statement.program_state_mut().metrics.reset());
     }
 
     pub(crate) fn reset_stmt_status(&mut self, counter: crate::statement::StatementStatusCounter) {
-        match counter {
-            crate::statement::StatementStatusCounter::FullscanStep => {
-                self.metrics.fullscan_steps = 0
+        reset_stmt_status_counter(&mut self.metrics, counter);
+        self.for_each_subprogram_mut(|statement| {
+            reset_stmt_status_counter(&mut statement.program_state_mut().metrics, counter)
+        });
+
+        fn reset_stmt_status_counter(
+            metrics: &mut StatementMetrics,
+            counter: crate::statement::StatementStatusCounter,
+        ) {
+            match counter {
+                crate::statement::StatementStatusCounter::FullscanStep => {
+                    metrics.fullscan_steps = 0
+                }
+                crate::statement::StatementStatusCounter::Sort => metrics.sort_operations = 0,
+                crate::statement::StatementStatusCounter::VmStep => metrics.insn_executed = 0,
+                crate::statement::StatementStatusCounter::Reprepare => metrics.reprepares = 0,
+                crate::statement::StatementStatusCounter::RowsRead => metrics.rows_read = 0,
+                crate::statement::StatementStatusCounter::RowsWritten => metrics.rows_written = 0,
             }
-            crate::statement::StatementStatusCounter::Sort => self.metrics.sort_operations = 0,
-            crate::statement::StatementStatusCounter::VmStep => self.metrics.insn_executed = 0,
-            crate::statement::StatementStatusCounter::Reprepare => self.metrics.reprepares = 0,
-            crate::statement::StatementStatusCounter::RowsRead => self.metrics.rows_read = 0,
-            crate::statement::StatementStatusCounter::RowsWritten => self.metrics.rows_written = 0,
         }
-        if let Some(OpProgramState::Step { statement, .. }) = self.active_op_state.program_mut() {
-            statement.reset_stmt_status(counter);
+    }
+
+    fn for_each_subprogram(&self, mut f: impl FnMut(&Statement)) {
+        let mut pending: Vec<&Statement> = self.direct_subprograms().collect();
+        while let Some(statement) = pending.pop() {
+            f(statement);
+            pending.extend(statement.program_state().direct_subprograms());
         }
-        for statement in self.subprogram_stmt_cache.values_mut() {
-            statement.reset_stmt_status(counter);
+    }
+
+    pub(crate) fn for_each_subprogram_mut(&mut self, mut f: impl FnMut(&mut Statement)) {
+        let mut pending: Vec<&mut Statement> = self.direct_subprograms_mut().collect();
+        while let Some(statement) = pending.pop() {
+            f(&mut *statement);
+            pending.extend(statement.program_state_mut().direct_subprograms_mut());
+        }
+    }
+
+    fn direct_subprograms(&self) -> impl Iterator<Item = &Statement> {
+        let (frames, finished): (&[SubprogramFrame], Option<&Statement>) =
+            match self.active_op_state.program_ref() {
+                Some(OpProgramState::Run(frames)) => (frames.as_slice(), None),
+                Some(OpProgramState::Call(frame)) => (std::slice::from_ref(frame), None),
+                Some(OpProgramState::Return { finished, .. }) => (&[], finished.as_deref()),
+                _ => (&[], None),
+            };
+        frames
+            .iter()
+            .map(|frame| &*frame.statement)
+            .chain(finished)
+            .chain(
+                self.subprogram_stmt_cache
+                    .values()
+                    .map(|statement| &**statement),
+            )
+    }
+
+    fn direct_subprograms_mut(&mut self) -> impl Iterator<Item = &mut Statement> {
+        let (frames, finished): (&mut [SubprogramFrame], Option<&mut Statement>) =
+            match self.active_op_state.program_mut() {
+                Some(OpProgramState::Run(frames)) => (frames.as_mut_slice(), None),
+                Some(OpProgramState::Call(frame)) => (std::slice::from_mut(frame), None),
+                Some(OpProgramState::Return { finished, .. }) => {
+                    (Default::default(), finished.as_deref_mut())
+                }
+                _ => (Default::default(), None),
+            };
+        frames
+            .iter_mut()
+            .map(|frame| &mut *frame.statement)
+            .chain(finished)
+            .chain(
+                self.subprogram_stmt_cache
+                    .values_mut()
+                    .map(|statement| &mut **statement),
+            )
+    }
+
+    pub(crate) fn take_cached_subprograms(&mut self) -> impl Iterator<Item = Box<Statement>> + '_ {
+        self.subprogram_stmt_cache
+            .drain()
+            .map(|(_, statement)| statement)
+    }
+
+    pub(crate) fn take_called_subprogram(&mut self) -> SubprogramFrame {
+        let frame = self
+            .active_op_state
+            .program_mut()
+            .map(|slot| std::mem::replace(slot, OpProgramState::Calling));
+        match frame {
+            Some(OpProgramState::Call(frame)) => frame,
+            _ => unreachable!("the nested Program instruction did not prepare a subprogram"),
+        }
+    }
+
+    pub(crate) fn resume_after_subprogram(&mut self, returned: OpProgramState) {
+        match self.active_op_state.program_mut() {
+            Some(slot) if matches!(slot, OpProgramState::Calling) => *slot = returned,
+            _ => unreachable!("the nested Program instruction was not waiting for its subprogram"),
         }
     }
 
@@ -2654,6 +2734,7 @@ impl Program {
                         let io = state.take_suspended_io();
                         program.park_on_io(state, io, waker)
                     }
+                    Ok(InsnFunctionStepResult::Call) => Some(ProgramStep::Call),
                     Err(boxed_err) => program.fail_step(state, pager, *boxed_err),
                     Ok(InsnFunctionStepResult::Step) | Ok(InsnFunctionStepResult::Row) => {
                         unreachable!("the dispatch loop settles steps and rows itself")
@@ -3538,7 +3619,7 @@ impl Program {
         // Cached (pooled) statements may be dropped after their trigger execution
         // was already ended by op_program; calling end again would pop the wrong
         // entry from the executing_triggers stack.
-        if self.is_trigger_subprogram() && state.execution_state.is_running() {
+        if self.trigger.is_some() && state.execution_state.is_running() {
             self.connection.end_trigger_execution();
         }
         // Roll back any in-flight autonomous sequence inner-tx and restore
