@@ -150,8 +150,8 @@ END;
 ## Nesting Limit
 
 A trigger body can fire more triggers and foreign key actions.
-Triggers and foreign key actions share a limit of 1000 nested calls.
-If a statement exceeds this limit, Turso returns
+Triggers and foreign key actions can nest at most 1000 levels deep.
+If a statement goes deeper, Turso returns
 `too many levels of trigger recursion` and rolls back the statement.
 
 ## Examples

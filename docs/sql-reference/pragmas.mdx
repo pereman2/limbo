@@ -324,8 +324,8 @@ PRAGMA foreign_keys = OFF;
 
 Foreign key enforcement is off by default for SQLite compatibility.
 
-Foreign key actions and triggers share a limit of 1000 nested calls.
-If an action exceeds this limit, Turso returns
+Triggers and foreign key actions can nest at most 1000 levels deep.
+If a statement exceeds this limit, Turso returns
 `too many levels of trigger recursion` and rolls back the statement.
 
 ### legacy_file_format
