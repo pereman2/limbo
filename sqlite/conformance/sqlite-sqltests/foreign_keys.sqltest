@@ -2296,6 +2296,56 @@ expect {
     0
 }
 
+@cross-check-integrity
+test fk-cascade-delete-self-referential-depth-500 {
+    PRAGMA foreign_keys=ON;
+    CREATE TABLE t(id INTEGER PRIMARY KEY, k INTEGER REFERENCES t(id) ON DELETE CASCADE);
+    WITH RECURSIVE s(x) AS (SELECT 1 UNION ALL SELECT x+1 FROM s WHERE x<500)
+        INSERT INTO t SELECT x, CASE WHEN x>1 THEN x-1 END FROM s;
+    DELETE FROM t WHERE id=1;
+    SELECT count(*) FROM t;
+}
+expect {
+    0
+}
+
+@cross-check-integrity
+test fk-cascade-delete-self-referential-depth-1000 {
+    PRAGMA foreign_keys=ON;
+    CREATE TABLE t(id INTEGER PRIMARY KEY, k INTEGER REFERENCES t(id) ON DELETE CASCADE);
+    WITH RECURSIVE s(x) AS (SELECT 1 UNION ALL SELECT x+1 FROM s WHERE x<1000)
+        INSERT INTO t SELECT x, CASE WHEN x>1 THEN x-1 END FROM s;
+    DELETE FROM t WHERE id=1;
+    SELECT count(*) FROM t;
+}
+expect {
+    0
+}
+
+@cross-check-integrity
+test fk-cascade-delete-self-referential-depth-1001 {
+    PRAGMA foreign_keys=ON;
+    CREATE TABLE t(id INTEGER PRIMARY KEY, k INTEGER REFERENCES t(id) ON DELETE CASCADE);
+    WITH RECURSIVE s(x) AS (SELECT 1 UNION ALL SELECT x+1 FROM s WHERE x<1001)
+        INSERT INTO t SELECT x, CASE WHEN x>1 THEN x-1 END FROM s;
+    DELETE FROM t WHERE id=1;
+}
+expect error {
+    too many levels of trigger recursion
+}
+
+@cross-check-integrity
+test fk-cascade-delete-self-referential-depth-2000 {
+    PRAGMA foreign_keys=ON;
+    CREATE TABLE t(id INTEGER PRIMARY KEY, k INTEGER REFERENCES t(id) ON DELETE CASCADE);
+    WITH RECURSIVE s(x) AS (SELECT 1 UNION ALL SELECT x+1 FROM s WHERE x<2000)
+        INSERT INTO t SELECT x, CASE WHEN x>1 THEN x-1 END FROM s;
+    DELETE FROM t WHERE id=1;
+}
+expect error {
+    too many levels of trigger recursion
+}
+
 # ON DELETE CASCADE - composite self-referential chain
 @cross-check-integrity
 test fk-cascade-delete-self-referential-composite-chain {

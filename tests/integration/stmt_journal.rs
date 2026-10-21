@@ -342,6 +342,49 @@ fn delete_by_rowid_with_fk(tmp_db: TempDatabase) -> anyhow::Result<()> {
     Ok(())
 }
 
+#[turso_macros::test(mvcc)]
+fn cascade_depth_error_restores_rows(tmp_db: TempDatabase) -> anyhow::Result<()> {
+    let conn = tmp_db.connect_limbo();
+    conn.execute("PRAGMA foreign_keys = ON")?;
+    conn.execute(
+        "CREATE TABLE t(id INTEGER PRIMARY KEY, k INTEGER REFERENCES t(id) ON DELETE CASCADE)",
+    )?;
+    for depth in [1001, 2000] {
+        for explicit_transaction in [false, true] {
+            conn.execute(&format!(
+                "WITH RECURSIVE s(x) AS (SELECT 1 UNION ALL SELECT x+1 FROM s WHERE x<{depth})
+                 INSERT INTO t SELECT x, CASE WHEN x>1 THEN x-1 END FROM s"
+            ))?;
+            if explicit_transaction {
+                conn.execute("BEGIN")?;
+                conn.execute("INSERT INTO t VALUES(3000, NULL)")?;
+            }
+            let err = conn.execute("DELETE FROM t WHERE id=1").unwrap_err();
+            assert_eq!(err.to_string(), "too many levels of trigger recursion");
+            let expected_count = depth + i32::from(explicit_transaction);
+            assert_eq!(
+                query_rows(&conn, "SELECT count(*) FROM t"),
+                [expected_count.to_string()]
+            );
+            assert_eq!(
+                query_rows(&conn, "PRAGMA foreign_key_check"),
+                Vec::<String>::new()
+            );
+            if explicit_transaction {
+                conn.execute("COMMIT")?;
+                assert_eq!(
+                    query_rows(&conn, "SELECT id FROM t WHERE id=3000"),
+                    ["3000"]
+                );
+            }
+            conn.execute("UPDATE t SET k=NULL WHERE id=1000")?;
+            conn.execute("DELETE FROM t")?;
+            assert_eq!(query_rows(&conn, "SELECT count(*) FROM t"), ["0"]);
+        }
+    }
+    Ok(())
+}
+
 // ──────────────────────────────────────────────────────────
 // SELECT (read-only) — never needs stmt journal
 // ──────────────────────────────────────────────────────────
