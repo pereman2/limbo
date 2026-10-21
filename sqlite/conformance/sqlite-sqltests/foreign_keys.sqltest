@@ -3022,6 +3022,43 @@ test fk-self-delete-remaining-orphan {
 expect error {
 }
 
+@cross-check-integrity
+test fk-self-delete-orphan-parent-leaves-child {
+    PRAGMA foreign_keys=OFF;
+    CREATE TABLE s(id INTEGER PRIMARY KEY, k2 INTEGER REFERENCES s(id));
+    INSERT INTO s VALUES(5,99),(6,5);
+    PRAGMA foreign_keys=ON;
+    DELETE FROM s WHERE id=5;
+}
+expect error {
+}
+
+@cross-check-integrity
+test fk-self-delete-deferred-orphan-parent-leaves-child {
+    PRAGMA foreign_keys=OFF;
+    CREATE TABLE s(id INTEGER PRIMARY KEY, k2 INTEGER REFERENCES s(id) DEFERRABLE INITIALLY DEFERRED);
+    INSERT INTO s VALUES(5,99),(6,5);
+    PRAGMA foreign_keys=ON;
+    BEGIN;
+    DELETE FROM s WHERE id=5;
+    COMMIT;
+}
+expect error {
+}
+
+@cross-check-integrity
+test fk-self-delete-parent-child-and-text-orphan {
+    PRAGMA foreign_keys=OFF;
+    CREATE TABLE s(id INTEGER PRIMARY KEY, k2 INTEGER REFERENCES s(id));
+    INSERT INTO s VALUES(1,NULL),(2,'abc'),(3,1);
+    PRAGMA foreign_keys=ON;
+    DELETE FROM s WHERE id>=1;
+    SELECT count(*) FROM s;
+}
+expect {
+    0
+}
+
 # ON DELETE RESTRICT should fail when child references the parent row
 @cross-check-integrity
 test fk-delete-restrict-fails {
