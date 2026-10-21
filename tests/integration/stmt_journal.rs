@@ -367,8 +367,12 @@ fn cascade_depth_error_restores_rows(tmp_db: TempDatabase) -> anyhow::Result<()>
                 [expected_count.to_string()]
             );
             assert_eq!(
-                query_rows(&conn, "PRAGMA foreign_key_check"),
-                Vec::<String>::new()
+                query_rows(
+                    &conn,
+                    "SELECT count(*) FROM t c WHERE c.k IS NOT NULL \
+                     AND NOT EXISTS (SELECT 1 FROM t p WHERE p.id=c.k)"
+                ),
+                ["0"]
             );
             if explicit_transaction {
                 conn.execute("COMMIT")?;
@@ -387,15 +391,80 @@ fn cascade_depth_error_restores_rows(tmp_db: TempDatabase) -> anyhow::Result<()>
     Ok(())
 }
 
+#[turso_macros::test(mvcc)]
+fn deep_cascade_prepared_delete_runs_again(tmp_db: TempDatabase) -> anyhow::Result<()> {
+    let conn = tmp_db.connect_limbo();
+    conn.execute("PRAGMA foreign_keys = ON")?;
+    conn.execute(
+        "CREATE TABLE t(id INTEGER PRIMARY KEY, k INTEGER REFERENCES t(id) ON DELETE CASCADE)",
+    )?;
+    let mut delete = conn.prepare("DELETE FROM t WHERE id=1")?;
+    for depth in [1000, 1000, 1001, 1000] {
+        conn.execute(format!(
+            "WITH RECURSIVE s(x) AS (SELECT 1 UNION ALL SELECT x+1 FROM s WHERE x<{depth})
+             INSERT INTO t SELECT x, CASE WHEN x>1 THEN x-1 END FROM s"
+        ))?;
+        let result = delete.run_ignore_rows();
+        delete.reset()?;
+        if depth > 1000 {
+            assert_eq!(
+                result.unwrap_err().to_string(),
+                "too many levels of trigger recursion"
+            );
+            assert_eq!(
+                query_rows(&conn, "SELECT count(*) FROM t"),
+                [depth.to_string()]
+            );
+            conn.execute("UPDATE t SET k=NULL")?;
+            conn.execute("DELETE FROM t")?;
+        } else {
+            result?;
+        }
+        assert_eq!(query_rows(&conn, "SELECT count(*) FROM t"), ["0"]);
+    }
+    Ok(())
+}
+
+#[turso_macros::test(mvcc)]
+fn cascade_raise_abort_at_depth_restores_rows(tmp_db: TempDatabase) -> anyhow::Result<()> {
+    let conn = tmp_db.connect_limbo();
+    conn.execute("PRAGMA foreign_keys = ON")?;
+    conn.execute(
+        "CREATE TABLE t(id INTEGER PRIMARY KEY, k INTEGER REFERENCES t(id) ON DELETE CASCADE)",
+    )?;
+    conn.execute(
+        "CREATE TRIGGER stop_at_700 BEFORE DELETE ON t WHEN old.id=700 \
+         BEGIN SELECT RAISE(ABORT, 'stopped at row 700'); END",
+    )?;
+    conn.execute(
+        "WITH RECURSIVE s(x) AS (SELECT 1 UNION ALL SELECT x+1 FROM s WHERE x<900)
+         INSERT INTO t SELECT x, CASE WHEN x>1 THEN x-1 END FROM s",
+    )?;
+    let err = conn.execute("DELETE FROM t WHERE id=1").unwrap_err();
+    assert!(err.to_string().contains("stopped at row 700"), "{err}");
+    assert_eq!(query_rows(&conn, "SELECT count(*) FROM t"), ["900"]);
+    Ok(())
+}
+
 #[test]
 fn cascade_resumes_or_aborts_after_deep_io() -> anyhow::Result<()> {
     use crate::queued_io::QueuedIo;
     use turso_core::{ConnectOpts, Database, SqliteDialect, StepResult, IO};
 
-    for action in ["resume", "reset", "drop"] {
+    for (action, mvcc) in [
+        ("resume", false),
+        ("reset", false),
+        ("drop", false),
+        ("resume", true),
+        ("reset", true),
+        ("drop", true),
+    ] {
         let io = Arc::new(QueuedIo::new());
         let db = Database::open_file(io.clone(), "cascade.db", Arc::new(SqliteDialect))?;
         let conn = db.connect(ConnectOpts::new())?;
+        if mvcc {
+            conn.execute("PRAGMA journal_mode=mvcc")?;
+        }
         conn.execute("PRAGMA foreign_keys=ON")?;
         conn.execute("PRAGMA cache_size=16")?;
         conn.execute("CREATE TABLE t(id INTEGER PRIMARY KEY, k INTEGER REFERENCES t(id) ON DELETE CASCADE, pad BLOB)")?;

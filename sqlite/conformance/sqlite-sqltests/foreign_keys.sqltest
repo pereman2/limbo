@@ -2379,6 +2379,70 @@ expect error {
     too many levels of trigger recursion
 }
 
+@cross-check-integrity
+test fk-cascade-update-composite-chain-depth-1001 {
+    PRAGMA foreign_keys=ON;
+    CREATE TABLE t(a INT, b INT, p INT, UNIQUE(a,b), FOREIGN KEY(a,p) REFERENCES t(a,b) ON UPDATE CASCADE);
+    WITH RECURSIVE s(x) AS (SELECT 1 UNION ALL SELECT x+1 FROM s WHERE x<1001)
+        INSERT INTO t SELECT 0, x, CASE WHEN x>1 THEN x-1 END FROM s;
+    UPDATE t SET a=5 WHERE b=1;
+}
+expect error {
+    too many levels of trigger recursion
+}
+
+@cross-check-integrity
+test fk-cascade-update-composite-chain-check-at-depth-700 {
+    PRAGMA foreign_keys=ON;
+    CREATE TABLE t(a INT, b INT, p INT, UNIQUE(a,b), FOREIGN KEY(a,p) REFERENCES t(a,b) ON UPDATE CASCADE, CHECK(b<>700 OR a=0));
+    WITH RECURSIVE s(x) AS (SELECT 1 UNION ALL SELECT x+1 FROM s WHERE x<900)
+        INSERT INTO t SELECT 0, x, CASE WHEN x>1 THEN x-1 END FROM s;
+    UPDATE t SET a=5 WHERE b=1;
+}
+expect error {
+    CHECK constraint failed
+}
+
+@cross-check-integrity
+test fk-set-null-then-update-cascade-depth-1000 {
+    PRAGMA foreign_keys=ON;
+    CREATE TABLE t(a INT, b INT, p INT, UNIQUE(a,b), FOREIGN KEY(a,p) REFERENCES t(a,b) ON DELETE SET NULL ON UPDATE CASCADE);
+    WITH RECURSIVE s(x) AS (SELECT 1 UNION ALL SELECT x+1 FROM s WHERE x<1000)
+        INSERT INTO t SELECT 0, x, CASE WHEN x>1 THEN x-1 END FROM s;
+    DELETE FROM t WHERE b=1;
+    SELECT count(*) FROM t WHERE a IS NULL;
+}
+expect {
+    999
+}
+
+@cross-check-integrity
+test fk-set-default-then-update-cascade-depth-1000 {
+    PRAGMA foreign_keys=ON;
+    CREATE TABLE t(a INT DEFAULT 9, b INT, p INT DEFAULT 1, UNIQUE(a,b), FOREIGN KEY(a,p) REFERENCES t(a,b) ON DELETE SET DEFAULT ON UPDATE CASCADE);
+    INSERT INTO t VALUES(9,1,NULL);
+    WITH RECURSIVE s(x) AS (SELECT 1 UNION ALL SELECT x+1 FROM s WHERE x<1000)
+        INSERT INTO t SELECT 0, x, CASE WHEN x>1 THEN x-1 END FROM s;
+    DELETE FROM t WHERE a=0 AND b=1;
+    SELECT a, count(*) FROM t GROUP BY a;
+}
+expect {
+    9|1000
+}
+
+@cross-check-integrity
+test fk-cascade-delete-raise-abort-at-depth-700 {
+    PRAGMA foreign_keys=ON;
+    CREATE TABLE t(id INTEGER PRIMARY KEY, k INTEGER REFERENCES t(id) ON DELETE CASCADE);
+    CREATE TRIGGER stop_at_700 BEFORE DELETE ON t WHEN old.id=700 BEGIN SELECT RAISE(ABORT, 'stopped at row 700'); END;
+    WITH RECURSIVE s(x) AS (SELECT 1 UNION ALL SELECT x+1 FROM s WHERE x<900)
+        INSERT INTO t SELECT x, CASE WHEN x>1 THEN x-1 END FROM s;
+    DELETE FROM t WHERE id=1;
+}
+expect error {
+    stopped at row 700
+}
+
 # ON DELETE CASCADE - composite self-referential chain
 @cross-check-integrity
 test fk-cascade-delete-self-referential-composite-chain {
