@@ -2050,13 +2050,11 @@ fn emit_update_insns<'a>(
                     program.preassign_label_to_next_insn(after_delete_label);
 
                     // Seek back to the original row we're updating
-                    let continue_label = program.allocate_label();
                     program.emit_insn(Insn::SeekRowid {
                         cursor_id: target_table_cursor_id,
                         src_reg: original_rowid_reg,
-                        target_pc: continue_label, // Should always succeed
+                        target_pc: skip_row_label,
                     });
-                    program.preassign_label_to_next_insn(continue_label);
                 }
                 _ => {
                     // ABORT/FAIL/ROLLBACK behavior

@@ -43,6 +43,7 @@ use crate::{
             NonFromClauseSubquery, QueryDestination, ResultSetColumn, Scan, SeekKeyComponent,
             SubqueryEvalPhase, SubqueryOrigin, SubqueryState, UpdateSetClause, WriteSetPlan,
         },
+        stmt_journal::any_effective_replace,
         trigger_exec::has_triggers_including_temp,
     },
     types::SeekOp,
@@ -1479,9 +1480,11 @@ fn update_write_set_reason(
 
         // REPLACE mode requires ephemeral table because REPLACE deletes conflicting rows,
         // which can corrupt the iteration order when iterating via an index.
-        if matches!(
-            plan.or_conflict,
-            Some(turso_parser::ast::ResolveType::Replace)
+        if any_effective_replace(
+            plan.or_conflict.is_some(),
+            plan.or_conflict.unwrap_or(ast::ResolveType::Abort),
+            None,
+            plan.indexes_to_update.iter().map(|idx| idx.on_conflict),
         ) {
             break 'requires Some(DmlSafetyReason::ReplaceMode);
         }

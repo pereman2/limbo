@@ -3892,6 +3892,34 @@ expect {
 }
 
 @cross-check-integrity
+test fk-update-or-replace-cascade-preserves-other-rows {
+    PRAGMA foreign_keys=ON;
+    CREATE TABLE t(id INTEGER PRIMARY KEY, k INTEGER REFERENCES t(id) ON DELETE CASCADE, u INTEGER UNIQUE);
+    INSERT INTO t VALUES(1,NULL,1),(2,1,2),(3,NULL,3);
+    UPDATE OR REPLACE t SET u=1 WHERE id=2;
+    SELECT * FROM t;
+    PRAGMA integrity_check;
+}
+expect {
+    3||3
+    ok
+}
+
+@cross-check-integrity
+test fk-update-ddl-replace-cascade-continues-after-deleted-row {
+    PRAGMA foreign_keys=ON;
+    CREATE TABLE t(id INTEGER PRIMARY KEY, k INTEGER REFERENCES t(id) ON DELETE CASCADE, u INTEGER UNIQUE ON CONFLICT REPLACE);
+    INSERT INTO t VALUES(1,NULL,1),(2,1,2),(3,NULL,3);
+    UPDATE t SET u=1 WHERE id>=2;
+    SELECT * FROM t;
+    PRAGMA integrity_check;
+}
+expect {
+    3||1
+    ok
+}
+
+@cross-check-integrity
 test fk-update-or-replace-cascade-trigger-deletes-updated-row {
     PRAGMA foreign_keys=ON;
     CREATE TABLE t(id INTEGER PRIMARY KEY, k INTEGER, u INTEGER UNIQUE);

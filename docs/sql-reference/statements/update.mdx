@@ -34,6 +34,8 @@ The optional `OR` clause specifies how to handle constraint violations during th
 | `IGNORE` | Skip the row that caused the constraint violation and continue processing remaining rows. |
 | `REPLACE` | Delete the conflicting row before updating the current row. If a NOT NULL constraint fails and there is no DEFAULT value, the statement behaves as `ABORT`. |
 
+If the conflicting row's deletion causes a foreign key action or a trigger to delete the row being updated, `UPDATE` skips that row.
+
 ```sql
 UPDATE OR IGNORE employees
 SET department = 'Engineering'
