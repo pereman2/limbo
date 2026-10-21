@@ -3878,6 +3878,36 @@ expect {
     10|10
 }
 
+@cross-check-integrity
+test fk-update-or-replace-cascade-deletes-updated-row {
+    PRAGMA foreign_keys=ON;
+    CREATE TABLE t(id INTEGER PRIMARY KEY, k INTEGER REFERENCES t(id) ON DELETE CASCADE, u INTEGER UNIQUE);
+    INSERT INTO t VALUES(1,NULL,1),(2,1,2);
+    UPDATE OR REPLACE t SET u=1 WHERE id=2;
+    SELECT * FROM t;
+    PRAGMA integrity_check;
+}
+expect {
+    ok
+}
+
+@cross-check-integrity
+test fk-update-or-replace-cascade-trigger-deletes-updated-row {
+    PRAGMA foreign_keys=ON;
+    CREATE TABLE t(id INTEGER PRIMARY KEY, k INTEGER, u INTEGER UNIQUE);
+    CREATE TABLE child(pid INTEGER REFERENCES t(id) ON DELETE CASCADE);
+    CREATE TRIGGER td AFTER DELETE ON child BEGIN DELETE FROM t WHERE id=2; END;
+    INSERT INTO t VALUES(1,NULL,1),(2,1,2);
+    INSERT INTO child VALUES(1);
+    UPDATE OR REPLACE t SET u=1 WHERE id=2;
+    SELECT * FROM t;
+    SELECT * FROM child;
+    PRAGMA integrity_check;
+}
+expect {
+    ok
+}
+
 # UPDATE OR REPLACE with SET NULL FK action on implicitly-deleted row
 @cross-check-integrity
 test fk-update-or-replace-set-null-on-unique-conflict {
