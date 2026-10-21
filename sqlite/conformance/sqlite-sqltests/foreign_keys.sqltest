@@ -2963,6 +2963,65 @@ expect {
     10|100
 }
 
+@cross-check-integrity
+test fk-self-delete-parent-and-child {
+    PRAGMA foreign_keys=ON;
+    CREATE TABLE s(id INTEGER PRIMARY KEY, k2 INTEGER REFERENCES s(id));
+    INSERT INTO s VALUES(1,NULL),(2,1);
+    DELETE FROM s WHERE id>=1;
+    SELECT count(*) FROM s;
+}
+expect {
+    0
+}
+
+@cross-check-integrity
+test fk-self-delete-child-inserted-first {
+    PRAGMA foreign_keys=OFF;
+    CREATE TABLE s(id INTEGER PRIMARY KEY, k2 INTEGER REFERENCES s(id));
+    INSERT INTO s VALUES(2,1),(1,NULL);
+    PRAGMA foreign_keys=ON;
+    DELETE FROM s WHERE id>=1;
+    SELECT count(*) FROM s;
+}
+expect {
+    0
+}
+
+@cross-check-integrity
+test fk-self-delete-chain {
+    PRAGMA foreign_keys=ON;
+    CREATE TABLE s(id INTEGER PRIMARY KEY, k2 INTEGER REFERENCES s(id) ON DELETE NO ACTION);
+    INSERT INTO s VALUES(1,NULL),(2,1),(3,2);
+    DELETE FROM s WHERE id>=1;
+    SELECT count(*) FROM s;
+}
+expect {
+    0
+}
+
+@cross-check-integrity
+test fk-self-delete-composite-parent-and-child {
+    PRAGMA foreign_keys=ON;
+    CREATE TABLE s(id INTEGER PRIMARY KEY, a INT, b INT, x INT, y INT, UNIQUE(a,b), FOREIGN KEY(x,y) REFERENCES s(a,b));
+    INSERT INTO s VALUES(1,10,20,NULL,NULL),(2,30,40,10,20);
+    DELETE FROM s WHERE id>=1;
+    SELECT count(*) FROM s;
+}
+expect {
+    0
+}
+
+@cross-check-integrity
+test fk-self-delete-remaining-orphan {
+    PRAGMA foreign_keys=ON;
+    CREATE TABLE s(id INTEGER PRIMARY KEY, k2 INTEGER REFERENCES s(id));
+    INSERT INTO s VALUES(1,NULL),(2,1),(3,1);
+    DELETE FROM s WHERE id<=2;
+}
+expect error {
+}
+
 # ON DELETE RESTRICT should fail when child references the parent row
 @cross-check-integrity
 test fk-delete-restrict-fails {
