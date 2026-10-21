@@ -3668,15 +3668,6 @@ fn emit_replace_delete_conflicting_row(
     // Phase 1: Before Delete - build parent key registers and handle NoAction/Restrict.
     // CASCADE/SetNull/SetDefault actions are prepared but deferred until after Delete.
     let prepared_fk_actions = if connection.foreign_keys_enabled() {
-        let prepared = ForeignKeyActions::prepare_fk_delete_actions(
-            program,
-            resolver,
-            ctx.table.name.as_str(),
-            ctx.cursor_id,
-            ctx.conflict_rowid_reg,
-            None,
-            ctx.database_id,
-        )?;
         if resolver.schema().has_child_fks(ctx.table.name.as_str()) {
             emit_fk_child_decrement_on_delete(
                 program,
@@ -3688,7 +3679,15 @@ fn emit_replace_delete_conflicting_row(
                 resolver,
             )?;
         }
-        prepared
+        ForeignKeyActions::prepare_fk_delete_actions(
+            program,
+            resolver,
+            ctx.table.name.as_str(),
+            ctx.cursor_id,
+            ctx.conflict_rowid_reg,
+            None,
+            ctx.database_id,
+        )?
     } else {
         ForeignKeyActions::default()
     };

@@ -318,6 +318,10 @@ The `ON DELETE` and `ON UPDATE` clauses specify what happens to child rows when 
 | `SET NULL` | Sets the foreign key columns in child rows to NULL |
 | `SET DEFAULT` | Sets the foreign key columns in child rows to their default values |
 
+An immediate `NO ACTION` constraint checks for violations at the end of the statement.
+A single `DELETE` can remove both a parent and its referencing children, including rows in the same table.
+The statement fails if any child still references a missing parent.
+
 ```sql
 CREATE TABLE departments (
     id INTEGER PRIMARY KEY,

@@ -2757,6 +2757,28 @@ expect {
 
 # INSERT OR REPLACE with ON DELETE CASCADE
 @cross-check-integrity
+test fk-insert-replace-orphan-parent-leaves-child {
+    PRAGMA foreign_keys=OFF;
+    CREATE TABLE s(id INTEGER PRIMARY KEY, u INT UNIQUE, k2 INTEGER REFERENCES s(id));
+    INSERT INTO s VALUES(5,10,99),(6,20,5),(7,30,NULL);
+    PRAGMA foreign_keys=ON;
+    INSERT OR REPLACE INTO s VALUES(7,10,NULL);
+}
+expect error {
+}
+
+@cross-check-integrity
+test fk-update-replace-orphan-parent-leaves-child {
+    PRAGMA foreign_keys=OFF;
+    CREATE TABLE s(id INTEGER PRIMARY KEY, u INT UNIQUE, k2 INTEGER REFERENCES s(id));
+    INSERT INTO s VALUES(5,10,99),(6,20,5),(7,30,NULL);
+    PRAGMA foreign_keys=ON;
+    UPDATE OR REPLACE s SET u=10 WHERE id=7;
+}
+expect error {
+}
+
+@cross-check-integrity
 test fk-replace-delete-cascade {
     PRAGMA foreign_keys=ON;
     CREATE TABLE parent(id INTEGER PRIMARY KEY, name TEXT);

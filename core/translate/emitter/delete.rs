@@ -367,11 +367,12 @@ pub fn emit_fk_child_decrement_on_delete(
     for fk_ref in
         resolver.with_schema(database_id, |s| s.resolved_fks_for_child(child_table_name))?
     {
-        if !fk_ref.fk.deferred {
-            continue;
-        }
         // Fast path: if any FK column is NULL can't be a violation
         let null_skip = program.allocate_label();
+        program.emit_insn(Insn::FkIfZero {
+            deferred: fk_ref.fk.deferred,
+            target_pc: null_skip,
+        });
         for cname in &fk_ref.fk.child_columns {
             let (pos, col) = child_tbl.get_column(cname).unwrap();
             let src = if col.is_rowid_alias() {
@@ -418,15 +419,14 @@ pub fn emit_fk_child_decrement_on_delete(
                 dst_reg: tmpi,
                 extra_amount: 0,
             });
+            let missing = program.allocate_label();
+            let done = program.allocate_label();
             program.emit_insn(Insn::MustBeInt {
                 reg: tmpi,
-                target_pc: None,
+                target_pc: Some(missing),
             });
 
             // NotExists jumps when the parent key is missing, so we decrement there
-            let missing = program.allocate_label();
-            let done = program.allocate_label();
-
             program.emit_insn(Insn::NotExists {
                 cursor: pcur,
                 rowid_reg: tmpi,
@@ -440,7 +440,7 @@ pub fn emit_fk_child_decrement_on_delete(
             // Parent MISSING, decrement is guarded by FkIfZero to avoid underflow
             program.preassign_label_to_next_insn(missing);
             program.emit_insn(Insn::Close { cursor_id: pcur });
-            emit_guarded_fk_decrement(program, done, true);
+            emit_guarded_fk_decrement(program, done, fk_ref.fk.deferred);
             program.preassign_label_to_next_insn(done);
         } else {
             // Probe parent unique index
@@ -487,7 +487,7 @@ pub fn emit_fk_child_decrement_on_delete(
                 num_regs: n,
             });
             program.emit_insn(Insn::Close { cursor_id: icur });
-            emit_guarded_fk_decrement(program, ok, true);
+            emit_guarded_fk_decrement(program, ok, fk_ref.fk.deferred);
             program.preassign_label_to_next_insn(ok);
             program.emit_insn(Insn::Close { cursor_id: icur });
         }
@@ -694,22 +694,6 @@ fn emit_delete_row_common(
     let prepared_fk_actions = if connection.foreign_keys_enabled() {
         let delete_db_id = unsafe { (*table_reference).database_id };
         if let Some(table) = unsafe { &*table_reference }.btree() {
-            let prepared = if t_ctx
-                .resolver
-                .with_schema(delete_db_id, |s| s.any_resolved_fks_referencing(table_name))
-            {
-                ForeignKeyActions::prepare_fk_delete_actions(
-                    program,
-                    &mut t_ctx.resolver,
-                    table_name,
-                    main_table_cursor_id,
-                    rowid_reg,
-                    None,
-                    delete_db_id,
-                )?
-            } else {
-                ForeignKeyActions::default()
-            };
             if t_ctx
                 .resolver
                 .with_schema(delete_db_id, |s| s.has_child_fks(table_name))
@@ -724,7 +708,22 @@ fn emit_delete_row_common(
                     &t_ctx.resolver,
                 )?;
             }
-            prepared
+            if t_ctx
+                .resolver
+                .with_schema(delete_db_id, |s| s.any_resolved_fks_referencing(table_name))
+            {
+                ForeignKeyActions::prepare_fk_delete_actions(
+                    program,
+                    &mut t_ctx.resolver,
+                    table_name,
+                    main_table_cursor_id,
+                    rowid_reg,
+                    None,
+                    delete_db_id,
+                )?
+            } else {
+                ForeignKeyActions::default()
+            }
         } else {
             ForeignKeyActions::default()
         }
