@@ -3882,12 +3882,31 @@ expect {
 test fk-update-or-replace-cascade-deletes-updated-row {
     PRAGMA foreign_keys=ON;
     CREATE TABLE t(id INTEGER PRIMARY KEY, k INTEGER REFERENCES t(id) ON DELETE CASCADE, u INTEGER UNIQUE);
-    INSERT INTO t VALUES(1,NULL,1),(2,1,2);
-    UPDATE OR REPLACE t SET u=1 WHERE id=2;
-    SELECT * FROM t;
+    CREATE TABLE update_log(phase TEXT, id INTEGER);
+    CREATE TRIGGER bu BEFORE UPDATE ON t BEGIN
+        INSERT INTO update_log VALUES('before', OLD.id);
+    END;
+    CREATE TRIGGER au AFTER UPDATE ON t BEGIN
+        INSERT INTO update_log VALUES('after', NEW.id);
+    END;
+    INSERT INTO t VALUES(1,NULL,1),(2,1,2),(3,NULL,3),(4,NULL,4);
+    UPDATE OR REPLACE t SET u=u-1 WHERE id>=2 RETURNING id,u;
+    SELECT changes();
+    SELECT * FROM t ORDER BY id;
+    SELECT * FROM update_log ORDER BY rowid;
     PRAGMA integrity_check;
 }
 expect {
+    3|2
+    4|3
+    2
+    3||2
+    4||3
+    before|2
+    before|3
+    after|3
+    before|4
+    after|4
     ok
 }
 
