@@ -11,8 +11,9 @@ use crate::schema::{BTreeTable, ColumnLayout, IndexColumn, EXPR_INDEX_SENTINEL, 
 use crate::translate::emitter::{emit_check_constraints, emit_make_record, UpdateRowSource};
 use crate::translate::expr::{walk_expr, WalkControl};
 use crate::translate::fkeys::{
-    affected_parent_fks_for_update, emit_fk_child_update_counters, emit_fk_update_parent_actions,
-    fire_fk_update_actions, ParentKeyNewProbeMode,
+    affected_parent_fks_for_update, emit_fk_child_update_new_counters,
+    emit_fk_child_update_old_counters, emit_fk_update_parent_actions, fire_fk_update_actions,
+    ParentKeyNewProbeMode,
 };
 use crate::translate::insert::{format_unique_violation_desc, InsertEmitCtx};
 use crate::translate::plan::ColumnMask;
@@ -841,12 +842,6 @@ pub fn emit_upsert(
         }
         _ => crate::alloc::vec![],
     };
-    let has_parent_fk_checks = affected_parent_fks.iter().any(|fk| {
-        matches!(
-            fk.fk.on_update,
-            ast::RefAct::NoAction | ast::RefAct::Restrict
-        )
-    });
     let has_parent_fk_actions = affected_parent_fks.iter().any(|fk| {
         matches!(
             fk.fk.on_update,
@@ -1014,19 +1009,15 @@ pub fn emit_upsert(
         if connection.foreign_keys_enabled() {
             let rowid_new_reg = new_rowid_reg.unwrap_or(ctx.conflict_rowid_reg);
 
-            // Child-side checks
             if resolver.with_schema(upsert_database_id, |s| s.has_child_fks(bt.name.as_str())) {
-                emit_fk_child_update_counters(
+                emit_fk_child_update_old_counters(
                     program,
                     &bt,
                     table.get_name(),
                     ctx.cursor_id,
-                    new_start,
-                    rowid_new_reg,
                     &directly_changed_cols,
                     upsert_database_id,
                     resolver,
-                    &layout,
                 )?;
             }
             let upsert_indices: Vec<_> = resolver.with_schema(upsert_database_id, |s| {
@@ -1040,7 +1031,7 @@ pub fn emit_upsert(
                         .transpose()
                 })
                 .collect::<crate::Result<_>>()?;
-            if has_parent_fk_checks {
+            if !affected_parent_fks.is_empty() {
                 let _ = emit_fk_update_parent_actions(
                     program,
                     &bt,
@@ -1055,6 +1046,19 @@ pub fn emit_upsert(
                     ParentKeyNewProbeMode::BeforeWrite,
                     upsert_database_id,
                     resolver,
+                )?;
+            }
+            if resolver.with_schema(upsert_database_id, |s| s.has_child_fks(bt.name.as_str())) {
+                emit_fk_child_update_new_counters(
+                    program,
+                    &bt,
+                    table.get_name(),
+                    new_start,
+                    rowid_new_reg,
+                    &directly_changed_cols,
+                    upsert_database_id,
+                    resolver,
+                    &layout,
                 )?;
             }
         }

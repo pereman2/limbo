@@ -12,7 +12,8 @@ use crate::stats::AnalyzeStats;
 use crate::sync::RwLock;
 use crate::translate::emitter::Resolver;
 use crate::translate::expr::{
-    bind_and_rewrite_expr, walk_expr, walk_expr_mut, BindingBehavior, WalkControl,
+    bind_and_rewrite_expr, comparison_affinity, walk_expr, walk_expr_mut, BindingBehavior,
+    WalkControl,
 };
 use crate::translate::index::{resolve_index_method_parameters, resolve_sorted_columns};
 use crate::translate::planner::ROWID_STRS;
@@ -2960,6 +2961,34 @@ impl Schema {
             found
         };
 
+        let mut reference_comparisons = Vec::new();
+        let mut action_comparisons = Vec::new();
+        for (&child_pos, &parent_pos) in child_pos.iter().zip(&parent_pos) {
+            let child_affinity = child.columns()[child_pos].affinity();
+            let (parent_affinity, collation) = if parent_uses_rowid {
+                (Affinity::Integer, CollationSeq::Binary)
+            } else {
+                let column = &parent_tbl.columns()[parent_pos];
+                (column.affinity(), column.collation())
+            };
+            reference_comparisons.push(FkKeyComparison {
+                affinity: comparison_affinity(parent_affinity, child_affinity, None, None),
+                collation,
+            });
+            action_comparisons.push(FkKeyComparison {
+                affinity: comparison_affinity(
+                    if parent_uses_rowid {
+                        Affinity::Integer
+                    } else {
+                        Affinity::None
+                    },
+                    child_affinity,
+                    None,
+                    None,
+                ),
+                collation,
+            });
+        }
         fk.validate()?;
         Ok(ResolvedFkRef {
             child_table: Arc::clone(child),
@@ -2969,6 +2998,8 @@ impl Schema {
             parent_pos: parent_pos.into_boxed_slice(),
             parent_uses_rowid,
             parent_unique_index,
+            reference_comparisons: reference_comparisons.into_boxed_slice(),
+            action_comparisons: action_comparisons.into_boxed_slice(),
         })
     }
 
@@ -5714,6 +5745,14 @@ pub struct ResolvedFkRef {
     /// For non-rowid parents: the UNIQUE index that enforces the parent key.
     /// (None when `parent_uses_rowid == true`.)
     pub parent_unique_index: Option<Arc<Index>>,
+    pub reference_comparisons: Box<[FkKeyComparison]>,
+    pub action_comparisons: Box<[FkKeyComparison]>,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct FkKeyComparison {
+    pub affinity: Affinity,
+    pub collation: CollationSeq,
 }
 
 impl ResolvedFkRef {

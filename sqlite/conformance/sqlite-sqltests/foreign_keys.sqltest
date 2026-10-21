@@ -3094,6 +3094,354 @@ expect {
 }
 
 @cross-check-integrity
+test fk-delete-cascade-text-child-numeric-spelling {
+    PRAGMA foreign_keys=ON;
+    CREATE TABLE p(id INTEGER PRIMARY KEY);
+    CREATE TABLE d(pid TEXT REFERENCES p(id) ON DELETE CASCADE);
+    INSERT INTO p VALUES(1);
+    INSERT INTO d VALUES('01');
+    DELETE FROM p WHERE id=1;
+    SELECT count(*) FROM d;
+}
+expect {
+    0
+}
+
+@cross-check-integrity
+test fk-delete-cascade-uses-parent-binary-collation {
+    PRAGMA foreign_keys=ON;
+    CREATE TABLE p(k TEXT UNIQUE);
+    CREATE TABLE d(pk TEXT COLLATE NOCASE REFERENCES p(k) ON DELETE CASCADE);
+    INSERT INTO p VALUES('a'),('A');
+    INSERT INTO d VALUES('a'),('A');
+    DELETE FROM p WHERE k='a';
+    SELECT 'p',* FROM p;
+    SELECT 'd',* FROM d;
+}
+expect {
+    p|A
+    d|A
+}
+
+@cross-check-integrity
+test fk-delete-cascade-uses-parent-nocase-collation {
+    PRAGMA foreign_keys=ON;
+    CREATE TABLE p(k TEXT COLLATE NOCASE UNIQUE);
+    CREATE TABLE d(pk TEXT REFERENCES p(k) ON DELETE CASCADE);
+    INSERT INTO p VALUES('a');
+    INSERT INTO d VALUES('A');
+    DELETE FROM p WHERE k='a';
+    SELECT count(*) FROM d;
+}
+expect {
+    0
+}
+
+@cross-check-integrity
+test fk-delete-cascade-nonrowid-text-child-remains-violation {
+    PRAGMA foreign_keys=ON;
+    CREATE TABLE p(k INTEGER UNIQUE);
+    CREATE TABLE d(pk TEXT REFERENCES p(k) ON DELETE CASCADE);
+    INSERT INTO p VALUES(1);
+    INSERT INTO d VALUES('01');
+    DELETE FROM p WHERE k=1;
+}
+expect error {
+}
+
+@cross-check-integrity
+test fk-delete-cascade-nonrowid-untyped-child-remains-violation {
+    PRAGMA foreign_keys=ON;
+    CREATE TABLE p(k INTEGER UNIQUE);
+    CREATE TABLE d(pk REFERENCES p(k) ON DELETE CASCADE);
+    INSERT INTO p VALUES(1);
+    INSERT INTO d VALUES('1');
+    DELETE FROM p WHERE k=1;
+}
+expect error {
+}
+
+@cross-check-integrity
+test fk-delete-cascade-indexed-text-child-numeric-spelling {
+    PRAGMA foreign_keys=ON;
+    CREATE TABLE p(id INTEGER PRIMARY KEY);
+    CREATE TABLE d(pid TEXT REFERENCES p(id) ON DELETE CASCADE);
+    INSERT INTO p VALUES(1);
+    CREATE INDEX d_pid ON d(pid);
+    INSERT INTO d VALUES('01');
+    DELETE FROM p WHERE id=1;
+    SELECT count(*) FROM d;
+}
+expect {
+    0
+}
+
+@cross-check-integrity
+test fk-deferred-self-replace-does-not-cancel-other-orphan {
+    PRAGMA foreign_keys=ON;
+    CREATE TABLE t(id INTEGER PRIMARY KEY, pid INTEGER REFERENCES t(id) DEFERRABLE INITIALLY DEFERRED);
+    INSERT INTO t VALUES(1,NULL);
+    BEGIN;
+    INSERT INTO t VALUES(10,99);
+    UPDATE OR REPLACE t SET id=2,pid=2 WHERE id=1;
+    COMMIT;
+}
+expect error {
+}
+
+@cross-check-integrity
+test fk-deferred-self-update-old-child-does-not-repair-new-orphan {
+    PRAGMA foreign_keys=OFF;
+    CREATE TABLE t(id INTEGER PRIMARY KEY, pid INTEGER REFERENCES t(id) DEFERRABLE INITIALLY DEFERRED);
+    INSERT INTO t VALUES(1,2);
+    PRAGMA foreign_keys=ON;
+    BEGIN;
+    UPDATE t SET id=2,pid=5 WHERE id=1;
+    COMMIT;
+}
+expect error {
+}
+
+@cross-check-integrity
+test fk-delete-cascade-partial-child-index-keeps-orphan-check {
+    PRAGMA foreign_keys=ON;
+    CREATE TABLE p(id INTEGER PRIMARY KEY);
+    CREATE TABLE c(pid INTEGER REFERENCES p(id));
+    CREATE TABLE d(id INTEGER PRIMARY KEY,pid INTEGER REFERENCES p(id) ON DELETE CASCADE);
+    CREATE INDEX d_pid ON d(pid) WHERE id>1;
+    INSERT INTO p VALUES(1);
+    INSERT INTO c VALUES(1);
+    INSERT INTO d VALUES(1,1);
+    DELETE FROM p WHERE id=1;
+}
+expect error {
+}
+
+@cross-check-integrity
+test fk-delete-cascade-text-child-keeps-orphan-check {
+    PRAGMA foreign_keys=ON;
+    CREATE TABLE p(id INTEGER PRIMARY KEY);
+    CREATE TABLE c(pid INTEGER REFERENCES p(id));
+    CREATE TABLE d(pid TEXT REFERENCES p(id) ON DELETE CASCADE);
+    INSERT INTO p VALUES(1);
+    INSERT INTO c VALUES(1);
+    INSERT INTO d VALUES('1');
+    DELETE FROM p WHERE id=1;
+}
+expect error {
+}
+
+@cross-check-integrity
+test fk-update-action-only-parent-keeps-child-violation {
+    PRAGMA foreign_keys=ON;
+    CREATE TABLE a(id INTEGER PRIMARY KEY);
+    CREATE TABLE x(id INTEGER PRIMARY KEY,aid INTEGER REFERENCES a(id));
+    CREATE TABLE c(xid INTEGER REFERENCES x(id) ON UPDATE CASCADE);
+    INSERT INTO a VALUES(1); INSERT INTO x VALUES(1,1); INSERT INTO c VALUES(1);
+    UPDATE x SET id=2,aid=99 WHERE id=1;
+}
+expect error {
+}
+
+@cross-check-integrity
+test fk-update-old-orphan-does-not-cancel-parent-violation {
+    PRAGMA foreign_keys=OFF;
+    CREATE TABLE s(id INTEGER PRIMARY KEY,k2 INTEGER REFERENCES s(id));
+    INSERT INTO s VALUES(5,99),(6,5);
+    PRAGMA foreign_keys=ON;
+    UPDATE s SET id=7,k2=NULL WHERE id=5;
+}
+expect error {
+}
+
+@cross-check-integrity
+test fk-upsert-cascade-only-parent-keeps-child-violation {
+    PRAGMA foreign_keys=ON;
+    CREATE TABLE a(id INTEGER PRIMARY KEY);
+    CREATE TABLE x(id INTEGER PRIMARY KEY, aid INTEGER REFERENCES a(id));
+    CREATE TABLE c(xid INTEGER REFERENCES x(id) ON UPDATE CASCADE);
+    INSERT INTO a VALUES(1);
+    INSERT INTO x VALUES(1,1);
+    INSERT INTO c VALUES(1);
+    INSERT INTO x VALUES(1,1) ON CONFLICT(id) DO UPDATE SET id=2, aid=99;
+}
+expect error {
+}
+
+@cross-check-integrity
+test fk-update-set-null-only-parent-keeps-child-violation {
+    PRAGMA foreign_keys=ON;
+    CREATE TABLE a(id INTEGER PRIMARY KEY);
+    CREATE TABLE x(id INTEGER PRIMARY KEY, aid INTEGER REFERENCES a(id));
+    CREATE TABLE c(xid INTEGER REFERENCES x(id) ON UPDATE SET NULL);
+    INSERT INTO a VALUES(1);
+    INSERT INTO x VALUES(1,1);
+    INSERT INTO c VALUES(1);
+    UPDATE x SET id=2, aid=99 WHERE id=1;
+}
+expect error {
+}
+
+@cross-check-integrity
+test fk-upsert-set-null-only-parent-keeps-child-violation {
+    PRAGMA foreign_keys=ON;
+    CREATE TABLE a(id INTEGER PRIMARY KEY);
+    CREATE TABLE x(id INTEGER PRIMARY KEY, aid INTEGER REFERENCES a(id));
+    CREATE TABLE c(xid INTEGER REFERENCES x(id) ON UPDATE SET NULL);
+    INSERT INTO a VALUES(1);
+    INSERT INTO x VALUES(1,1);
+    INSERT INTO c VALUES(1);
+    INSERT INTO x VALUES(1,1) ON CONFLICT(id) DO UPDATE SET id=2, aid=99;
+}
+expect error {
+}
+
+@cross-check-integrity
+test fk-update-set-default-only-parent-keeps-child-violation {
+    PRAGMA foreign_keys=ON;
+    CREATE TABLE a(id INTEGER PRIMARY KEY);
+    CREATE TABLE x(id INTEGER PRIMARY KEY, aid INTEGER REFERENCES a(id));
+    CREATE TABLE c(xid INTEGER REFERENCES x(id) ON UPDATE SET DEFAULT);
+    INSERT INTO a VALUES(1);
+    INSERT INTO x VALUES(1,1);
+    INSERT INTO c VALUES(1);
+    UPDATE x SET id=2, aid=99 WHERE id=1;
+}
+expect error {
+}
+
+@cross-check-integrity
+test fk-upsert-set-default-only-parent-keeps-child-violation {
+    PRAGMA foreign_keys=ON;
+    CREATE TABLE a(id INTEGER PRIMARY KEY);
+    CREATE TABLE x(id INTEGER PRIMARY KEY, aid INTEGER REFERENCES a(id));
+    CREATE TABLE c(xid INTEGER REFERENCES x(id) ON UPDATE SET DEFAULT);
+    INSERT INTO a VALUES(1);
+    INSERT INTO x VALUES(1,1);
+    INSERT INTO c VALUES(1);
+    INSERT INTO x VALUES(1,1) ON CONFLICT(id) DO UPDATE SET id=2, aid=99;
+}
+expect error {
+}
+
+@cross-check-integrity
+test fk-update-cascade-partial-child-index-keeps-orphan-check {
+    PRAGMA foreign_keys=ON;
+    CREATE TABLE p(id INTEGER PRIMARY KEY);
+    CREATE TABLE c(pid INTEGER REFERENCES p(id));
+    CREATE TABLE d(id INTEGER PRIMARY KEY, pid INTEGER REFERENCES p(id) ON UPDATE CASCADE);
+    CREATE INDEX d_pid ON d(pid) WHERE id>1;
+    INSERT INTO p VALUES(1);
+    INSERT INTO c VALUES(1);
+    INSERT INTO d VALUES(1,1);
+    UPDATE p SET id=2 WHERE id=1;
+}
+expect error {
+}
+
+@cross-check-integrity
+test fk-delete-setnull-partial-child-index-keeps-orphan-check {
+    PRAGMA foreign_keys=ON;
+    CREATE TABLE p(id INTEGER PRIMARY KEY);
+    CREATE TABLE c(pid INTEGER REFERENCES p(id));
+    CREATE TABLE d(id INTEGER PRIMARY KEY,pid INTEGER REFERENCES p(id) ON DELETE SET NULL);
+    CREATE INDEX d_pid ON d(pid) WHERE id>1;
+    INSERT INTO p VALUES(1);
+    INSERT INTO c VALUES(1);
+    INSERT INTO d VALUES(1,1);
+    DELETE FROM p WHERE id=1;
+}
+expect error {
+}
+
+@cross-check-integrity
+test fk-update-cascade-text-child-index-keeps-orphan-check {
+    PRAGMA foreign_keys=ON;
+    CREATE TABLE p(id INTEGER PRIMARY KEY);
+    CREATE TABLE c(pid INTEGER REFERENCES p(id));
+    CREATE TABLE d(pid TEXT REFERENCES p(id) ON UPDATE CASCADE);
+    CREATE INDEX d_pid ON d(pid);
+    INSERT INTO p VALUES(1);
+    INSERT INTO c VALUES(1);
+    INSERT INTO d VALUES('1');
+    UPDATE p SET id=2 WHERE id=1;
+}
+expect error {
+}
+
+@cross-check-integrity
+test fk-delete-cascade-text-child-index-keeps-orphan-check {
+    PRAGMA foreign_keys=ON;
+    CREATE TABLE p(id INTEGER PRIMARY KEY);
+    CREATE TABLE c(pid INTEGER REFERENCES p(id));
+    CREATE TABLE d(pid TEXT REFERENCES p(id) ON DELETE CASCADE);
+    INSERT INTO p VALUES(1);
+    INSERT INTO c VALUES(1);
+    CREATE INDEX d_pid ON d(pid);
+    INSERT INTO d VALUES('1');
+    DELETE FROM p WHERE id=1;
+}
+expect error {
+}
+
+@cross-check-integrity
+test fk-delete-cascade-child-collation-keeps-orphan-check {
+    PRAGMA foreign_keys=ON;
+    CREATE TABLE p(k TEXT PRIMARY KEY COLLATE NOCASE);
+    CREATE TABLE c(k TEXT REFERENCES p(k));
+    CREATE TABLE d(k TEXT COLLATE NOCASE REFERENCES p(k) ON DELETE CASCADE);
+    CREATE INDEX d_k ON d(k COLLATE BINARY);
+    INSERT INTO p VALUES('a');
+    INSERT INTO c VALUES('a');
+    INSERT INTO d VALUES('A');
+    DELETE FROM p WHERE k='a';
+}
+expect error {
+}
+
+@cross-check-integrity
+test fk-delete-cascade-rowid-child-keeps-orphan-check {
+    PRAGMA foreign_keys=ON;
+    CREATE TABLE p(id INTEGER PRIMARY KEY);
+    CREATE TABLE c(pid INTEGER REFERENCES p(id));
+    CREATE TABLE d(id INTEGER PRIMARY KEY REFERENCES p(id) ON DELETE CASCADE);
+    INSERT INTO p VALUES(1);
+    INSERT INTO c VALUES(1);
+    INSERT INTO d VALUES(1);
+    DELETE FROM p WHERE id=1;
+}
+expect error {
+}
+
+@cross-check-integrity
+test fk-update-old-orphan-does-not-cancel-other-child-violation {
+    PRAGMA foreign_keys=OFF;
+    CREATE TABLE a(id INTEGER PRIMARY KEY);
+    CREATE TABLE b(id INTEGER PRIMARY KEY);
+    CREATE TABLE s(id INTEGER PRIMARY KEY, a INTEGER REFERENCES a(id), b INTEGER REFERENCES b(id));
+    INSERT INTO a VALUES(1);
+    INSERT INTO s VALUES(1,1,99);
+    PRAGMA foreign_keys=ON;
+    UPDATE s SET a=99, b=NULL WHERE id=1;
+}
+expect error {
+}
+
+@cross-check-integrity
+test fk-upsert-old-orphan-does-not-cancel-other-child-violation {
+    PRAGMA foreign_keys=OFF;
+    CREATE TABLE a(id INTEGER PRIMARY KEY);
+    CREATE TABLE b(id INTEGER PRIMARY KEY);
+    CREATE TABLE s(id INTEGER PRIMARY KEY, a INTEGER REFERENCES a(id), b INTEGER REFERENCES b(id));
+    INSERT INTO a VALUES(1);
+    INSERT INTO s VALUES(1,1,99);
+    PRAGMA foreign_keys=ON;
+    INSERT INTO s VALUES(1,1,NULL) ON CONFLICT(id) DO UPDATE SET a=99, b=NULL;
+}
+expect error {
+}
+
+@cross-check-integrity
 test fk-update-cascade-remaining-orphan {
     PRAGMA foreign_keys=ON;
     CREATE TABLE p(id INTEGER PRIMARY KEY);

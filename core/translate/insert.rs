@@ -23,8 +23,8 @@ use crate::{
             walk_expr, BindingBehavior, NoConstantOptReason, ReturningBufferCtx, WalkControl,
         },
         fkeys::{
-            build_index_affinity_string, emit_fk_restrict_halt, emit_fk_violation,
-            emit_guarded_fk_decrement, emit_skip_if_any_null, index_probe, index_scan_match_any,
+            build_index_affinity_string, emit_fk_child_matches, emit_fk_restrict_halt,
+            emit_fk_violation, emit_guarded_fk_decrement, emit_skip_if_any_null, index_probe,
             open_read_index, open_read_table, ForeignKeyActions,
         },
         plan::{
@@ -4100,100 +4100,21 @@ pub fn emit_parent_side_fk_decrement_on_insert(
         // never matches any child row (SQL NULL semantics)
         emit_skip_if_any_null(program, new_pk_start, n_cols, skip_fk);
 
-        let child_tbl = &pref.child_table;
-        let child_cols = &pref.fk.child_columns;
-        let indices: Vec<_> = resolver.with_schema(database_id, |s| {
-            s.get_indices(&child_tbl.name).cloned().collect()
-        });
-        let idx = indices.iter().find(|ix| {
-            ix.columns.len() == child_cols.len()
-                && ix
-                    .columns
-                    .iter()
-                    .zip(child_cols.iter())
-                    .all(|(ic, cc)| ic.name.eq_ignore_ascii_case(cc))
-        });
-
-        if let Some(ix) = idx {
-            let icur = open_read_index(program, ix, database_id);
-            // Copy key into probe regs and apply child-index affinities
-            let probe_start = program.alloc_registers(n_cols);
-            for i in 0..n_cols {
-                program.emit_insn(Insn::Copy {
-                    src_reg: new_pk_start + i,
-                    dst_reg: probe_start + i,
-                    extra_amount: 0,
-                });
-            }
-            if let Some(count) = NonZeroUsize::new(n_cols) {
-                program.emit_insn(Insn::Affinity {
-                    start_reg: probe_start,
-                    count,
-                    affinities: build_index_affinity_string(ix, child_tbl),
-                });
-            }
-
-            // Decrement once per matching child row
-            index_scan_match_any(program, icur, probe_start, n_cols, None, |p| {
+        emit_fk_child_matches(
+            program,
+            &pref,
+            new_pk_start,
+            is_self_ref.then_some(insertion.key_register()),
+            false,
+            database_id,
+            resolver,
+            |p| {
                 let next = p.allocate_label();
                 emit_guarded_fk_decrement(p, next, pref.fk.deferred);
                 p.preassign_label_to_next_insn(next);
                 Ok(())
-            })?;
-        } else {
-            // fallback scan :(
-            let ccur = open_read_table(program, child_tbl, database_id);
-            let done = program.allocate_label();
-            program.emit_insn(Insn::Rewind {
-                cursor_id: ccur,
-                pc_if_empty: done,
-            });
-            let loop_top = program.allocate_label();
-            let next_row = program.allocate_label();
-            program.preassign_label_to_next_insn(loop_top);
-
-            for (i, child_name) in child_cols.iter().enumerate() {
-                let (pos, _) = child_tbl.get_column(child_name).ok_or_else(|| {
-                    crate::LimboError::InternalError(format!("child col {child_name} missing"))
-                })?;
-                let tmp = program.alloc_register();
-                program.emit_insn(Insn::Column {
-                    cursor_id: ccur,
-                    column: pos,
-                    dest: tmp,
-                    default: None,
-                });
-
-                program.emit_insn(Insn::IsNull {
-                    reg: tmp,
-                    target_pc: next_row,
-                });
-
-                let cont = program.allocate_label();
-                program.emit_insn(Insn::Eq {
-                    lhs: tmp,
-                    rhs: new_pk_start + i,
-                    target_pc: cont,
-                    flags: CmpInsFlags::default().jump_if_null(),
-                    collation: Some(super::collate::CollationSeq::Binary),
-                });
-                program.emit_insn(Insn::Goto {
-                    target_pc: next_row,
-                });
-                program.preassign_label_to_next_insn(cont);
-            }
-            // Matched one child row: guarded decrement of counter
-            emit_guarded_fk_decrement(program, next_row, pref.fk.deferred);
-            program.preassign_label_to_next_insn(next_row);
-            program.emit_insn(Insn::Next {
-                cursor_id: ccur,
-                pc_if_next: loop_top,
-                fullscan: false,
-                is_index: false,
-            });
-            program.preassign_label_to_next_insn(done);
-            program.emit_insn(Insn::Close { cursor_id: ccur });
-        }
+            },
+        )?;
         program.preassign_label_to_next_insn(skip_fk);
     }
     Ok(())

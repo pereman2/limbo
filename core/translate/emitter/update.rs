@@ -30,10 +30,10 @@ use crate::{
             NoConstantOptReason, ReturningBufferCtx,
         },
         fkeys::{
-            affected_parent_fks_for_update, emit_fk_child_update_counters,
-            emit_fk_parent_deferred_new_key_probes, emit_fk_update_parent_actions,
-            fire_fk_update_actions, stabilize_new_row_for_fk, ForeignKeyActions,
-            ParentKeyNewProbeMode,
+            affected_parent_fks_for_update, emit_fk_child_update_new_counters,
+            emit_fk_child_update_old_counters, emit_fk_parent_deferred_new_key_probes,
+            emit_fk_update_parent_actions, fire_fk_update_actions, stabilize_new_row_for_fk,
+            ForeignKeyActions, ParentKeyNewProbeMode,
         },
         main_loop::{CloseLoop, InitLoop, OpenLoop},
         plan::{
@@ -1312,9 +1312,6 @@ fn emit_update_insns<'a>(
         )?,
         _ => crate::alloc::vec![],
     };
-    let has_parent_fk_checks = affected_parent_fks
-        .iter()
-        .any(|fk| matches!(fk.fk.on_update, RefAct::NoAction | RefAct::Restrict));
     let has_parent_fk_actions = affected_parent_fks.iter().any(|fk| {
         matches!(
             fk.fk.on_update,
@@ -2162,16 +2159,26 @@ fn emit_update_insns<'a>(
     // pre-rewrite table image. Self-referential rows therefore need explicit
     // handling: table scans see OLD values, while the NEW parent/child keys
     // live in registers until the rewrite.
+    if connection.foreign_keys_enabled() {
+        if let Some(table_btree) = target_table.table.btree() {
+            if t_ctx.resolver.schema().has_child_fks(table_name) {
+                emit_fk_child_update_old_counters(
+                    program,
+                    &table_btree,
+                    table_name,
+                    target_table_cursor_id,
+                    &affected_columns,
+                    update_database_id,
+                    &t_ctx.resolver,
+                )?;
+            }
+        }
+    }
     let mut deferred_new_key_plans = Vec::new();
     if connection.foreign_keys_enabled() {
         let rowid_new_reg = effective_rowid_reg;
         if let Some(table_btree) = target_table.table.btree() {
-            // Parent-side checks scan child rows that point at the OLD parent
-            // key. Each match means this update may create a new violation:
-            // RESTRICT halts immediately, while NO ACTION increments the FK
-            // counter so the statement/transaction can fail later if nothing
-            // fixes it.
-            if has_parent_fk_checks {
+            if !affected_parent_fks.is_empty() {
                 let new_key_probe_mode = if any_effective_replace(
                     program.flags.has_statement_conflict(),
                     or_conflict,
@@ -2208,11 +2215,10 @@ fn emit_update_insns<'a>(
     if connection.foreign_keys_enabled() {
         if let Some(table_btree) = target_table.table.btree() {
             if t_ctx.resolver.schema().has_child_fks(table_name) {
-                emit_fk_child_update_counters(
+                emit_fk_child_update_new_counters(
                     program,
                     &table_btree,
                     table_name,
-                    target_table_cursor_id,
                     start,
                     effective_rowid_reg,
                     &affected_columns,
