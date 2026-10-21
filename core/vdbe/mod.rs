@@ -61,7 +61,7 @@ use crate::{
             OpDestroyState, OpIdxInsertState, OpInitCdcVersionState, OpInsertState,
             OpInsertSubState, OpJournalModeState, OpNewRowidState, OpNoConflictState,
             OpParseSchemaState, OpProgramState, OpSeekState, OpTransactionState, SubprogramFrame,
-            VacuumIntoOpContext,
+            SubprogramResult, VacuumIntoOpContext,
         },
         hash_table::HashTable,
         metrics::StatementMetrics,
@@ -242,7 +242,7 @@ pub(crate) fn step_view_delta_batch(
                 }
 
                 let statement = stmt.as_mut().expect("maintenance statement was just built");
-                match statement.step_subprogram()? {
+                match statement.step_materialized_view()? {
                     StepResult::Done => {
                         *stmt = None;
                         *current_index += 1;
@@ -1681,7 +1681,9 @@ impl ProgramState {
             match self.active_op_state.program_ref() {
                 Some(OpProgramState::Run(frames)) => (frames.as_slice(), None),
                 Some(OpProgramState::Call(frame)) => (std::slice::from_ref(frame), None),
-                Some(OpProgramState::Return { finished, .. }) => (&[], finished.as_deref()),
+                Some(OpProgramState::Return(SubprogramResult::Finished(statement))) => {
+                    (&[], Some(&**statement))
+                }
                 _ => (&[], None),
             };
         frames
@@ -1700,8 +1702,8 @@ impl ProgramState {
             match self.active_op_state.program_mut() {
                 Some(OpProgramState::Run(frames)) => (frames.as_mut_slice(), None),
                 Some(OpProgramState::Call(frame)) => (std::slice::from_mut(frame), None),
-                Some(OpProgramState::Return { finished, .. }) => {
-                    (Default::default(), finished.as_deref_mut())
+                Some(OpProgramState::Return(SubprogramResult::Finished(statement))) => {
+                    (Default::default(), Some(&mut **statement))
                 }
                 _ => (Default::default(), None),
             };
@@ -1726,7 +1728,7 @@ impl ProgramState {
         let frame = self
             .active_op_state
             .program_mut()
-            .map(|slot| std::mem::replace(slot, OpProgramState::Calling));
+            .map(|slot| std::mem::replace(slot, OpProgramState::WaitingForSubprogram));
         match frame {
             Some(OpProgramState::Call(frame)) => frame,
             _ => unreachable!("the nested Program instruction did not prepare a subprogram"),
@@ -1735,7 +1737,7 @@ impl ProgramState {
 
     pub(crate) fn resume_after_subprogram(&mut self, returned: OpProgramState) {
         match self.active_op_state.program_mut() {
-            Some(slot) if matches!(slot, OpProgramState::Calling) => *slot = returned,
+            Some(slot) if matches!(slot, OpProgramState::WaitingForSubprogram) => *slot = returned,
             _ => unreachable!("the nested Program instruction was not waiting for its subprogram"),
         }
     }

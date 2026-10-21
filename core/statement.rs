@@ -854,11 +854,8 @@ impl Statement {
         self._step(Some(waker))
     }
 
-    /// Fast step for materialized view subprograms: skips reprepare checks, timeout
-    /// arming, busy handler, metrics recording, and schema retry.
-    /// The parent statement handles all of those concerns.
     #[inline]
-    pub fn step_subprogram(&mut self) -> Result<StepResult> {
+    pub fn step_materialized_view(&mut self) -> Result<StepResult> {
         self.program
             .step(&mut self.state, &self.pager, self.query_mode, None)
             .map_err(|err| *err)

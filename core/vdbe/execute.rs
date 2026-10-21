@@ -5965,41 +5965,20 @@ pub enum OpProgramState {
     Start,
     Run(Vec<SubprogramFrame>),
     Call(SubprogramFrame),
-    Calling,
-    Return {
-        finished: Option<Box<Statement>>,
-        raise_ignore: bool,
-    },
+    WaitingForSubprogram,
+    Return(SubprogramResult),
     Failed(Box<LimboError>),
+}
+
+pub enum SubprogramResult {
+    Finished(Box<Statement>),
+    ConstraintIgnored,
+    RaiseIgnore,
 }
 
 impl Default for OpProgramState {
     fn default() -> Self {
         Self::Start
-    }
-}
-
-fn finish_subprogram(program: &Program, frame: &SubprogramFrame, subprogram_aborted: bool) {
-    let pending_changes = frame.statement.n_total_change();
-    if pending_changes != 0 {
-        program.connection.add_total_changes(pending_changes);
-    }
-
-    // Only end trigger execution for normal completion. Error paths
-    // already called end_trigger_execution() via abort() in the subprogram.
-    if frame.is_trigger && !subprogram_aborted {
-        program.connection.end_trigger_execution();
-    }
-
-    // Restore last_insert_rowid after trigger execution, per SQLite semantics:
-    // trigger-body INSERTs must not overwrite the top-level rowid.
-    if let Some(rowid) = frame.saved_last_insert_rowid {
-        program.connection.update_last_rowid(rowid);
-    }
-
-    // Restore `changes()`, but not `total_changes()`
-    if let Some(changes) = frame.saved_changes_value {
-        program.connection.set_changes(changes);
     }
 }
 
@@ -6076,28 +6055,25 @@ pub fn op_program(
                 }
             }
             OpProgramState::Failed(err) => return Err(err),
-            OpProgramState::Return {
-                finished,
-                raise_ignore,
-            } => {
-                // Cache the statement for reuse on subsequent fires of this
-                // same Program instruction (e.g. next row in an INSERT loop).
-                // Only cache on clean completion - aborted statements have dirty
-                // internal state and cannot be safely reused.
-                if let Some(statement) = finished {
-                    let pc_key = state.pc as usize;
-                    state.subprogram_stmt_cache.insert(pc_key, statement);
-                }
-                if raise_ignore {
+            OpProgramState::Return(result) => {
+                match result {
+                    // Cache the statement for reuse on subsequent fires of this
+                    // same Program instruction (e.g. next row in an INSERT loop).
+                    // Only cache on clean completion - aborted statements have dirty
+                    // internal state and cannot be safely reused.
+                    SubprogramResult::Finished(statement) => {
+                        let pc_key = state.pc as usize;
+                        state.subprogram_stmt_cache.insert(pc_key, statement);
+                        state.pc += 1;
+                    }
+                    SubprogramResult::ConstraintIgnored => state.pc += 1,
                     // RAISE(IGNORE) — skip the current row by jumping to ignore_jump_target
-                    state.pc = ignore_jump_target.as_offset_int();
-                } else {
-                    state.pc += 1;
+                    SubprogramResult::RaiseIgnore => state.pc = ignore_jump_target.as_offset_int(),
                 }
                 state.active_op_state.clear();
                 return Ok(InsnFunctionStepResult::Step);
             }
-            OpProgramState::Call(_) | OpProgramState::Calling => {
+            OpProgramState::Call(_) | OpProgramState::WaitingForSubprogram => {
                 unreachable!(
                     "a nested Program instruction ran while the root statement owns its subprogram"
                 )
@@ -6119,11 +6095,14 @@ pub(super) fn abort_active_subprogram(
     match subprogram {
         OpProgramState::Run(frames) => unwind_subprograms(program, frames, err),
         OpProgramState::Call(frame) => unwind_subprograms(program, vec![frame], err),
-        OpProgramState::Return { finished, .. } => {
-            drop_subprogram_statements(finished);
+        OpProgramState::Return(SubprogramResult::Finished(statement)) => {
+            drop_subprogram_statements([statement]);
             Ok(())
         }
-        OpProgramState::Start | OpProgramState::Calling | OpProgramState::Failed(_) => Ok(()),
+        OpProgramState::Start
+        | OpProgramState::WaitingForSubprogram
+        | OpProgramState::Return(_)
+        | OpProgramState::Failed(_) => Ok(()),
     }
 }
 
@@ -6228,10 +6207,7 @@ fn run_subprograms(
                     .pop()
                     .expect("the finished frame is still on the stack");
                 finish_subprogram(program, &frame, false);
-                OpProgramState::Return {
-                    finished: Some(frame.statement),
-                    raise_ignore: false,
-                }
+                OpProgramState::Return(SubprogramResult::Finished(frame.statement))
             }
             ProgramStep::Error(err) => {
                 let parent_resolve_type = match depth {
@@ -6245,15 +6221,11 @@ fn run_subprograms(
                 drop_subprogram_statements([frame.statement]);
                 match *err {
                     LimboError::Constraint(_) if parent_resolve_type == ResolveType::Ignore => {
-                        OpProgramState::Return {
-                            finished: None,
-                            raise_ignore: false,
-                        }
+                        OpProgramState::Return(SubprogramResult::ConstraintIgnored)
                     }
-                    LimboError::RaiseIgnore => OpProgramState::Return {
-                        finished: None,
-                        raise_ignore: true,
-                    },
+                    LimboError::RaiseIgnore => {
+                        OpProgramState::Return(SubprogramResult::RaiseIgnore)
+                    }
                     _ => OpProgramState::Failed(err),
                 }
             }
@@ -6285,6 +6257,30 @@ fn unwind_subprograms(
     statements.reverse();
     drop_subprogram_statements(statements);
     abort_error.map_or(Ok(()), Err)
+}
+
+fn finish_subprogram(program: &Program, frame: &SubprogramFrame, subprogram_aborted: bool) {
+    let pending_changes = frame.statement.n_total_change();
+    if pending_changes != 0 {
+        program.connection.add_total_changes(pending_changes);
+    }
+
+    // Only end trigger execution for normal completion. Error paths
+    // already called end_trigger_execution() via abort() in the subprogram.
+    if frame.is_trigger && !subprogram_aborted {
+        program.connection.end_trigger_execution();
+    }
+
+    // Restore last_insert_rowid after trigger execution, per SQLite semantics:
+    // trigger-body INSERTs must not overwrite the top-level rowid.
+    if let Some(rowid) = frame.saved_last_insert_rowid {
+        program.connection.update_last_rowid(rowid);
+    }
+
+    // Restore `changes()`, but not `total_changes()`
+    if let Some(changes) = frame.saved_changes_value {
+        program.connection.set_changes(changes);
+    }
 }
 
 pub(super) fn drop_subprogram_statements(statements: impl IntoIterator<Item = Box<Statement>>) {
@@ -16413,7 +16409,7 @@ pub fn op_populate_materialized_views(
             .stmt
             .as_mut()
             .expect("population statement was just built");
-        match statement.step_subprogram()? {
+        match statement.step_materialized_view()? {
             StepResult::Done => {
                 populate_state.stmt = None;
                 populate_state.view_idx += 1;
