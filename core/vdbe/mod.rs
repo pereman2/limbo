@@ -1168,7 +1168,7 @@ pub struct ProgramState {
     fk_deferred_violations_when_stmt_started: AtomicIsize,
     /// Number of immediate foreign key violations that occurred during the active statement. If nonzero,
     /// the statement subtransactionwill roll back.
-    fk_immediate_violations_during_stmt: AtomicIsize,
+    pub(crate) fk_immediate_violations_during_stmt: Arc<AtomicIsize>,
     uses_subjournal: bool,
     /// Whether this statement is an active write inside an explicit transaction.
     pub(crate) is_active_write: bool,
@@ -1258,7 +1258,7 @@ impl ProgramState {
             populate_matviews_state: None,
             auto_txn_cleanup: TxnCleanup::None,
             fk_deferred_violations_when_stmt_started: AtomicIsize::new(0),
-            fk_immediate_violations_during_stmt: AtomicIsize::new(0),
+            fk_immediate_violations_during_stmt: Arc::new(AtomicIsize::new(0)),
             rowsets: HashMap::default(),
             spare_agg_payloads: Vec::new(),
             bloom_filters: HashMap::default(),
@@ -1420,7 +1420,6 @@ impl ProgramState {
         self.view_delta_state = ViewDeltaApplyState::NotStarted;
         self.populate_matviews_state = None;
         self.auto_txn_cleanup = TxnCleanup::None;
-        *self.fk_immediate_violations_during_stmt.get_mut() = 0;
         *self.fk_deferred_violations_when_stmt_started.get_mut() = 0;
         if !self.rowsets.is_empty() {
             self.rowsets.clear();
@@ -1448,6 +1447,9 @@ impl ProgramState {
         self.halt_in_progress = false;
         self.pending_cdc_info = None;
         self.subprogram_stmt_cache.clear();
+        if let Some(counter) = Arc::get_mut(&mut self.fk_immediate_violations_during_stmt) {
+            *counter.get_mut() = 0;
+        }
     }
 
     pub(crate) fn record_statement_change(&self) {

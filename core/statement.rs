@@ -889,6 +889,11 @@ impl Statement {
         self.state.current_time = Some(now);
     }
 
+    pub(crate) fn share_fk_immediate_violations(&mut self, parent: &vdbe::ProgramState) {
+        self.state.fk_immediate_violations_during_stmt =
+            parent.fk_immediate_violations_during_stmt.clone();
+    }
+
     pub(crate) fn abort_subprogram(&mut self, err: Option<&LimboError>) -> Result<()> {
         let result = self.program.abort(&self.pager, err, &mut self.state, false);
         self.state.execution_state = vdbe::ProgramExecutionState::Failed;

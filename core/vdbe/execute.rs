@@ -3923,7 +3923,8 @@ pub fn halt(
 
     // Check for immediate foreign key violations.
     // Any immediate violation causes the statement subtransaction to roll back.
-    if program.connection.foreign_keys_enabled()
+    if !program.is_trigger_subprogram()
+        && program.connection.foreign_keys_enabled()
         && state.get_fk_immediate_violations_during_stmt() > 0
     {
         return Err(
@@ -6022,6 +6023,7 @@ pub fn op_program(
                             crate::connection::PrepareOptions::default(),
                         ))
                     };
+                statement.share_fk_immediate_violations(state);
 
                 // Check if this is a trigger subprogram - if so, track execution
                 // and save last_insert_rowid so it can be restored after the trigger finishes.
