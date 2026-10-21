@@ -2755,7 +2755,6 @@ expect {
     10|100
 }
 
-# INSERT OR REPLACE with ON DELETE CASCADE
 @cross-check-integrity
 test fk-insert-replace-orphan-parent-leaves-child {
     PRAGMA foreign_keys=OFF;
@@ -2778,6 +2777,7 @@ test fk-update-replace-orphan-parent-leaves-child {
 expect error {
 }
 
+# INSERT OR REPLACE with ON DELETE CASCADE
 @cross-check-integrity
 test fk-replace-delete-cascade {
     PRAGMA foreign_keys=ON;
@@ -3032,6 +3032,118 @@ test fk-self-delete-composite-parent-and-child {
 }
 expect {
     0
+}
+
+@cross-check-integrity
+test fk-self-delete-noaction-cascade {
+    PRAGMA foreign_keys=ON;
+    CREATE TABLE s(id INTEGER PRIMARY KEY, k2 INTEGER REFERENCES s(id), k3 INTEGER REFERENCES s(id) ON DELETE CASCADE);
+    INSERT INTO s VALUES(1,NULL,NULL),(2,1,1);
+    DELETE FROM s WHERE id>=1;
+    SELECT count(*) FROM s;
+}
+expect {
+    0
+}
+
+@cross-check-integrity
+test fk-self-delete-noaction-cascade-chain {
+    PRAGMA foreign_keys=ON;
+    CREATE TABLE s(id INTEGER PRIMARY KEY, k2 INTEGER REFERENCES s(id), k3 INTEGER REFERENCES s(id) ON DELETE CASCADE);
+    INSERT INTO s VALUES(1,NULL,NULL),(2,1,1),(3,2,2);
+    DELETE FROM s WHERE id>=1;
+    SELECT count(*) FROM s;
+}
+expect {
+    0
+}
+
+@cross-check-integrity
+test fk-self-delete-noaction-cascade-multiple-parents {
+    PRAGMA foreign_keys=ON;
+    CREATE TABLE s(id INTEGER PRIMARY KEY, k2 INTEGER REFERENCES s(id), k3 INTEGER REFERENCES s(id) ON DELETE CASCADE);
+    INSERT INTO s VALUES(1,NULL,NULL),(2,1,1),(3,NULL,NULL),(4,3,3);
+    DELETE FROM s WHERE id>=1;
+    SELECT count(*) FROM s;
+}
+expect {
+    0
+}
+
+@cross-check-integrity
+test fk-self-delete-noaction-cascade-remaining-orphan {
+    PRAGMA foreign_keys=ON;
+    CREATE TABLE s(id INTEGER PRIMARY KEY, k2 INTEGER REFERENCES s(id), k3 INTEGER REFERENCES s(id) ON DELETE CASCADE);
+    INSERT INTO s VALUES(1,NULL,NULL),(2,1,1),(3,1,NULL);
+    DELETE FROM s WHERE id<=2;
+}
+expect error {
+}
+
+@cross-check-integrity
+test fk-self-delete-after-trigger-removes-child {
+    PRAGMA foreign_keys=ON;
+    CREATE TABLE s(id INTEGER PRIMARY KEY, k2 INTEGER REFERENCES s(id));
+    CREATE TRIGGER cleanup AFTER DELETE ON s BEGIN DELETE FROM s WHERE k2=old.id; END;
+    INSERT INTO s VALUES(1,NULL),(2,1);
+    DELETE FROM s WHERE id=1;
+    SELECT count(*) FROM s;
+}
+expect {
+    0
+}
+
+@cross-check-integrity
+test fk-update-cascade-remaining-orphan {
+    PRAGMA foreign_keys=ON;
+    CREATE TABLE p(id INTEGER PRIMARY KEY);
+    CREATE TABLE c(pid INTEGER REFERENCES p(id));
+    CREATE TABLE d(pid INTEGER REFERENCES p(id) ON UPDATE CASCADE);
+    INSERT INTO p VALUES(1);
+    INSERT INTO c VALUES(1);
+    INSERT INTO d VALUES(1);
+    UPDATE p SET id=2;
+}
+expect error {
+}
+
+@cross-check-integrity
+test fk-update-after-trigger-indexed-remaining-orphan {
+    PRAGMA foreign_keys=ON;
+    CREATE TABLE p(id INTEGER PRIMARY KEY);
+    CREATE TABLE c(id INTEGER PRIMARY KEY, pid INTEGER REFERENCES p(id));
+    CREATE INDEX c_pid ON c(pid);
+    CREATE TRIGGER cleanup AFTER UPDATE ON p BEGIN DELETE FROM c WHERE id=1; END;
+    INSERT INTO p VALUES(1);
+    INSERT INTO c VALUES(1,1),(2,1);
+    UPDATE p SET id=2;
+}
+expect error {
+}
+
+@cross-check-integrity
+test fk-delete-after-trigger-indexed-remaining-orphan {
+    PRAGMA foreign_keys=ON;
+    CREATE TABLE p(id INTEGER PRIMARY KEY);
+    CREATE TABLE c(id INTEGER PRIMARY KEY, pid INTEGER REFERENCES p(id));
+    CREATE INDEX c_pid ON c(pid);
+    CREATE TRIGGER cleanup AFTER DELETE ON p BEGIN DELETE FROM c WHERE id=1; END;
+    INSERT INTO p VALUES(1);
+    INSERT INTO c VALUES(1,1),(2,1);
+    DELETE FROM p WHERE id=1;
+}
+expect error {
+}
+
+@cross-check-integrity
+test fk-self-delete-after-trigger-remaining-orphan {
+    PRAGMA foreign_keys=ON;
+    CREATE TABLE s(id INTEGER PRIMARY KEY, k2 INTEGER REFERENCES s(id));
+    CREATE TRIGGER cleanup AFTER DELETE ON s BEGIN DELETE FROM s WHERE id=2; END;
+    INSERT INTO s VALUES(1,NULL),(2,1),(3,1);
+    DELETE FROM s WHERE id=1;
+}
+expect error {
 }
 
 @cross-check-integrity
