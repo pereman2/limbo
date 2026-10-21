@@ -2346,6 +2346,39 @@ expect error {
     too many levels of trigger recursion
 }
 
+@cross-check-integrity
+test fk-cascade-delete-trigger-shared-depth-999 {
+    PRAGMA foreign_keys=ON;
+    CREATE TABLE p(id INTEGER PRIMARY KEY);
+    CREATE TABLE t(id INTEGER PRIMARY KEY, k INTEGER REFERENCES t(id) ON DELETE CASCADE);
+    CREATE TRIGGER delete_chain BEFORE DELETE ON p BEGIN DELETE FROM t WHERE id=1; END;
+    INSERT INTO p VALUES(1);
+    WITH RECURSIVE s(x) AS (SELECT 1 UNION ALL SELECT x+1 FROM s WHERE x<999)
+        INSERT INTO t SELECT x, CASE WHEN x>1 THEN x-1 END FROM s;
+    DELETE FROM p;
+    SELECT count(*) FROM t;
+    SELECT count(*) FROM p;
+}
+expect {
+    0
+    0
+}
+
+@cross-check-integrity
+test fk-cascade-delete-trigger-shared-depth-1000 {
+    PRAGMA foreign_keys=ON;
+    CREATE TABLE p(id INTEGER PRIMARY KEY);
+    CREATE TABLE t(id INTEGER PRIMARY KEY, k INTEGER REFERENCES t(id) ON DELETE CASCADE);
+    CREATE TRIGGER delete_chain BEFORE DELETE ON p BEGIN DELETE FROM t WHERE id=1; END;
+    INSERT INTO p VALUES(1);
+    WITH RECURSIVE s(x) AS (SELECT 1 UNION ALL SELECT x+1 FROM s WHERE x<1000)
+        INSERT INTO t SELECT x, CASE WHEN x>1 THEN x-1 END FROM s;
+    DELETE FROM p;
+}
+expect error {
+    too many levels of trigger recursion
+}
+
 # ON DELETE CASCADE - composite self-referential chain
 @cross-check-integrity
 test fk-cascade-delete-self-referential-composite-chain {

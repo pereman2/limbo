@@ -377,10 +377,65 @@ fn cascade_depth_error_restores_rows(tmp_db: TempDatabase) -> anyhow::Result<()>
                     ["3000"]
                 );
             }
-            conn.execute("UPDATE t SET k=NULL WHERE id=1000")?;
+            conn.execute("UPDATE t SET k=NULL WHERE id=1001")?;
             conn.execute("DELETE FROM t")?;
             assert_eq!(query_rows(&conn, "SELECT count(*) FROM t"), ["0"]);
         }
+    }
+    Ok(())
+}
+
+#[test]
+fn cascade_resumes_or_aborts_after_deep_io() -> anyhow::Result<()> {
+    use crate::queued_io::QueuedIo;
+    use turso_core::{ConnectOpts, Database, SqliteDialect, StepResult, IO};
+
+    for action in ["resume", "reset", "drop"] {
+        let io = Arc::new(QueuedIo::new());
+        let db = Database::open_file(io.clone(), "cascade.db", Arc::new(SqliteDialect))?;
+        let conn = db.connect(ConnectOpts::new())?;
+        conn.execute("PRAGMA foreign_keys=ON")?;
+        conn.execute("PRAGMA cache_size=16")?;
+        conn.execute("CREATE TABLE t(id INTEGER PRIMARY KEY, k INTEGER REFERENCES t(id) ON DELETE CASCADE, pad BLOB)")?;
+        conn.execute("CREATE INDEX tk ON t(k)")?;
+        conn.execute(
+            "WITH RECURSIVE s(x) AS (SELECT 1 UNION ALL SELECT x+1 FROM s WHERE x<1000)
+             INSERT INTO t SELECT x, CASE WHEN x>1 THEN x-1 END, zeroblob(1000) FROM s",
+        )?;
+        conn.execute("PRAGMA wal_checkpoint(TRUNCATE)")?;
+        conn.execute("BEGIN")?;
+        let mut stmt = conn.prepare("DELETE FROM t WHERE id=1")?;
+        let mut suspended_deep = false;
+        for _ in 0..100_000 {
+            match stmt.step()? {
+                StepResult::IO => {
+                    if stmt.metrics().rows_written >= 500 {
+                        suspended_deep = true;
+                        break;
+                    }
+                    io.step()?;
+                }
+                StepResult::Yield => {}
+                other => panic!("expected pending cascade I/O, got {other:?}"),
+            }
+        }
+        assert!(suspended_deep);
+        if action == "resume" {
+            stmt.run_ignore_rows()?;
+            assert_eq!(query_rows(&conn, "SELECT count(*) FROM t"), ["0"]);
+            stmt.reset_metrics();
+            assert_eq!(stmt.metrics().rows_written, 0);
+        } else if action == "reset" {
+            stmt.reset()?;
+        }
+        drop(stmt);
+        if action != "resume" {
+            assert_eq!(query_rows(&conn, "SELECT count(*) FROM t"), ["1000"]);
+        }
+        conn.execute("COMMIT")?;
+        assert_eq!(query_rows(&conn, "PRAGMA integrity_check"), ["ok"]);
+        conn.execute("DELETE FROM t")?;
+        assert_eq!(query_rows(&conn, "SELECT count(*) FROM t"), ["0"]);
     }
     Ok(())
 }
