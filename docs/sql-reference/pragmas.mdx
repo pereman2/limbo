@@ -327,7 +327,7 @@ Foreign key enforcement is off by default for SQLite compatibility.
 Triggers and foreign key actions can nest at most 1000 levels deep.
 If a statement exceeds this limit, Turso returns
 `too many levels of trigger recursion` and rolls back the statement.
-Inside an explicit transaction, SQLite can keep the rows that an ON DELETE CASCADE chain deleted before the error.
+Inside an explicit transaction, SQLite can keep the changes that an ON DELETE CASCADE chain made before the error.
 Turso always rolls back the statement.
 The limit applies to nesting while a statement runs, for example a table whose foreign key references the same table.
 A long chain of different tables or triggers can still crash Turso while it compiles the statement.
