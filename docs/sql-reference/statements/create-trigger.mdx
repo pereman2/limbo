@@ -153,6 +153,10 @@ A trigger body can fire more triggers and foreign key actions.
 Triggers and foreign key actions can nest at most 1000 levels deep.
 If a statement goes deeper, Turso returns
 `too many levels of trigger recursion` and rolls back the statement.
+Inside an explicit transaction, SQLite keeps the changes made before the error.
+Turso rolls them back.
+The limit applies to nesting while a statement runs, for example a table whose foreign key references the same table.
+A chain of a few hundred different tables or triggers can still crash Turso while it compiles the statement.
 
 ## Examples
 
