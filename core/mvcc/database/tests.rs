@@ -8723,6 +8723,308 @@ fn test_lazy_cursor_exact_rowid_hit_rechecks_checkpoint_coverage() {
     store.durable_txid_max.store(old_max, Ordering::SeqCst);
 }
 
+#[test]
+fn test_lazy_cursor_point_seek_does_not_advance_hidden_physical_rows() {
+    for backwards in [false, true] {
+        let (db, conn) = setup_lazy_exact_seek_db();
+        conn.execute("UPDATE t SET v = v || '-updated'").unwrap();
+        conn.execute("BEGIN CONCURRENT").unwrap();
+        let mut cursor = open_lazy_payload_cursor(&db, &conn);
+        let point = if backwards {
+            CursorYieldPoint::AdvanceBtreeBackwardProgress
+        } else {
+            CursorYieldPoint::AdvanceBtreeForwardProgress
+        };
+        let injector = FixedYieldInjector::new([point.point()]);
+        conn.set_yield_injector(Some(injector.clone()));
+        let op = if backwards {
+            SeekOp::LE { eq_only: true }
+        } else {
+            SeekOp::GE { eq_only: true }
+        };
+        assert_eq!(
+            drive_lazy_payload_io(&conn, || cursor.seek(SeekKey::TableRowId(2), op)),
+            SeekResult::Found
+        );
+        assert_eq!(
+            payload_text(&lazy_payload_bytes(&conn, &mut cursor).unwrap()),
+            "two-updated"
+        );
+        assert_eq!(
+            injector.remaining_len(),
+            1,
+            "exact probe advanced the physical cursor"
+        );
+        conn.set_yield_injector(None);
+        conn.execute("ROLLBACK").unwrap();
+    }
+}
+
+#[test]
+fn test_lazy_cursor_point_seek_continues_in_both_directions() {
+    for start in [1, 3, 5] {
+        for backwards in [false, true] {
+            let (db, conn) = setup_lazy_exact_seek_db();
+            conn.execute("BEGIN CONCURRENT").unwrap();
+            let mut cursor = open_lazy_payload_cursor(&db, &conn);
+            assert_eq!(
+                drive_lazy_payload_io(&conn, || cursor
+                    .seek(SeekKey::TableRowId(start), SeekOp::GE { eq_only: true })),
+                SeekResult::Found
+            );
+            let mut rows = vec![start];
+            loop {
+                if backwards {
+                    drive_lazy_payload_io(&conn, || cursor.prev());
+                } else {
+                    drive_lazy_payload_io(&conn, || cursor.next());
+                }
+                let Some(rowid) = drive_lazy_payload_io(&conn, || cursor.rowid()) else {
+                    break;
+                };
+                assert!(lazy_payload_bytes(&conn, &mut cursor).is_some());
+                rows.push(rowid);
+            }
+            let mut expected: Vec<_> = [1, 2, 3, 5, 6]
+                .into_iter()
+                .filter(|id| {
+                    if backwards {
+                        *id <= start
+                    } else {
+                        *id >= start
+                    }
+                })
+                .collect();
+            if backwards {
+                expected.reverse();
+            }
+            assert_eq!(rows, expected);
+            conn.execute("ROLLBACK").unwrap();
+        }
+    }
+}
+
+#[test]
+fn test_lazy_cursor_point_seek_resets_for_new_positions() {
+    let (db, conn) = setup_lazy_exact_seek_db();
+    conn.execute("BEGIN CONCURRENT").unwrap();
+    let mut cursor = open_lazy_payload_cursor(&db, &conn);
+    for reposition in ["rewind", "last", "range", "point", "miss"] {
+        assert_eq!(
+            drive_lazy_payload_io(&conn, || cursor
+                .seek(SeekKey::TableRowId(3), SeekOp::GE { eq_only: true })),
+            SeekResult::Found
+        );
+        match reposition {
+            "rewind" => drive_lazy_payload_io(&conn, || cursor.rewind()),
+            "last" => drive_lazy_payload_io(&conn, || cursor.last()),
+            "range" => {
+                drive_lazy_payload_io(&conn, || cursor.seek(SeekKey::TableRowId(2), SeekOp::GT));
+            }
+            "point" => {
+                drive_lazy_payload_io(&conn, || {
+                    cursor.seek(SeekKey::TableRowId(5), SeekOp::GE { eq_only: true })
+                });
+            }
+            "miss" => {
+                assert_eq!(
+                    drive_lazy_payload_io(&conn, || cursor
+                        .seek(SeekKey::TableRowId(99), SeekOp::GE { eq_only: true })),
+                    SeekResult::NotFound
+                );
+            }
+            _ => unreachable!(),
+        }
+        let expected = match reposition {
+            "rewind" => Some(1),
+            "last" => Some(6),
+            "range" => Some(3),
+            "point" => Some(5),
+            _ => None,
+        };
+        assert_eq!(drive_lazy_payload_io(&conn, || cursor.rowid()), expected);
+        if reposition == "last" {
+            drive_lazy_payload_io(&conn, || cursor.prev());
+        } else {
+            drive_lazy_payload_io(&conn, || cursor.next());
+        }
+        let expected_next = match reposition {
+            "rewind" => Some(2),
+            "last" => Some(5),
+            "range" => Some(5),
+            "point" => Some(6),
+            _ => None,
+        };
+        assert_eq!(
+            drive_lazy_payload_io(&conn, || cursor.rowid()),
+            expected_next
+        );
+    }
+    conn.execute("ROLLBACK").unwrap();
+}
+
+#[test]
+fn test_lazy_cursor_point_seek_keeps_payload_during_rollback_and_gc() {
+    let (db, conn) = setup_lazy_exact_seek_db();
+    conn.execute("BEGIN CONCURRENT").unwrap();
+    conn.execute("SAVEPOINT s").unwrap();
+    conn.execute("UPDATE t SET v = 'changed' WHERE id = 3")
+        .unwrap();
+    let mut cursor = open_lazy_payload_cursor(&db, &conn);
+    assert_eq!(
+        drive_lazy_payload_io(&conn, || cursor
+            .seek(SeekKey::TableRowId(3), SeekOp::GE { eq_only: true })),
+        SeekResult::Found
+    );
+    let IOResult::Done(Some(payload)) = cursor.record_payload().unwrap() else {
+        panic!("chain bytes expected");
+    };
+    conn.execute("ROLLBACK TO s").unwrap();
+    db.get_mvcc_store().gc_incremental(usize::MAX);
+    assert_eq!(payload_text(payload), "changed");
+    assert_eq!(
+        payload_text(&lazy_payload_bytes(&conn, &mut cursor).unwrap()),
+        "three"
+    );
+    drive_lazy_payload_io(&conn, || cursor.next());
+    assert_eq!(drive_lazy_payload_io(&conn, || cursor.rowid()), Some(5));
+    conn.execute("ROLLBACK").unwrap();
+}
+
+#[test]
+fn test_lazy_cursor_point_seek_preserves_write_loop_after_physical_miss() {
+    let (db, conn) = setup_lazy_exact_seek_db();
+    conn.execute("BEGIN CONCURRENT").unwrap();
+    let root = get_rows(&conn, "SELECT rootpage FROM sqlite_schema WHERE name = 't'")[0][0]
+        .as_int()
+        .unwrap();
+    let mut physical = BTreeCursor::new_table(conn.pager.load().clone(), root, 2);
+    assert_eq!(
+        drive_lazy_payload_io(&conn, || physical
+            .seek(SeekKey::TableRowId(1), SeekOp::GE { eq_only: true })),
+        SeekResult::NotFound
+    );
+    let mut cursor = open_lazy_payload_cursor(&db, &conn);
+    assert_eq!(
+        drive_lazy_payload_io(&conn, || cursor
+            .seek(SeekKey::TableRowId(1), SeekOp::GE { eq_only: true })),
+        SeekResult::Found
+    );
+    let mut deleted = Vec::new();
+    while let Some(rowid) = drive_lazy_payload_io(&conn, || cursor.rowid()) {
+        assert_eq!(
+            drive_lazy_payload_io(&conn, || cursor
+                .seek(SeekKey::TableRowId(rowid), SeekOp::GE { eq_only: true })),
+            SeekResult::Found
+        );
+        drive_lazy_payload_io(&conn, || cursor.delete());
+        deleted.push(rowid);
+        drive_lazy_payload_io(&conn, || cursor.next());
+    }
+    assert_eq!(deleted, vec![1, 2, 3, 5, 6]);
+    assert!(get_rows(&conn, "SELECT id FROM t").is_empty());
+    conn.execute("ROLLBACK").unwrap();
+}
+
+#[test]
+fn test_lazy_cursor_point_seek_survives_checkpoint_before_movement() {
+    let db = MvccTestDbNoConn::new_with_random_db_passive();
+    let writer = db.connect();
+    writer
+        .execute("PRAGMA mvcc_checkpoint_threshold = -1")
+        .unwrap();
+    writer
+        .execute("CREATE TABLE t(id INTEGER PRIMARY KEY, v TEXT)")
+        .unwrap();
+    writer
+        .execute("INSERT INTO t VALUES (1, 'one'), (2, 'two'), (3, 'three')")
+        .unwrap();
+    writer.execute("PRAGMA wal_checkpoint(TRUNCATE)").unwrap();
+    writer
+        .execute("UPDATE t SET v = 'updated' WHERE id = 2")
+        .unwrap();
+    let reader = db.connect();
+    reader.execute("BEGIN CONCURRENT").unwrap();
+    let mut cursor = open_lazy_payload_cursor(&db, &reader);
+    let injector = FixedYieldInjector::new([CursorYieldPoint::SeekBtreeProgress.point()]);
+    reader.set_yield_injector(Some(injector.clone()));
+    loop {
+        let IOResult::IO(pending) = cursor
+            .seek(SeekKey::TableRowId(2), SeekOp::GE { eq_only: true })
+            .unwrap()
+        else {
+            panic!("point probe completed before SeekBtreeProgress");
+        };
+        if pending.is_explicit_yield() {
+            assert!(injector.is_empty());
+            pending.wait(reader.db.io.as_ref()).unwrap();
+            break;
+        }
+        assert_eq!(injector.remaining_len(), 1);
+        pending.wait(reader.db.io.as_ref()).unwrap();
+    }
+    assert!(injector.is_empty());
+    writer.execute("PRAGMA wal_checkpoint(PASSIVE)").unwrap();
+    db.get_mvcc_store().gc_incremental(usize::MAX);
+    assert_eq!(
+        drive_lazy_payload_io(&reader, || cursor
+            .seek(SeekKey::TableRowId(2), SeekOp::GE { eq_only: true })),
+        SeekResult::Found
+    );
+    assert_eq!(
+        payload_text(&lazy_payload_bytes(&reader, &mut cursor).unwrap()),
+        "updated"
+    );
+    reader.set_yield_injector(None);
+    writer
+        .execute("UPDATE t SET v = 'later' WHERE id = 3")
+        .unwrap();
+    writer.execute("PRAGMA wal_checkpoint(PASSIVE)").unwrap();
+    drive_lazy_payload_io(&reader, || cursor.next());
+    assert_eq!(drive_lazy_payload_io(&reader, || cursor.rowid()), Some(3));
+    assert_eq!(
+        payload_text(&lazy_payload_bytes(&reader, &mut cursor).unwrap()),
+        "three"
+    );
+    reader.execute("ROLLBACK").unwrap();
+}
+
+#[test]
+fn test_lazy_cursor_point_seek_abandons_physical_miss() {
+    for point in [
+        CursorYieldPoint::SeekStart,
+        CursorYieldPoint::SeekBtreeProgress,
+    ] {
+        let (db, conn) = setup_lazy_exact_seek_db();
+        conn.execute("BEGIN CONCURRENT").unwrap();
+        let root = get_rows(&conn, "SELECT rootpage FROM sqlite_schema WHERE name = 't'")[0][0]
+            .as_int()
+            .unwrap();
+        let mut physical = BTreeCursor::new_table(conn.pager.load().clone(), root, 2);
+        assert_eq!(
+            drive_lazy_payload_io(&conn, || physical
+                .seek(SeekKey::TableRowId(3), SeekOp::GE { eq_only: true })),
+            SeekResult::NotFound
+        );
+        drop(physical);
+        let mut cursor = open_lazy_payload_cursor(&db, &conn);
+        let injector = FixedYieldInjector::new([point.point()]);
+        conn.set_yield_injector(Some(injector.clone()));
+        let IOResult::IO(pending) = cursor
+            .seek(SeekKey::TableRowId(3), SeekOp::GE { eq_only: true })
+            .unwrap()
+        else {
+            panic!("point probe must yield");
+        };
+        assert!(pending.is_explicit_yield());
+        assert!(injector.is_empty());
+        pending.wait(conn.db.io.as_ref()).unwrap();
+        drop(cursor);
+        conn.set_yield_injector(None);
+        check_lazy_cursor_after_abandonment(&db, &conn);
+    }
+}
+
 fn check_lazy_cursor_after_abandonment(db: &MvccTestDbNoConn, conn: &Arc<Connection>) {
     conn.execute("ROLLBACK").unwrap();
     conn.execute("BEGIN CONCURRENT").unwrap();

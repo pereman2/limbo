@@ -116,6 +116,9 @@ enum SeekBtreeState {
 
 #[derive(Debug, Clone, Copy)]
 enum SeekState {
+    PointBtree,
+    PointCheckBtreeFound,
+    PointCheckBtreeMissing,
     /// Seeking in btree (MVCC seek already done)
     SeekBtree(SeekBtreeState),
     /// Pick winner and finalize
@@ -1885,12 +1888,80 @@ impl<Clock: LogicalClock + 'static, A: ConcurrentAllocator> CursorTrait
                         }
                     }
 
-                    // Move to btree seek state
+                    let seek_state = if matches!(seek_key, SeekKey::TableRowId(_))
+                        && op.eq_only()
+                        && self.eq_seek_row.is_some()
+                    {
+                        SeekState::PointBtree
+                    } else {
+                        SeekState::SeekBtree(SeekBtreeState::SeekBtree)
+                    };
+                    self.state
+                        .replace(MvccLazyCursorState::Seek(seek_state, direction));
+                    inject_io_yield!(self, CursorYieldPoint::SeekStart);
+                }
+                Some(MvccLazyCursorState::Seek(SeekState::PointBtree, direction)) => {
+                    let found = self.is_btree_allocated()
+                        && matches!(
+                            return_if_io!(self.btree_cursor.seek(seek_key.clone(), op)),
+                            SeekResult::Found
+                        );
                     self.state.replace(MvccLazyCursorState::Seek(
-                        SeekState::SeekBtree(SeekBtreeState::SeekBtree),
+                        if found {
+                            SeekState::PointCheckBtreeFound
+                        } else {
+                            SeekState::PointCheckBtreeMissing
+                        },
                         direction,
                     ));
-                    inject_io_yield!(self, CursorYieldPoint::SeekStart);
+                    inject_io_yield!(self, CursorYieldPoint::SeekBtreeProgress);
+                }
+                Some(MvccLazyCursorState::Seek(
+                    point_state @ (SeekState::PointCheckBtreeFound
+                    | SeekState::PointCheckBtreeMissing),
+                    direction,
+                )) => {
+                    let found = matches!(point_state, SeekState::PointCheckBtreeFound);
+                    let SeekKey::TableRowId(rowid) = seek_key else {
+                        unreachable!("point seek requires a table rowid");
+                    };
+                    let row_id = RowID {
+                        table_id: self.table_id,
+                        row_id: RowKey::Int(rowid),
+                    };
+                    let physical_valid = found
+                        && self.get_btree_current_key()?.as_ref() == Some(&row_id.row_id)
+                        && self.query_btree_version_is_valid(&row_id.row_id)?;
+                    let versions = self
+                        .dual_peek
+                        .mvcc_peek
+                        .get_versions()
+                        .expect("point seek requires a version chain");
+                    let falls_through = {
+                        let chain = versions.read();
+                        self.db.btree_covers_chain_for_snapshot(
+                            self.snapshot,
+                            self.table_id,
+                            &chain,
+                        )
+                    };
+                    if falls_through && !physical_valid {
+                        self.eq_seek_row = None;
+                        self.dual_peek.mvcc_peek = CursorPeek::Exhausted;
+                        self.state.replace(MvccLazyCursorState::Seek(
+                            SeekState::SeekBtree(SeekBtreeState::SeekBtree),
+                            direction,
+                        ));
+                        continue;
+                    }
+                    self.current_pos = CursorPosition::Loaded {
+                        row_id,
+                        in_btree: falls_through,
+                        versions: (!falls_through).then_some(versions),
+                    };
+                    self.range_position = TableRangePosition::Point;
+                    self.state = None;
+                    return Ok(IOResult::Done(SeekResult::Found));
                 }
                 Some(MvccLazyCursorState::Seek(SeekState::SeekBtree(_), direction)) => {
                     return_if_io!(self.seek_btree_and_set_peek(seek_key.clone(), op));
