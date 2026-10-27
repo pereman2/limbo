@@ -9114,6 +9114,430 @@ fn payload_text(payload: &[u8]) -> String {
         .to_string()
 }
 
+#[test]
+fn test_lazy_cursor_count_uses_physical_pages() {
+    let (db, conn) = setup_lazy_count_db(false);
+    conn.execute("BEGIN CONCURRENT").unwrap();
+    let mut cursor = open_lazy_payload_cursor(&db, &conn);
+    let injector = FixedYieldInjector::new([CursorYieldPoint::NextStart.point()]);
+    conn.set_yield_injector(Some(injector.clone()));
+    cursor.set_null_flag(true);
+    assert_eq!(drive_lazy_payload_io(&conn, || cursor.count()), 500);
+    assert!(!cursor.get_null_flag());
+    assert!(!injector.is_empty());
+    assert_eq!(drive_lazy_payload_io(&conn, || cursor.rowid()), None);
+    drive_lazy_payload_io(&conn, || cursor.next());
+    assert_eq!(drive_lazy_payload_io(&conn, || cursor.rowid()), None);
+    drive_lazy_payload_io(&conn, || cursor.prev());
+    assert_eq!(drive_lazy_payload_io(&conn, || cursor.rowid()), None);
+    assert_eq!(drive_lazy_payload_io(&conn, || cursor.count()), 500);
+    conn.set_yield_injector(None);
+    drive_lazy_payload_io(&conn, || cursor.rewind());
+    assert_eq!(drive_lazy_payload_io(&conn, || cursor.rowid()), Some(1));
+    conn.execute("ROLLBACK").unwrap();
+}
+
+#[test]
+fn test_lazy_cursor_count_merges_versions() {
+    for checkpoint in [false, true] {
+        let db = MvccTestDbNoConn::new();
+        let conn = db.connect();
+        conn.execute("CREATE TABLE t(id INTEGER PRIMARY KEY, v TEXT)")
+            .unwrap();
+        conn.execute("INSERT INTO t VALUES (1, 'one'), (2, 'two'), (3, 'three')")
+            .unwrap();
+        if checkpoint {
+            conn.execute("PRAGMA wal_checkpoint(TRUNCATE)").unwrap();
+        }
+        conn.execute("BEGIN CONCURRENT").unwrap();
+        conn.execute("UPDATE t SET v = 'updated' WHERE id = 1")
+            .unwrap();
+        conn.execute("DELETE FROM t WHERE id = 3").unwrap();
+        conn.execute("INSERT INTO t VALUES (4, 'four')").unwrap();
+        let writer = db.connect();
+        writer.execute("BEGIN CONCURRENT").unwrap();
+        writer
+            .execute("INSERT INTO t VALUES (5, 'invisible')")
+            .unwrap();
+        let mut cursor = open_lazy_payload_cursor(&db, &conn);
+        assert_eq!(drive_lazy_payload_io(&conn, || cursor.count()), 3);
+        conn.execute("SAVEPOINT s").unwrap();
+        conn.execute("DELETE FROM t WHERE id = 4").unwrap();
+        assert_eq!(drive_lazy_payload_io(&conn, || cursor.count()), 2);
+        conn.execute("ROLLBACK TO s").unwrap();
+        assert_eq!(drive_lazy_payload_io(&conn, || cursor.count()), 3);
+        writer.execute("ROLLBACK").unwrap();
+        conn.execute("ROLLBACK").unwrap();
+    }
+}
+
+#[cfg(feature = "io_memory_yield")]
+#[test]
+fn test_lazy_cursor_count_restarts_after_writes_during_io() {
+    for change in ["delete", "insert", "update", "rollback", "abandon"] {
+        let (db, conn) = setup_lazy_count_db(true);
+        conn.execute("BEGIN CONCURRENT").unwrap();
+        conn.execute("SAVEPOINT s").unwrap();
+        let mut cursor = open_lazy_payload_cursor(&db, &conn);
+        conn.pager.load().clear_page_cache(false);
+        let IOResult::IO(pending) = cursor.count().unwrap() else {
+            panic!("physical count must wait for page I/O");
+        };
+        assert!(!pending.finished());
+        assert!(!pending.is_explicit_yield());
+        match change {
+            "insert" => conn.execute("INSERT INTO t VALUES (501, 'new')").unwrap(),
+            "update" => conn
+                .execute("UPDATE t SET v = 'new' WHERE id = 500")
+                .unwrap(),
+            _ => conn.execute("DELETE FROM t WHERE id = 500").unwrap(),
+        }
+        if change == "rollback" {
+            conn.execute("ROLLBACK TO s").unwrap();
+        }
+        if change == "abandon" {
+            drop(cursor);
+            pending.wait(conn.db.io.as_ref()).unwrap();
+            conn.execute("ROLLBACK").unwrap();
+            conn.execute("BEGIN CONCURRENT").unwrap();
+            conn.execute("INSERT INTO t VALUES (501, 'after abandonment')")
+                .unwrap();
+            cursor = open_lazy_payload_cursor(&db, &conn);
+        } else {
+            pending.wait(conn.db.io.as_ref()).unwrap();
+        }
+        let expected = match change {
+            "delete" => 499,
+            "insert" | "abandon" => 501,
+            _ => 500,
+        };
+        assert_eq!(
+            drive_lazy_payload_io(&conn, || cursor.count()),
+            expected,
+            "{change}"
+        );
+        assert_eq!(
+            drive_lazy_payload_io(&conn, || cursor.count()),
+            expected,
+            "repeat {change}"
+        );
+        conn.execute("ROLLBACK").unwrap();
+    }
+}
+
+#[cfg(feature = "io_memory_yield")]
+#[test]
+fn test_lazy_cursor_count_sql_sees_delete_during_io() {
+    let (_db, conn) = setup_lazy_count_db(true);
+    conn.execute("BEGIN CONCURRENT").unwrap();
+    let mut stmt = conn.prepare("SELECT count(*) FROM t").unwrap();
+    conn.pager.load().clear_page_cache(false);
+    assert!(matches!(stmt.step().unwrap(), StepResult::IO));
+    conn.execute("DELETE FROM t WHERE id = 500").unwrap();
+    loop {
+        match stmt.step().unwrap() {
+            StepResult::Row => {
+                assert_eq!(stmt.row().unwrap().get_value(0), &Value::from_i64(499));
+                break;
+            }
+            StepResult::IO | StepResult::Yield => stmt._io().step().unwrap(),
+            other => panic!("unexpected result {other:?}"),
+        }
+    }
+    drop(stmt);
+    conn.execute("ROLLBACK").unwrap();
+}
+
+#[test]
+fn test_lazy_cursor_count_restarts_after_physical_result() {
+    for undo in [false, true] {
+        let (db, conn) = setup_lazy_count_db(false);
+        conn.execute("BEGIN CONCURRENT").unwrap();
+        conn.execute("SAVEPOINT s").unwrap();
+        let mut cursor = open_lazy_payload_cursor(&db, &conn);
+        let injector = FixedYieldInjector::new([CursorYieldPoint::CountProgress.point()]);
+        conn.set_yield_injector(Some(injector.clone()));
+        let IOResult::IO(pending) = cursor.count().unwrap() else {
+            panic!("count must yield with a completed physical result");
+        };
+        assert!(pending.is_explicit_yield());
+        assert!(injector.is_empty());
+        conn.set_yield_injector(None);
+        let store = db.get_mvcc_store();
+        let tx_id = conn.get_mv_tx_id().unwrap();
+        let before = store.write_generation(tx_id).unwrap();
+        conn.execute("DELETE FROM t WHERE id = 500").unwrap();
+        let after_write = store.write_generation(tx_id).unwrap();
+        assert!(after_write > before);
+        if undo {
+            conn.execute("ROLLBACK TO s").unwrap();
+            assert!(store.write_generation(tx_id).unwrap() > after_write);
+        }
+        pending.wait(conn.db.io.as_ref()).unwrap();
+        let expected = if undo { 500 } else { 499 };
+        assert_eq!(drive_lazy_payload_io(&conn, || cursor.count()), expected);
+        assert_eq!(drive_lazy_payload_io(&conn, || cursor.count()), expected);
+        conn.execute("ROLLBACK").unwrap();
+    }
+}
+
+#[test]
+fn test_lazy_cursor_count_abandons_pending_physical_result() {
+    let (_db, conn) = setup_lazy_count_db(false);
+    conn.execute("BEGIN CONCURRENT").unwrap();
+    let injector = FixedYieldInjector::new([CursorYieldPoint::CountProgress.point()]);
+    conn.set_yield_injector(Some(injector.clone()));
+    let mut stmt = conn.prepare("SELECT count(*) FROM t").unwrap();
+    assert!(matches!(stmt.step().unwrap(), StepResult::Yield));
+    assert!(injector.is_empty());
+    conn.set_yield_injector(None);
+    drop(stmt);
+    conn.execute("ROLLBACK").unwrap();
+    conn.execute("INSERT INTO t VALUES (501, 'after abandonment')")
+        .unwrap();
+    assert_eq!(
+        get_rows(&conn, "SELECT count(*) FROM t"),
+        vec![vec![Value::from_i64(501)]]
+    );
+}
+
+#[cfg(feature = "io_memory_yield")]
+#[test]
+fn test_lazy_cursor_count_snapshot_survives_checkpoint_and_gc_during_io() {
+    for passive in [false, true] {
+        for insert in [false, true] {
+            let opts = DatabaseOpts::new().with_experimental_mvcc_passive_checkpoint(passive);
+            let (db, conn) = setup_lazy_count_db_with_options(true, opts);
+            conn.execute("BEGIN CONCURRENT").unwrap();
+            let mut cursor = open_lazy_payload_cursor(&db, &conn);
+            conn.pager.load().clear_page_cache(false);
+            let injector = FixedYieldInjector::new([CursorYieldPoint::CountProgress.point()]);
+            conn.set_yield_injector(Some(injector.clone()));
+            let IOResult::IO(pending) = cursor.count().unwrap() else {
+                panic!("physical count must wait for page I/O");
+            };
+            assert!(!pending.finished());
+            assert!(!pending.is_explicit_yield());
+            assert!(
+                !injector.is_empty(),
+                "merged count would consume CountProgress before page I/O"
+            );
+            conn.set_yield_injector(None);
+            let writer = db.connect();
+            writer
+                .execute("PRAGMA mvcc_checkpoint_threshold = -1")
+                .unwrap();
+            writer.execute("BEGIN CONCURRENT").unwrap();
+            if insert {
+                writer
+                    .execute("INSERT INTO t VALUES (501, 'later')")
+                    .unwrap();
+            } else {
+                writer.execute("DELETE FROM t WHERE id = 500").unwrap();
+            }
+            writer.execute("COMMIT").unwrap();
+            if passive {
+                writer.execute("PRAGMA wal_checkpoint(PASSIVE)").unwrap();
+            } else {
+                assert!(matches!(
+                    writer.execute("PRAGMA wal_checkpoint(TRUNCATE)"),
+                    Err(LimboError::Busy)
+                ));
+            }
+            let store = db.get_mvcc_store();
+            store.gc_incremental(usize::MAX);
+            store.drop_unused_row_versions();
+            pending.wait(conn.db.io.as_ref()).unwrap();
+            let actual = drive_lazy_payload_io(&conn, || cursor.count());
+            println!("passive={passive} insert={insert}: pending snapshot count={actual}");
+            assert_eq!(actual, 500);
+            let fresh = db.connect();
+            assert_eq!(
+                get_rows(&fresh, "SELECT count(*) FROM t"),
+                vec![vec![Value::from_i64(if insert { 501 } else { 499 })]]
+            );
+            drop(cursor);
+            conn.execute("ROLLBACK").unwrap();
+            writer.execute("PRAGMA wal_checkpoint(TRUNCATE)").unwrap();
+            store.gc_incremental(usize::MAX);
+            assert_eq!(
+                get_rows(&fresh, "SELECT count(*) FROM t"),
+                vec![vec![Value::from_i64(if insert { 501 } else { 499 })]]
+            );
+        }
+    }
+}
+
+#[test]
+fn test_lazy_cursor_count_keeps_abort_timing() {
+    for path in ["physical", "merged", "index"] {
+        for after_start in [false, true] {
+            let db = MvccTestDbNoConn::new();
+            let conn = db.connect();
+            conn.execute("CREATE TABLE t(id INTEGER PRIMARY KEY, v TEXT)")
+                .unwrap();
+            conn.execute("CREATE INDEX i ON t(v)").unwrap();
+            conn.execute("INSERT INTO t VALUES (1, 'one')").unwrap();
+            conn.execute("PRAGMA wal_checkpoint(TRUNCATE)").unwrap();
+            conn.execute("BEGIN CONCURRENT").unwrap();
+            let mut cursor = if path == "index" {
+                let index = conn
+                    .schema
+                    .read()
+                    .get_index(NamespaceId::ROOT, "t", "i")
+                    .unwrap()
+                    .clone();
+                let root = get_rows(&conn, "SELECT rootpage FROM sqlite_schema WHERE name = 'i'")
+                    [0][0]
+                    .as_int()
+                    .unwrap();
+                let info = Arc::new(IndexInfo::new_from_index(&index).unwrap());
+                MvccLazyCursor::new(
+                    db.get_mvcc_store(),
+                    &conn,
+                    conn.get_mv_tx_id().unwrap(),
+                    root,
+                    MvccCursorType::Index(info),
+                    Box::new(
+                        BTreeCursor::new_index(
+                            conn.pager.load().clone(),
+                            root,
+                            &index,
+                            index.columns.len(),
+                        )
+                        .unwrap(),
+                    ),
+                )
+                .unwrap()
+            } else {
+                open_lazy_payload_cursor(&db, &conn)
+            };
+            if path == "merged" {
+                let writer = db.connect();
+                writer
+                    .execute("INSERT INTO t VALUES (2, 'invisible')")
+                    .unwrap();
+            }
+            if after_start {
+                let injector = FixedYieldInjector::new([CursorYieldPoint::CountProgress.point()]);
+                conn.set_yield_injector(Some(injector.clone()));
+                let IOResult::IO(pending) = cursor.count().unwrap() else {
+                    panic!("count must yield after starting");
+                };
+                assert!(pending.is_explicit_yield());
+                assert!(injector.is_empty());
+                conn.set_yield_injector(None);
+            }
+            let store = db.get_mvcc_store();
+            let tx_id = conn.get_mv_tx_id().unwrap();
+            store
+                .txs
+                .get(&tx_id)
+                .unwrap()
+                .value()
+                .abort_now
+                .store(true, Ordering::Release);
+            let actual = drive_lazy_payload_io(&conn, || cursor.count());
+            println!("path={path} after_start={after_start}: aborted count={actual}");
+            assert_eq!(actual, 1);
+            assert!(store.tx_should_abort(tx_id));
+            conn.execute("ROLLBACK").unwrap();
+        }
+    }
+}
+
+#[cfg(feature = "io_memory_yield")]
+#[test]
+fn test_lazy_cursor_count_keeps_abort_timing_during_io() {
+    let (db, conn) = setup_lazy_count_db(true);
+    conn.execute("BEGIN CONCURRENT").unwrap();
+    let mut cursor = open_lazy_payload_cursor(&db, &conn);
+    conn.pager.load().clear_page_cache(false);
+    let IOResult::IO(pending) = cursor.count().unwrap() else {
+        panic!("count must wait for page I/O");
+    };
+    assert!(!pending.finished());
+    assert!(!pending.is_explicit_yield());
+    let store = db.get_mvcc_store();
+    store
+        .txs
+        .get(&conn.get_mv_tx_id().unwrap())
+        .unwrap()
+        .value()
+        .abort_now
+        .store(true, Ordering::Release);
+    pending.wait(conn.db.io.as_ref()).unwrap();
+    assert_eq!(drive_lazy_payload_io(&conn, || cursor.count()), 500);
+    conn.execute("ROLLBACK").unwrap();
+}
+
+#[test]
+fn test_lazy_cursor_count_rejects_exhausted_generation() {
+    let (db, conn) = setup_lazy_count_db(false);
+    conn.execute("BEGIN CONCURRENT").unwrap();
+    let mut cursor = open_lazy_payload_cursor(&db, &conn);
+    let store = db.get_mvcc_store();
+    store
+        .txs
+        .get(&conn.get_mv_tx_id().unwrap())
+        .unwrap()
+        .value()
+        .write_generation
+        .store(u64::MAX, Ordering::Release);
+    assert!(matches!(
+        *cursor.count().unwrap_err(),
+        LimboError::CommitDependencyAborted
+    ));
+    conn.execute("ROLLBACK").unwrap();
+}
+
+fn setup_lazy_count_db(yield_io: bool) -> (MvccTestDbNoConn, Arc<Connection>) {
+    setup_lazy_count_db_with_options(yield_io, DatabaseOpts::new())
+}
+
+fn setup_lazy_count_db_with_options(
+    yield_io: bool,
+    opts: DatabaseOpts,
+) -> (MvccTestDbNoConn, Arc<Connection>) {
+    let temp_dir = tempfile::TempDir::new().unwrap();
+    let path = temp_dir.path().join("count.db");
+    let io: Arc<dyn IO> = if yield_io {
+        #[cfg(not(feature = "io_memory_yield"))]
+        unreachable!();
+        #[cfg(feature = "io_memory_yield")]
+        {
+            Arc::new(crate::MemoryYieldIO::new())
+        }
+    } else {
+        Arc::new(MemoryIO::new())
+    };
+    let database = Database::open_file_with_flags(
+        io,
+        path.to_str().unwrap(),
+        OpenFlags::default(),
+        opts,
+        None,
+        Arc::new(SqliteDialect),
+    )
+    .unwrap();
+    let db = MvccTestDbNoConn {
+        db: Some(database),
+        path: Some(path.to_str().unwrap().to_string()),
+        opts,
+        enc_opts: None,
+        _temp_dir: Some(temp_dir),
+    };
+    let conn = db.connect();
+    conn.execute("PRAGMA journal_mode = 'mvcc'").unwrap();
+    conn.execute("PRAGMA mvcc_checkpoint_threshold = -1")
+        .unwrap();
+    conn.execute("CREATE TABLE t(id INTEGER PRIMARY KEY, v TEXT)")
+        .unwrap();
+    conn.execute("WITH RECURSIVE s(x) AS (VALUES(1) UNION ALL SELECT x+1 FROM s WHERE x<500) INSERT INTO t SELECT x, printf('%0200d', x) FROM s").unwrap();
+    conn.execute("PRAGMA wal_checkpoint(TRUNCATE)").unwrap();
+    (db, conn)
+}
+
 fn open_lazy_payload_cursor(
     db: &MvccTestDbNoConn,
     conn: &Arc<Connection>,
@@ -9486,6 +9910,7 @@ fn new_tx_in<A: super::RowVersionAllocator>(
         tx_id,
         begin_ts,
         write_set: Mutex::new(WriteSet::new()),
+        write_generation: AtomicU64::new(0),
         header: RwLock::new(DatabaseHeader::default()),
         header_dirty: AtomicBool::new(false),
         savepoint_stack: RwLock::new(Vec::new()),
@@ -11278,6 +11703,7 @@ fn transaction_display() {
         tx_id,
         begin_ts,
         write_set,
+        write_generation: AtomicU64::new(0),
         header: RwLock::new(DatabaseHeader::default()),
         header_dirty: AtomicBool::new(false),
         savepoint_stack: RwLock::new(Vec::new()),

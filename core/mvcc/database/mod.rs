@@ -1015,6 +1015,7 @@ pub struct Transaction<A: RowVersionAllocator = TursoAllocator> {
     begin_ts: u64,
     /// The transaction write set. Only writer is the [Transaction]'s own connection.
     write_set: Mutex<WriteSet<A>>,
+    write_generation: AtomicU64,
     /// The transaction header.
     header: RwLock<DatabaseHeader>,
     /// True when the transaction mutated its local database header snapshot.
@@ -1072,6 +1073,7 @@ impl<A: RowVersionAllocator> Transaction<A> {
             read_mark,
             schema_generation_at_begin,
             write_set: Mutex::new(WriteSet::new()),
+            write_generation: AtomicU64::new(0),
             header: RwLock::new(header),
             header_dirty: AtomicBool::new(false),
             savepoint_stack: RwLock::new(Vec::new()),
@@ -1103,6 +1105,16 @@ impl<A: RowVersionAllocator> Transaction<A> {
                 .push((id.clone(), row_versions.clone()));
         }
         self.write_set.lock().insert(id, row_versions);
+        if self
+            .write_generation
+            .fetch_update(Ordering::Release, Ordering::Relaxed, |generation| {
+                generation.checked_add(1)
+            })
+            .is_err()
+        {
+            self.abort_now.store(true, Ordering::Release);
+            panic!("transaction write generation overflow");
+        }
     }
 
     /// Begin a new savepoint for statement-level tracking.
@@ -7430,6 +7442,19 @@ impl<Clock: LogicalClock, A: ConcurrentAllocator> MvStore<Clock, A> {
     }
 
     fn rollback_savepoint_changes(&self, tx_id: TxID, savepoint: Savepoint<A>) {
+        let tx = self.txs.get(&tx_id).unwrap();
+        if tx
+            .value()
+            .write_generation
+            .fetch_update(Ordering::Release, Ordering::Relaxed, |generation| {
+                generation.checked_add(1)
+            })
+            .is_err()
+        {
+            tx.value().abort_now.store(true, Ordering::Release);
+            panic!("transaction write generation overflow");
+        }
+        drop(tx);
         let Savepoint {
             header,
             header_dirty,
@@ -10538,6 +10563,18 @@ impl<Clock: LogicalClock, A: ConcurrentAllocator> MvStore<Clock, A> {
         self.table_id_to_rootpage
             .get(table_id)
             .is_some_and(|e| e.value().materialized_at > min_reader_mark)
+    }
+
+    pub(crate) fn write_generation(&self, tx_id: TxID) -> Result<u64> {
+        let tx = self
+            .txs
+            .get(&tx_id)
+            .ok_or_else(|| LimboError::NoSuchTransactionID(tx_id.to_string()))?;
+        let generation = tx.value().write_generation.load(Ordering::Acquire);
+        if generation == u64::MAX {
+            return Err(LimboError::CommitDependencyAborted);
+        }
+        Ok(generation)
     }
 
     pub fn tx_should_abort(&self, tx_id: u64) -> bool {

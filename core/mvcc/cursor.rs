@@ -127,6 +127,7 @@ enum SeekState {
 
 #[derive(Debug, Clone, Copy)]
 enum CountState {
+    Physical { generation: u64 },
     Rewind,
     NextBtree { count: usize },
     CheckBtreeKey { count: usize },
@@ -2352,8 +2353,51 @@ impl<Clock: LogicalClock + 'static, A: ConcurrentAllocator> CursorTrait
             let state = self.count_state;
             match state {
                 None => {
-                    self.count_state.replace(CountState::Rewind);
+                    self.set_null_flag(false);
+                    let generation = self.db.write_generation(self.tx_id)?;
+                    let start = RowID::new(self.table_id, RowKey::Int(i64::MIN));
+                    let end = RowID::new(self.table_id, RowKey::Int(i64::MAX));
+                    self.count_state = Some(
+                        if matches!(self.mv_cursor_type, MvccCursorType::Table)
+                            && self.is_btree_allocated()
+                            && self.db.rows.range(start..=end).next().is_none()
+                        {
+                            self.btree_cursor.invalidate_btree_cache();
+                            CountState::Physical { generation }
+                        } else {
+                            CountState::Rewind
+                        },
+                    );
+                    if matches!(self.count_state, Some(CountState::Rewind)) {
+                        inject_io_yield!(self, CursorYieldPoint::CountProgress);
+                    }
+                }
+                Some(CountState::Physical { generation }) => {
+                    if self.db.write_generation(self.tx_id)? != generation {
+                        self.btree_cursor.invalidate_btree_cache();
+                        self.count_state = Some(CountState::Rewind);
+                        continue;
+                    }
+                    let count = return_if_io!(self.btree_cursor.count());
+                    if self.db.write_generation(self.tx_id)? != generation {
+                        self.btree_cursor.invalidate_btree_cache();
+                        self.count_state = Some(CountState::Rewind);
+                        continue;
+                    }
                     inject_io_yield!(self, CursorYieldPoint::CountProgress);
+                    self.current_pos = CursorPosition::End;
+                    self.dual_peek = DualCursorPeek {
+                        mvcc_peek: CursorPeek::Exhausted,
+                        btree_peek: CursorPeek::Exhausted,
+                    };
+                    self.table_iterator = None;
+                    self.eq_seek_row = None;
+                    self.payload_row = None;
+                    self.range_position = TableRangePosition::Untracked;
+                    self.state = None;
+                    self.count_state = None;
+                    self.invalidate_record();
+                    return Ok(IOResult::Done(count));
                 }
                 Some(CountState::Rewind) => {
                     return_if_io!(self.rewind());
