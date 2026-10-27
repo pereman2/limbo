@@ -557,6 +557,7 @@ pub struct MvccLazyCursor<Clock: LogicalClock + 'static, A: ConcurrentAllocator 
     snapshot: MvccReadSnapshot,
     /// Reusable immutable record, used to allow better allocation strategy.
     reusable_immutable_record: Option<ImmutableRecord>,
+    payload_row: Option<Row>,
     /// Eq-only table seek copies the occupying payload under the version lock.
     /// Passive GC can empty the live chain before Column.
     eq_seek_row: Option<Row>,
@@ -635,6 +636,7 @@ impl<Clock: LogicalClock + 'static, A: ConcurrentAllocator> MvccLazyCursor<Clock
             current_pos: CursorPosition::BeforeFirst,
             table_id,
             reusable_immutable_record: None,
+            payload_row: None,
             eq_seek_row: None,
             btree_readable: false,
             btree_cursor,
@@ -1625,6 +1627,31 @@ impl<Clock: LogicalClock + 'static, A: ConcurrentAllocator> CursorTrait
 
     fn record(&mut self) -> IOResultOr<Option<&crate::types::ImmutableRecord>> {
         self.current_row()
+    }
+
+    fn record_payload(&mut self) -> IOResultOr<Option<&[u8]>> {
+        if self.get_null_flag() {
+            return Ok(IOResult::Done(None));
+        }
+        if self.db.tx_should_abort(self.tx_id) {
+            return Err(LimboError::CommitDependencyAborted.into());
+        }
+        match &self.current_pos {
+            CursorPosition::Loaded { in_btree: true, .. } => self.btree_cursor.record_payload(),
+            CursorPosition::Loaded { row_id, .. } => {
+                self.payload_row = self.read_mvcc_current_row()?.or_else(|| {
+                    self.eq_seek_row
+                        .as_ref()
+                        .filter(|row| row.id == *row_id)
+                        .cloned()
+                });
+                if self.payload_row.is_none() && self.db.tx_should_abort(self.tx_id) {
+                    return Err(LimboError::CommitDependencyAborted.into());
+                }
+                Ok(IOResult::Done(self.payload_row.as_ref().map(Row::payload)))
+            }
+            CursorPosition::BeforeFirst | CursorPosition::End => Ok(IOResult::Done(None)),
+        }
     }
 
     fn seek_unpacked(&mut self, registers: &[Register], op: SeekOp) -> IOResultOr<SeekResult> {
