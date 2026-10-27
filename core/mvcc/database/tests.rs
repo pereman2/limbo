@@ -38,6 +38,7 @@ use quickcheck::{Arbitrary, Gen};
 use quickcheck_macros::quickcheck;
 use rand::{Rng, SeedableRng};
 use rand_chacha::ChaCha8Rng;
+use std::collections::BTreeMap;
 use std::sync::Arc;
 
 const TX_BASE_HEADER_SIZE: usize = 24;
@@ -7685,6 +7686,500 @@ fn test_sequence_watermark_reader_never_skips_committed_rows_fuzz() {
                 "watermark reader skipped committed id {id} (advanced last to {last}); \
                  collected={collected:?}"
             );
+        }
+    }
+}
+
+#[test]
+fn test_lazy_cursor_payload_borrows_chain_bytes() {
+    let (db, tx_id, table_id, root_page) = setup_lazy_db(&[1]);
+    let mut cursor = MvccLazyCursor::new(
+        db.mvcc_store.clone(),
+        &db.conn,
+        tx_id,
+        i64::from(table_id),
+        MvccCursorType::Table,
+        Box::new(BTreeCursor::new(db.conn.pager.load().clone(), root_page, 1)),
+    )
+    .unwrap();
+    assert!(matches!(cursor.next().unwrap(), IOResult::Done(())));
+    let row = cursor.read_mvcc_current_row().unwrap().unwrap();
+    let IOResult::Done(Some(payload)) = cursor.record_payload().unwrap() else {
+        panic!("positioned chain row must have a payload");
+    };
+    assert_eq!(payload, row.payload());
+    assert_eq!(payload.as_ptr(), row.payload().as_ptr());
+    cursor.set_null_flag(true);
+    assert!(matches!(
+        cursor.record_payload().unwrap(),
+        IOResult::Done(None)
+    ));
+    cursor.set_null_flag(false);
+    db.mvcc_store
+        .txs
+        .get(&tx_id)
+        .unwrap()
+        .value()
+        .abort_now
+        .store(true, Ordering::Release);
+    assert!(matches!(
+        *cursor.record_payload().unwrap_err(),
+        LimboError::CommitDependencyAborted
+    ));
+}
+
+#[test]
+fn test_lazy_cursor_payload_borrows_btree_bytes() {
+    let db = MvccTestDbNoConn::new();
+    let conn = db.connect();
+    conn.execute("CREATE TABLE t(id INTEGER PRIMARY KEY, v TEXT)")
+        .unwrap();
+    conn.execute("INSERT INTO t VALUES (1, 'small')").unwrap();
+    conn.execute("PRAGMA wal_checkpoint(TRUNCATE)").unwrap();
+    conn.execute("BEGIN CONCURRENT").unwrap();
+    let mut cursor = open_lazy_payload_cursor(&db, &conn);
+    drive_lazy_payload_io(&conn, || cursor.rewind());
+    let root = get_rows(&conn, "SELECT rootpage FROM sqlite_schema WHERE name = 't'")[0][0]
+        .as_int()
+        .unwrap();
+    let mut physical = BTreeCursor::new_table(conn.pager.load().clone(), root, 2);
+    drive_lazy_payload_io(&conn, || physical.rewind());
+    let physical_ptr = drive_lazy_payload_io(&conn, || {
+        physical
+            .record_payload()
+            .map(|r| r.map(|r| r.unwrap().as_ptr()))
+    });
+    let lazy_ptr = drive_lazy_payload_io(&conn, || {
+        cursor
+            .record_payload()
+            .map(|r| r.map(|r| r.unwrap().as_ptr()))
+    });
+    assert_eq!(lazy_ptr, physical_ptr);
+    conn.execute("ROLLBACK").unwrap();
+}
+
+#[test]
+fn test_lazy_cursor_payload_matches_scan_model() {
+    for layout in ["chains", "btree", "mixed"] {
+        for seed in 0..4 {
+            let db = MvccTestDbNoConn::new_with_random_db_passive();
+            let writer = db.connect();
+            writer
+                .execute("PRAGMA mvcc_checkpoint_threshold = -1")
+                .unwrap();
+            writer
+                .execute("CREATE TABLE t(id INTEGER PRIMARY KEY, v TEXT)")
+                .unwrap();
+            let mut model = BTreeMap::new();
+            for id in 1..=16 {
+                let value = format!(
+                    "row{id}-{}",
+                    "x".repeat(if id % 3 == 0 { 10000 } else { 8 })
+                );
+                writer
+                    .execute(format!("INSERT INTO t VALUES ({id}, '{value}')"))
+                    .unwrap();
+                model.insert(id, value);
+            }
+            if layout != "chains" {
+                writer.execute("PRAGMA wal_checkpoint(TRUNCATE)").unwrap();
+            }
+            let mut rng = ChaCha8Rng::seed_from_u64(seed);
+            if layout == "mixed" {
+                for _ in 0..24 {
+                    let id = rng.random_range(1..=20);
+                    if rng.random_bool(0.3) {
+                        writer
+                            .execute(format!("DELETE FROM t WHERE id = {id}"))
+                            .unwrap();
+                        model.remove(&id);
+                    } else {
+                        let value =
+                            format!("updated-{id}-{}", "y".repeat(rng.random_range(1..6000)));
+                        writer
+                            .execute(format!("INSERT OR REPLACE INTO t VALUES ({id}, '{value}')"))
+                            .unwrap();
+                        model.insert(id, value);
+                    }
+                }
+            }
+            let reader = db.connect();
+            reader.execute("BEGIN CONCURRENT").unwrap();
+            get_rows(&reader, "SELECT * FROM t LIMIT 1");
+            writer.execute("BEGIN CONCURRENT").unwrap();
+            writer
+                .execute("UPDATE t SET v = 'invisible' WHERE id % 2 = 0")
+                .unwrap();
+            let expected: Vec<_> = model.iter().map(|(id, v)| (*id, v.clone())).collect();
+            assert_eq!(scan_lazy_cursor_payload(&db, &reader, false), expected);
+            writer.execute("COMMIT").unwrap();
+            writer.execute("PRAGMA wal_checkpoint(PASSIVE)").unwrap();
+            db.get_mvcc_store().gc_incremental(usize::MAX);
+            assert_eq!(scan_lazy_cursor_payload(&db, &reader, false), expected);
+            assert_eq!(
+                scan_lazy_cursor_payload(&db, &reader, true),
+                expected.iter().rev().cloned().collect::<Vec<_>>()
+            );
+            reader.execute("INSERT INTO t VALUES (30, 'own')").unwrap();
+            model.insert(30, "own".to_string());
+            assert_eq!(
+                scan_lazy_cursor_payload(&db, &reader, false),
+                model.into_iter().collect::<Vec<_>>()
+            );
+            reader.execute("ROLLBACK").unwrap();
+        }
+    }
+}
+
+#[test]
+fn test_lazy_cursor_payload_follows_writes_and_rollback() {
+    let db = MvccTestDbNoConn::new();
+    let conn = db.connect();
+    conn.execute("CREATE TABLE t(id INTEGER PRIMARY KEY, v TEXT)")
+        .unwrap();
+    conn.execute("INSERT INTO t VALUES (1, 'original')")
+        .unwrap();
+    conn.execute("BEGIN CONCURRENT").unwrap();
+    let mut cursor = open_lazy_payload_cursor(&db, &conn);
+    drive_lazy_payload_io(&conn, || cursor.rewind());
+    conn.execute("SAVEPOINT s").unwrap();
+    let IOResult::Done(Some(original)) = cursor.record_payload().unwrap() else {
+        panic!("chain row must have a payload");
+    };
+    conn.execute("UPDATE t SET v = 'changed' WHERE id = 1")
+        .unwrap();
+    assert_eq!(payload_text(original), "original");
+    conn.execute("ROLLBACK TO s").unwrap();
+    assert_eq!(payload_text(original), "original");
+    let IOResult::Done(Some(restored)) = cursor.record_payload().unwrap() else {
+        panic!("rolled-back update must restore the payload");
+    };
+    assert_eq!(payload_text(restored), "original");
+    conn.execute("UPDATE t SET v = 'changed again' WHERE id = 1")
+        .unwrap();
+    let IOResult::Done(Some(changed)) = cursor.record_payload().unwrap() else {
+        panic!("updated row must have a payload");
+    };
+    conn.execute("ROLLBACK TO s").unwrap();
+    assert_eq!(payload_text(changed), "changed again");
+    let IOResult::Done(Some(restored)) = cursor.record_payload().unwrap() else {
+        panic!("rolled-back update must restore the payload");
+    };
+    assert_eq!(payload_text(restored), "original");
+    let record =
+        ImmutableRecord::from_values(&[Value::Null, Value::build_text("inserted")], 2).unwrap();
+    drive_lazy_payload_io(&conn, || {
+        cursor.insert(&BTreeKey::new_table_rowid(2, Some(&record)))
+    });
+    assert_eq!(
+        lazy_payload_bytes(&conn, &mut cursor).unwrap(),
+        record.get_payload()
+    );
+    drive_lazy_payload_io(&conn, || cursor.delete());
+    assert!(lazy_payload_bytes(&conn, &mut cursor).is_none());
+    conn.execute("ROLLBACK").unwrap();
+}
+
+#[test]
+fn test_lazy_cursor_payload_sees_own_writes_ahead_of_scan() {
+    let db = MvccTestDbNoConn::new();
+    let conn = db.connect();
+    conn.execute("CREATE TABLE t(id INTEGER PRIMARY KEY, v TEXT)")
+        .unwrap();
+    conn.execute("INSERT INTO t VALUES (1, 'first'), (2, 'second')")
+        .unwrap();
+    conn.execute("BEGIN CONCURRENT").unwrap();
+    let mut cursor = open_lazy_payload_cursor(&db, &conn);
+    drive_lazy_payload_io(&conn, || cursor.rewind());
+    assert_eq!(drive_lazy_payload_io(&conn, || cursor.rowid()), Some(1));
+    let first = lazy_payload_bytes(&conn, &mut cursor).unwrap();
+    assert_eq!(payload_text(&first), "first");
+    conn.execute("INSERT INTO t VALUES (3, 'own')").unwrap();
+    let mut remaining = Vec::new();
+    loop {
+        drive_lazy_payload_io(&conn, || cursor.next());
+        let Some(rowid) = drive_lazy_payload_io(&conn, || cursor.rowid()) else {
+            break;
+        };
+        let payload = lazy_payload_bytes(&conn, &mut cursor).unwrap();
+        remaining.push((rowid, payload_text(&payload)));
+    }
+    assert_eq!(
+        remaining,
+        vec![(2, "second".to_string()), (3, "own".to_string())]
+    );
+    assert!(lazy_payload_bytes(&conn, &mut cursor).is_none());
+    conn.execute("ROLLBACK").unwrap();
+}
+
+#[test]
+fn test_lazy_cursor_payload_columns_defaults_and_null_rows() {
+    for checkpoint in [false, true] {
+        let db = MvccTestDbNoConn::new();
+        let conn = db.connect();
+        conn.execute("CREATE TABLE t(id INTEGER PRIMARY KEY, v TEXT)")
+            .unwrap();
+        conn.execute("INSERT INTO t VALUES (1, 'small'), (2, printf('%10000s', 'large'))")
+            .unwrap();
+        if checkpoint {
+            conn.execute("PRAGMA wal_checkpoint(TRUNCATE)").unwrap();
+        }
+        conn.execute("ALTER TABLE t ADD COLUMN n INTEGER DEFAULT 42")
+            .unwrap();
+        let rows = get_rows(&conn, "SELECT v, n FROM t ORDER BY id");
+        assert_eq!(
+            rows[0],
+            vec![Value::build_text("small"), Value::from_i64(42)]
+        );
+        assert_eq!(rows[1][0].to_text().unwrap().len(), 10000);
+        assert_eq!(rows[1][1], Value::from_i64(42));
+        assert_eq!(
+            get_rows(&conn, "SELECT n, v, n FROM t WHERE id = 1"),
+            vec![vec![
+                Value::from_i64(42),
+                Value::build_text("small"),
+                Value::from_i64(42)
+            ]]
+        );
+        assert_eq!(
+            get_rows(&conn, "SELECT b.v, b.n FROM t a LEFT JOIN t b ON b.id = 99"),
+            vec![vec![Value::Null, Value::Null]; 2]
+        );
+    }
+}
+
+#[test]
+fn test_lazy_cursor_payload_reports_decode_errors() {
+    for sql in ["SELECT v FROM t", "SELECT v, n FROM t"] {
+        let db = MvccTestDbNoConn::new();
+        let conn = db.connect();
+        conn.execute("CREATE TABLE t(id INTEGER PRIMARY KEY, v TEXT, n TEXT)")
+            .unwrap();
+        conn.execute("BEGIN CONCURRENT").unwrap();
+        let mut cursor = open_lazy_payload_cursor(&db, &conn);
+        let table_id = db.get_mvcc_store().get_table_id_from_root_page(
+            get_rows(&conn, "SELECT rootpage FROM sqlite_schema WHERE name = 't'")[0][0]
+                .as_int()
+                .unwrap(),
+        );
+        db.get_mvcc_store()
+            .insert(
+                conn.get_mv_tx_id().unwrap(),
+                Row::new_table_row(RowID::new(table_id, RowKey::Int(1)), &[20]).unwrap(),
+            )
+            .unwrap();
+        drive_lazy_payload_io(&conn, || cursor.rewind());
+        let payload = lazy_payload_bytes(&conn, &mut cursor).unwrap();
+        assert!(matches!(
+            crate::types::ValueIterator::new(&payload),
+            Err(LimboError::Corrupt(_))
+        ));
+        let mut stmt = conn.prepare(sql).unwrap();
+        let error = loop {
+            match stmt.step() {
+                Err(error) => break error,
+                Ok(StepResult::IO | StepResult::Yield) => stmt._io().step().unwrap(),
+                other => panic!("expected decoding error for {sql}, got {other:?}"),
+            }
+        };
+        assert!(matches!(error, LimboError::Corrupt(_)));
+        drop(stmt);
+        assert!(conn.get_mv_tx_id().is_none());
+    }
+}
+
+#[test]
+fn test_lazy_cursor_payload_resumes_yields_and_drops_after_chain_read() {
+    let db = MvccTestDbNoConn::new();
+    let conn = db.connect();
+    conn.execute("CREATE TABLE t(id INTEGER PRIMARY KEY, v TEXT)")
+        .unwrap();
+    conn.execute("INSERT INTO t VALUES (1, 'a'), (2, 'b'), (3, 'c')")
+        .unwrap();
+    conn.execute("PRAGMA wal_checkpoint(TRUNCATE)").unwrap();
+    conn.execute("UPDATE t SET v = 'updated' WHERE id = 2")
+        .unwrap();
+    for abandon in [false, true] {
+        let injector = FixedYieldInjector::new([CursorYieldPoint::NextStart.point()]);
+        conn.set_yield_injector(Some(injector.clone()));
+        let mut stmt = conn.prepare("SELECT v FROM t ORDER BY id").unwrap();
+        let mut values = Vec::new();
+        loop {
+            match stmt.step().unwrap() {
+                StepResult::Row => {
+                    values.push(stmt.row().unwrap().get_value(0).clone());
+                    if abandon && values.len() == 2 {
+                        break;
+                    }
+                }
+                StepResult::IO | StepResult::Yield => stmt._io().step().unwrap(),
+                StepResult::Done => break,
+                other => panic!("unexpected result {other:?}"),
+            }
+        }
+        assert!(injector.is_empty());
+        let mut expected = vec![Value::build_text("a"), Value::build_text("updated")];
+        if !abandon {
+            expected.push(Value::build_text("c"));
+        }
+        assert_eq!(values, expected);
+        drop(stmt);
+        conn.set_yield_injector(None);
+        conn.execute("UPDATE t SET v = v WHERE id = 1").unwrap();
+        assert_eq!(
+            get_rows(&conn, "SELECT v FROM t WHERE id = 2"),
+            vec![vec![Value::build_text("updated")]]
+        );
+    }
+}
+
+#[cfg(feature = "io_memory_yield")]
+#[test]
+fn test_lazy_cursor_payload_resumes_and_drops_overflow_io() {
+    let temp_dir = tempfile::TempDir::new().unwrap();
+    let path = temp_dir.path().join("payload.db");
+    let io = Arc::new(crate::MemoryYieldIO::new());
+    let database =
+        Database::open_file(io, path.to_str().unwrap(), Arc::new(SqliteDialect)).unwrap();
+    let conn = database.connect(ConnectOpts::new()).unwrap();
+    conn.execute("PRAGMA journal_mode = 'mvcc'").unwrap();
+    let db = MvccTestDbNoConn {
+        db: Some(database),
+        path: Some(path.to_str().unwrap().to_string()),
+        opts: DatabaseOpts::new(),
+        enc_opts: None,
+        _temp_dir: Some(temp_dir),
+    };
+    conn.execute("CREATE TABLE t(id INTEGER PRIMARY KEY, v TEXT)")
+        .unwrap();
+    let expected = "overflow".repeat(4000);
+    conn.execute(format!("INSERT INTO t VALUES (1, '{expected}')"))
+        .unwrap();
+    conn.execute("PRAGMA wal_checkpoint(TRUNCATE)").unwrap();
+    for abandon in [false, true] {
+        conn.execute("BEGIN CONCURRENT").unwrap();
+        conn.pager.load().clear_page_cache(false);
+        let mut cursor = open_lazy_payload_cursor(&db, &conn);
+        drive_lazy_payload_io(&conn, || cursor.rewind());
+        assert_eq!(drive_lazy_payload_io(&conn, || cursor.rowid()), Some(1));
+        let IOResult::IO(pending) = cursor.record_payload().unwrap() else {
+            panic!("overflow payload must wait for I/O");
+        };
+        assert!(!pending.finished());
+        assert!(!pending.is_explicit_yield());
+        if abandon {
+            drop(cursor);
+            assert!(!pending.finished());
+            pending.wait(conn.db.io.as_ref()).unwrap();
+            cursor = open_lazy_payload_cursor(&db, &conn);
+            drive_lazy_payload_io(&conn, || cursor.rewind());
+        } else {
+            pending.wait(conn.db.io.as_ref()).unwrap();
+        }
+        let payload = lazy_payload_bytes(&conn, &mut cursor).unwrap();
+        assert_eq!(payload_text(&payload), expected);
+        drop(cursor);
+        conn.execute("ROLLBACK").unwrap();
+    }
+}
+
+fn scan_lazy_cursor_payload(
+    db: &MvccTestDbNoConn,
+    conn: &Arc<Connection>,
+    backwards: bool,
+) -> Vec<(i64, String)> {
+    let mut cursor = open_lazy_payload_cursor(db, conn);
+    if backwards {
+        drive_lazy_payload_io(conn, || cursor.last());
+    } else {
+        drive_lazy_payload_io(conn, || cursor.rewind());
+    }
+    let mut rows = Vec::new();
+    while let Some(rowid) = drive_lazy_payload_io(conn, || cursor.rowid()) {
+        let payload = lazy_payload_bytes(conn, &mut cursor).unwrap();
+        let record = drive_lazy_payload_io(conn, || {
+            cursor
+                .record()
+                .map(|r| r.map(|r| r.unwrap().get_payload().to_vec()))
+        });
+        assert_eq!(payload, record);
+        let value = crate::types::ValueIterator::new(&payload)
+            .unwrap()
+            .nth(1)
+            .unwrap()
+            .unwrap()
+            .to_text()
+            .unwrap()
+            .to_string();
+        rows.push((rowid, value));
+        if backwards {
+            drive_lazy_payload_io(conn, || cursor.prev());
+        } else {
+            drive_lazy_payload_io(conn, || cursor.next());
+        }
+    }
+    assert!(lazy_payload_bytes(conn, &mut cursor).is_none());
+    rows
+}
+
+fn payload_text(payload: &[u8]) -> String {
+    crate::types::ValueIterator::new(payload)
+        .unwrap()
+        .nth(1)
+        .unwrap()
+        .unwrap()
+        .to_text()
+        .unwrap()
+        .to_string()
+}
+
+fn open_lazy_payload_cursor(
+    db: &MvccTestDbNoConn,
+    conn: &Arc<Connection>,
+) -> MvccLazyCursor<MvccClock, crate::alloc::DynAllocator> {
+    let store = db.get_mvcc_store();
+    let root = get_rows(conn, "SELECT rootpage FROM sqlite_schema WHERE name = 't'")[0][0]
+        .as_int()
+        .unwrap();
+    let physical_root = if root < 0 {
+        store.get_real_table_id(root)
+    } else {
+        root
+    };
+    MvccLazyCursor::new(
+        store,
+        conn,
+        conn.get_mv_tx_id().unwrap(),
+        root,
+        MvccCursorType::Table,
+        Box::new(BTreeCursor::new_table(
+            conn.pager.load().clone(),
+            physical_root,
+            2,
+        )),
+    )
+    .unwrap()
+}
+
+fn lazy_payload_bytes(
+    conn: &Arc<Connection>,
+    cursor: &mut MvccLazyCursor<MvccClock, crate::alloc::DynAllocator>,
+) -> Option<Vec<u8>> {
+    drive_lazy_payload_io(conn, || {
+        cursor
+            .record_payload()
+            .map(|r| r.map(|payload| payload.map(<[u8]>::to_vec)))
+    })
+}
+
+fn drive_lazy_payload_io<T>(
+    conn: &Arc<Connection>,
+    mut operation: impl FnMut() -> crate::types::IOResultOr<T>,
+) -> T {
+    loop {
+        match operation().unwrap() {
+            IOResult::Done(value) => return value,
+            IOResult::IO(io) => io.wait(conn.db.io.as_ref()).unwrap(),
         }
     }
 }
