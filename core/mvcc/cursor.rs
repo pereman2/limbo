@@ -83,6 +83,15 @@ enum RewindState {
 }
 
 #[derive(Debug, Clone, Copy)]
+#[repr(u8)]
+enum TableRangePosition {
+    Untracked,
+    Forwards,
+    Backwards,
+    Point,
+}
+
+#[derive(Debug, Clone, Copy)]
 enum NextState {
     AdvanceUnitialized,
     CheckNeedsAdvance,
@@ -558,6 +567,7 @@ pub struct MvccLazyCursor<Clock: LogicalClock + 'static, A: ConcurrentAllocator 
     /// Reusable immutable record, used to allow better allocation strategy.
     reusable_immutable_record: Option<ImmutableRecord>,
     payload_row: Option<Row>,
+    range_position: TableRangePosition,
     /// Eq-only table seek copies the occupying payload under the version lock.
     /// Passive GC can empty the live chain before Column.
     eq_seek_row: Option<Row>,
@@ -637,6 +647,7 @@ impl<Clock: LogicalClock + 'static, A: ConcurrentAllocator> MvccLazyCursor<Clock
             table_id,
             reusable_immutable_record: None,
             payload_row: None,
+            range_position: TableRangePosition::Untracked,
             eq_seek_row: None,
             btree_readable: false,
             btree_cursor,
@@ -1196,6 +1207,7 @@ impl<Clock: LogicalClock + 'static, A: ConcurrentAllocator> MvccLazyCursor<Clock
         self.dual_peek = DualCursorPeek::default();
         self.index_peek_epoch = self.db.index_rows_epoch();
         self.eq_seek_row = None;
+        self.range_position = TableRangePosition::Untracked;
         // The forward scan is monotonic; a reposition invalidates it.
         self.index_shadow_scan.reset();
     }
@@ -1404,9 +1416,35 @@ impl<Clock: LogicalClock + 'static, A: ConcurrentAllocator> CursorTrait
     }
 
     /// Move the cursor to the next row. Returns true if the cursor moved to the next row, false if the cursor is at the end of the table.
-    ///
-    /// Uses dual-cursor approach: only advances the cursor that was just consumed.
     fn next(&mut self) -> IOResultOr<()> {
+        if matches!(
+            self.range_position,
+            TableRangePosition::Backwards | TableRangePosition::Point
+        ) {
+            let result = match &self.current_pos {
+                CursorPosition::Loaded {
+                    row_id:
+                        RowID {
+                            row_id: RowKey::Int(rowid),
+                            ..
+                        },
+                    ..
+                } => self
+                    .seek(SeekKey::TableRowId(*rowid), SeekOp::GT)
+                    .map(|result| result.map(|_| ())),
+                CursorPosition::BeforeFirst => self.rewind(),
+                CursorPosition::End => Ok(IOResult::Done(())),
+                CursorPosition::Loaded { .. } => {
+                    unreachable!("range continuation requires a table row position")
+                }
+            };
+            self.range_position = match &result {
+                Ok(IOResult::IO(_)) => TableRangePosition::Point,
+                Ok(IOResult::Done(_)) => TableRangePosition::Forwards,
+                Err(_) => TableRangePosition::Untracked,
+            };
+            return result;
+        }
         if self.state.is_none() {
             // If BeforeFirst and peek not initialized, initialize the iterators and peek values
             if matches!(self.current_pos, CursorPosition::BeforeFirst) {
@@ -1500,9 +1538,35 @@ impl<Clock: LogicalClock + 'static, A: ConcurrentAllocator> CursorTrait
     }
 
     /// Move the cursor to the previous row. Returns true if the cursor moved, false if at the beginning.
-    ///
-    /// Uses dual-cursor approach: only advances the cursor that was just consumed.
     fn prev(&mut self) -> IOResultOr<()> {
+        if matches!(
+            self.range_position,
+            TableRangePosition::Forwards | TableRangePosition::Point
+        ) {
+            let result = match &self.current_pos {
+                CursorPosition::Loaded {
+                    row_id:
+                        RowID {
+                            row_id: RowKey::Int(rowid),
+                            ..
+                        },
+                    ..
+                } => self
+                    .seek(SeekKey::TableRowId(*rowid), SeekOp::LT)
+                    .map(|result| result.map(|_| ())),
+                CursorPosition::End => self.last(),
+                CursorPosition::BeforeFirst => Ok(IOResult::Done(())),
+                CursorPosition::Loaded { .. } => {
+                    unreachable!("range continuation requires a table row position")
+                }
+            };
+            self.range_position = match &result {
+                Ok(IOResult::IO(_)) => TableRangePosition::Point,
+                Ok(IOResult::Done(_)) => TableRangePosition::Backwards,
+                Err(_) => TableRangePosition::Untracked,
+            };
+            return result;
+        }
         if self.state.is_none() {
             // If End and peek not initialized, initialize via last()
             if matches!(self.current_pos, CursorPosition::End) {
@@ -1879,6 +1943,13 @@ impl<Clock: LogicalClock + 'static, A: ConcurrentAllocator> CursorTrait
                                 }
                             };
                             if found {
+                                self.range_position = if self.table_iterator.is_none()
+                                    && matches!(seek_key, SeekKey::TableRowId(_))
+                                {
+                                    TableRangePosition::Point
+                                } else {
+                                    TableRangePosition::Untracked
+                                };
                                 return Ok(IOResult::Done(SeekResult::Found));
                             } else {
                                 return Ok(IOResult::Done(SeekResult::NotFound));
@@ -2074,9 +2145,6 @@ impl<Clock: LogicalClock + 'static, A: ConcurrentAllocator> CursorTrait
             };
             let inclusive = true;
 
-            // Check MVCC first. This is a point existence probe, so it is
-            // eq-only: bound the skiplist walk to the single rowid instead of
-            // scanning forward over invisible concurrent rows.
             let rowid = self.db.seek_rowid(
                 RowID {
                     table_id: self.table_id,
@@ -2119,6 +2187,7 @@ impl<Clock: LogicalClock + 'static, A: ConcurrentAllocator> CursorTrait
                     in_btree: false,
                     versions: Some(versions),
                 };
+                self.range_position = TableRangePosition::Point;
                 self.state = None;
                 return Ok(IOResult::Done(true));
             }
@@ -2181,6 +2250,7 @@ impl<Clock: LogicalClock + 'static, A: ConcurrentAllocator> CursorTrait
                     in_btree: true,
                     versions: None,
                 };
+                self.range_position = TableRangePosition::Point;
                 self.state = None;
                 Ok(IOResult::Done(true))
             } else {
