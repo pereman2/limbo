@@ -4451,6 +4451,8 @@ pub struct MvStore<Clock: LogicalClock, A: ConcurrentAllocator = TursoAllocator>
     pub(crate) cursor_physical_advances: AtomicU64,
     #[cfg(test)]
     pub(crate) cursor_table_generation_reads: AtomicU64,
+    #[cfg(test)]
+    pub(crate) btree_validity_tx_lookups: AtomicU64,
     /// Final state for removed transactions. Readers may still race with stale TxID
     /// references in row versions after a transaction is removed from `txs`.
     finalized_tx_states: SkipMap<TxID, TransactionState, BasicComparator, A>,
@@ -4696,6 +4698,8 @@ impl<Clock: LogicalClock, A: ConcurrentAllocator> MvStore<Clock, A> {
             cursor_physical_advances: AtomicU64::new(0),
             #[cfg(test)]
             cursor_table_generation_reads: AtomicU64::new(0),
+            #[cfg(test)]
+            btree_validity_tx_lookups: AtomicU64::new(0),
             finalized_tx_states: SkipMap::new_in(alloc.clone()),
             checkpoint_dirty_table_keys: SkipMap::new_in(alloc.clone()),
             checkpoint_dirty_index_keys: SkipMap::new_in(alloc.clone()),
@@ -6148,6 +6152,32 @@ impl<Clock: LogicalClock, A: ConcurrentAllocator> MvStore<Clock, A> {
         row_id: &RowKey,
         tx_id: TxID,
     ) -> Result<bool> {
+        self.with_btree_row_chain(table_id, row_id, |versions| {
+            self.chain_leaves_btree_row_valid(tx_id, table_id, versions)
+        })
+    }
+
+    pub(crate) fn cursor_btree_row_is_valid(
+        &self,
+        cursor_transaction: &CursorTransaction<Clock, A>,
+        table_id: MVTableId,
+        row_id: &RowKey,
+        tx_id: TxID,
+    ) -> Result<bool> {
+        self.with_btree_row_chain(table_id, row_id, |versions| {
+            let tx = cursor_transaction
+                .live_transaction()
+                .ok_or_else(|| LimboError::NoSuchTransactionID(tx_id.to_string()))?;
+            Ok(self.transaction_leaves_btree_row_valid(tx, table_id, versions))
+        })
+    }
+
+    fn with_btree_row_chain(
+        &self,
+        table_id: MVTableId,
+        row_id: &RowKey,
+        chain_leaves_row_valid: impl FnOnce(&[RowVersion]) -> Result<bool>,
+    ) -> Result<bool> {
         match row_id {
             RowKey::Int(_) => {
                 let row_id_full = RowID {
@@ -6159,7 +6189,7 @@ impl<Clock: LogicalClock, A: ConcurrentAllocator> MvStore<Clock, A> {
                     return Ok(true);
                 };
                 let versions = versions.value().read();
-                self.chain_leaves_btree_row_valid(tx_id, table_id, &versions)
+                chain_leaves_row_valid(&versions)
             }
             RowKey::Record(record) => {
                 // Dont allocate new SkipList here to avoid introducing concerns around error handling
@@ -6172,7 +6202,7 @@ impl<Clock: LogicalClock, A: ConcurrentAllocator> MvStore<Clock, A> {
                     return Ok(true);
                 };
                 let versions = versions.value().read();
-                self.chain_leaves_btree_row_valid(tx_id, table_id, &versions)
+                chain_leaves_row_valid(&versions)
             }
         }
     }
@@ -6183,13 +6213,24 @@ impl<Clock: LogicalClock, A: ConcurrentAllocator> MvStore<Clock, A> {
         table_id: MVTableId,
         versions: &[RowVersion],
     ) -> Result<bool> {
+        #[cfg(test)]
+        self.btree_validity_tx_lookups
+            .fetch_add(1, Ordering::Relaxed);
         let tx = self
             .txs
             .get(&tx_id)
             .ok_or_else(|| LimboError::NoSuchTransactionID(tx_id.to_string()))?;
-        let tx = tx.value();
+        Ok(self.transaction_leaves_btree_row_valid(tx.value(), table_id, versions))
+    }
+
+    fn transaction_leaves_btree_row_valid(
+        &self,
+        tx: &Transaction<A>,
+        table_id: MVTableId,
+        versions: &[RowVersion],
+    ) -> bool {
         if self.btree_covers_chain_for_tx(tx, table_id, versions) {
-            return Ok(true);
+            return true;
         }
 
         // Check if any version invalidates the B-tree row
@@ -6197,7 +6238,7 @@ impl<Clock: LogicalClock, A: ConcurrentAllocator> MvStore<Clock, A> {
             version.is_btree_invalidating_version(tx, &self.txs, &self.finalized_tx_states)
         });
 
-        Ok(!btree_is_invalid)
+        !btree_is_invalid
     }
 
     fn find_visible_version<'a>(
@@ -11365,5 +11406,9 @@ impl<Clock: LogicalClock, A: ConcurrentAllocator> CursorTransaction<Clock, A> {
 
     pub(crate) fn is_removed(&self) -> bool {
         self.transaction.is_removed()
+    }
+
+    fn live_transaction(&self) -> Option<&Transaction<A>> {
+        (!self.transaction.is_removed()).then(|| self.transaction.value())
     }
 }

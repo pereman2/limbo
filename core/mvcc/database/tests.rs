@@ -8757,6 +8757,68 @@ fn test_lazy_cursor_transaction_reads_without_abort_lookup() {
 }
 
 #[test]
+fn test_lazy_cursor_shadowed_rows_without_transaction_lookup() {
+    let mut lookups = Vec::new();
+    for backwards in [false, true] {
+        let (db, conn) = setup_lazy_shadowed_physical_rows();
+        let store = db.get_mvcc_store();
+        let mut cursor = open_lazy_payload_cursor(&db, &conn);
+        store.btree_validity_tx_lookups.store(0, Ordering::Relaxed);
+        if backwards {
+            drive_lazy_payload_io(&conn, || cursor.last());
+        } else {
+            drive_lazy_payload_io(&conn, || cursor.rewind());
+        }
+        let rows = collect_lazy_write_scan(&conn, &mut cursor, backwards);
+        let mut expected: Vec<_> = [(1, "one"), (2, "two-new"), (3, "three-new"), (4, "four")]
+            .into_iter()
+            .map(|(id, v)| (id, v.to_string()))
+            .collect();
+        if backwards {
+            expected.reverse();
+        }
+        assert_eq!(rows, expected, "backwards={backwards}");
+        lookups.push(store.btree_validity_tx_lookups.load(Ordering::Relaxed));
+        conn.execute("ROLLBACK").unwrap();
+    }
+    assert_eq!(lookups, [0, 0]);
+}
+
+#[test]
+fn test_lazy_cursor_shadowed_row_after_transaction_removal() {
+    let (db, conn) = setup_lazy_shadowed_physical_rows();
+    let mut cursor = open_lazy_payload_cursor(&db, &conn);
+    drive_lazy_payload_io(&conn, || cursor.rewind());
+    assert_eq!(drive_lazy_payload_io(&conn, || cursor.rowid()), Some(1));
+    conn.execute("ROLLBACK").unwrap();
+    let err = loop {
+        match cursor.next() {
+            Ok(IOResult::Done(())) => panic!("next must fail without its transaction"),
+            Ok(IOResult::IO(io)) => io.wait(conn.db.io.as_ref()).unwrap(),
+            Err(err) => break err,
+        }
+    };
+    assert!(
+        matches!(*err, LimboError::NoSuchTransactionID(_)),
+        "{err:?}"
+    );
+}
+
+fn setup_lazy_shadowed_physical_rows() -> (MvccTestDbNoConn, Arc<Connection>) {
+    let db = MvccTestDbNoConn::new();
+    let conn = db.connect();
+    conn.execute("CREATE TABLE t(id INTEGER PRIMARY KEY, v TEXT)")
+        .unwrap();
+    conn.execute("INSERT INTO t VALUES (1, 'one'), (2, 'two'), (3, 'three'), (4, 'four')")
+        .unwrap();
+    conn.execute("PRAGMA wal_checkpoint(TRUNCATE)").unwrap();
+    conn.execute("UPDATE t SET v = v || '-new' WHERE id IN (2, 3)")
+        .unwrap();
+    conn.execute("BEGIN CONCURRENT").unwrap();
+    (db, conn)
+}
+
+#[test]
 fn test_lazy_cursor_transaction_abort_mid_scan() {
     for checkpoint in [false, true] {
         let db = MvccTestDbNoConn::new();

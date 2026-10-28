@@ -888,8 +888,12 @@ impl<Clock: LogicalClock + 'static, A: ConcurrentAllocator> MvccLazyCursor<Clock
                 .cursor_physical_visits
                 .fetch_add(1, crate::sync::atomic::Ordering::Relaxed);
         }
-        self.db
-            .query_btree_version_is_valid(self.table_id, key, self.snapshot.tx_id)
+        self.db.cursor_btree_row_is_valid(
+            &self.transaction,
+            self.table_id,
+            key,
+            self.snapshot.tx_id,
+        )
     }
 
     /// Advance MVCC iterator and return next visible row key in the direction that the iterator was initialized in.
