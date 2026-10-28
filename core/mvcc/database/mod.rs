@@ -1013,7 +1013,6 @@ pub struct Transaction<A: RowVersionAllocator = TursoAllocator> {
     tx_id: u64,
     /// The transaction begin timestamp.
     begin_ts: u64,
-    /// The transaction write set. Only writer is the [Transaction]'s own connection.
     write_set: Mutex<WriteSet<A>>,
     write_generation: AtomicU64,
     /// The transaction header.
@@ -4434,6 +4433,8 @@ pub struct MvStore<Clock: LogicalClock, A: ConcurrentAllocator = TursoAllocator>
     /// `MvccLazyCursor` seeks its next MVCC index entry again.
     index_rows_epoch: AtomicU64,
     txs: SkipMap<TxID, Transaction<A>, BasicComparator, A>,
+    #[cfg(test)]
+    tx_abort_lookups: AtomicU64,
     /// Final state for removed transactions. Readers may still race with stale TxID
     /// references in row versions after a transaction is removed from `txs`.
     finalized_tx_states: SkipMap<TxID, TransactionState, BasicComparator, A>,
@@ -4669,6 +4670,8 @@ impl<Clock: LogicalClock, A: ConcurrentAllocator> MvStore<Clock, A> {
             index_rows: SkipMap::new_in(alloc.clone()),
             index_rows_epoch: AtomicU64::new(0),
             txs: SkipMap::new_in(alloc.clone()),
+            #[cfg(test)]
+            tx_abort_lookups: AtomicU64::new(0),
             finalized_tx_states: SkipMap::new_in(alloc.clone()),
             checkpoint_dirty_table_keys: SkipMap::new_in(alloc.clone()),
             checkpoint_dirty_index_keys: SkipMap::new_in(alloc.clone()),
@@ -6823,6 +6826,9 @@ impl<Clock: LogicalClock, A: ConcurrentAllocator> MvStore<Clock, A> {
                 { "tx_id": tx_id }
             );
             self.txs.remove(&tx_id);
+            drop(tx.write_set.lock().take());
+            drop(std::mem::take(&mut *tx.savepoint_stack.write()));
+            drop(std::mem::take(&mut *tx.created_table_ids.lock()));
             if held_checkpoint_read {
                 self.blocking_checkpoint_lock.unlock();
             }
@@ -10578,11 +10584,29 @@ impl<Clock: LogicalClock, A: ConcurrentAllocator> MvStore<Clock, A> {
     }
 
     pub fn tx_should_abort(&self, tx_id: u64) -> bool {
+        #[cfg(test)]
+        self.tx_abort_lookups.fetch_add(1, Ordering::Relaxed);
         if let Some(tx) = self.txs.get(&tx_id) {
             tx.value().abort_now.load(Ordering::Acquire)
         } else {
             false
         }
+    }
+
+    pub(crate) fn cursor_transaction(
+        self: &Arc<Self>,
+        tx_id: TxID,
+    ) -> Result<Box<CursorTransaction<Clock, A>>> {
+        let entry = self
+            .txs
+            .get(&tx_id)
+            .ok_or_else(|| LimboError::NoSuchTransactionID(tx_id.to_string()))?;
+        let transaction =
+            unsafe { std::mem::transmute::<TxEntry<'_, A>, TxEntry<'static, A>>(entry) };
+        Ok(Box::new(CursorTransaction {
+            transaction,
+            _store: self.clone(),
+        }))
     }
 }
 
@@ -11252,5 +11276,19 @@ impl Ord for RowID {
             std::cmp::Ordering::Equal => self.row_id.cmp(&other.row_id),
             ord => ord,
         }
+    }
+}
+
+pub(crate) struct CursorTransaction<
+    Clock: LogicalClock + 'static,
+    A: ConcurrentAllocator = TursoAllocator,
+> {
+    transaction: TxEntry<'static, A>,
+    _store: Arc<MvStore<Clock, A>>,
+}
+
+impl<Clock: LogicalClock, A: ConcurrentAllocator> CursorTransaction<Clock, A> {
+    pub(crate) fn should_abort(&self) -> bool {
+        !self.transaction.is_removed() && self.transaction.value().abort_now.load(Ordering::Acquire)
     }
 }

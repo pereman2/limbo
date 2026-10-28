@@ -5,8 +5,8 @@ use crate::types::IOResultOr;
 
 use crate::mvcc::clock::LogicalClock;
 use crate::mvcc::database::{
-    create_seek_range, MVTableId, MvStore, MvccReadSnapshot, Row, RowID, RowKey, RowVersions,
-    SortableIndexKey,
+    create_seek_range, CursorTransaction, MVTableId, MvStore, MvccReadSnapshot, Row, RowID, RowKey,
+    RowVersions, SortableIndexKey,
 };
 #[cfg(any(test, injected_yields))]
 use crate::mvcc::yield_hooks::{ProvidesYieldContext, YieldContext, YieldPointMarker};
@@ -178,7 +178,7 @@ impl<Clock: LogicalClock + 'static, A: ConcurrentAllocator> ProvidesYieldContext
             connection.yield_injector(),
             connection.failure_injector(),
             self.yield_instance_id,
-            cursor_yield_key(self.tx_id, self.table_id),
+            cursor_yield_key(self.snapshot.tx_id, self.table_id),
         )
     }
 }
@@ -566,7 +566,7 @@ pub struct MvccLazyCursor<Clock: LogicalClock + 'static, A: ConcurrentAllocator 
     index_iterator: Option<MvccIterator<'static, Arc<SortableIndexKey>, A>>,
     mv_cursor_type: MvccCursorType,
     table_id: MVTableId,
-    tx_id: u64,
+    transaction: Box<CursorTransaction<Clock, A>>,
     snapshot: MvccReadSnapshot,
     /// Reusable immutable record, used to allow better allocation strategy.
     reusable_immutable_record: Option<ImmutableRecord>,
@@ -636,13 +636,14 @@ impl<Clock: LogicalClock + 'static, A: ConcurrentAllocator> MvccLazyCursor<Clock
         } else {
             db.get_table_id_from_root_page_at(root_page_or_table_id, snapshot.begin_ts)
         };
+        let transaction = db.cursor_transaction(tx_id)?;
         Ok(Self {
             db,
             #[cfg(any(test, injected_yields))]
             yield_instance_id: connection.next_yield_instance_id(),
             #[cfg(any(test, injected_yields))]
             connection: Arc::downgrade(connection),
-            tx_id,
+            transaction,
             snapshot,
             table_iterator: None,
             index_iterator: None,
@@ -672,9 +673,12 @@ impl<Clock: LogicalClock + 'static, A: ConcurrentAllocator> MvccLazyCursor<Clock
         let RowKey::Record(rec) = key else {
             return self.query_btree_version_is_valid(key);
         };
-        let valid =
-            self.index_shadow_scan
-                .btree_row_is_valid(&self.db, self.table_id, self.tx_id, rec)?;
+        let valid = self.index_shadow_scan.btree_row_is_valid(
+            &self.db,
+            self.table_id,
+            self.snapshot.tx_id,
+            rec,
+        )?;
         // Debug-only cross-check: any scan divergence (e.g. a missed reset)
         // fails the test suite instead of shipping.
         #[cfg(debug_assertions)]
@@ -683,7 +687,7 @@ impl<Clock: LogicalClock + 'static, A: ConcurrentAllocator> MvccLazyCursor<Clock
             self.db.query_btree_version_is_valid(
                 self.table_id,
                 &RowKey::Record(rec.clone()),
-                self.tx_id
+                self.snapshot.tx_id
             )?,
             "index shadow scan diverged from query_btree_version_is_valid"
         );
@@ -692,7 +696,7 @@ impl<Clock: LogicalClock + 'static, A: ConcurrentAllocator> MvccLazyCursor<Clock
 
     /// Returns the current row as an immutable record.
     pub fn current_row(&mut self) -> IOResultOr<Option<&crate::types::ImmutableRecord>> {
-        if self.db.tx_should_abort(self.tx_id) {
+        if self.transaction.should_abort() {
             return Err(LimboError::CommitDependencyAborted.into());
         }
         if self.get_null_flag() {
@@ -724,10 +728,11 @@ impl<Clock: LogicalClock + 'static, A: ConcurrentAllocator> MvccLazyCursor<Clock
                         MvccCursorType::Index(_) => Some(self.table_id),
                         MvccCursorType::Table => None,
                     };
-                    match self
-                        .db
-                        .read_from_table_or_index(self.tx_id, row_id, maybe_index_id)?
-                    {
+                    match self.db.read_from_table_or_index(
+                        self.snapshot.tx_id,
+                        row_id,
+                        maybe_index_id,
+                    )? {
                         Some(row) => {
                             record.invalidate();
                             record.start_serialization(row.payload())?;
@@ -740,7 +745,7 @@ impl<Clock: LogicalClock + 'static, A: ConcurrentAllocator> MvccLazyCursor<Clock
                 if !found {
                     let Some(row) = self.eq_seek_row.as_ref().filter(|row| row.id == *row_id)
                     else {
-                        if self.db.tx_should_abort(self.tx_id) {
+                        if self.transaction.should_abort() {
                             return Err(LimboError::CommitDependencyAborted.into());
                         }
                         return Ok(IOResult::Done(None));
@@ -777,7 +782,7 @@ impl<Clock: LogicalClock + 'static, A: ConcurrentAllocator> MvccLazyCursor<Clock
             MvccCursorType::Table => None,
         };
         self.db
-            .read_from_table_or_index(self.tx_id, row_id, maybe_index_id)
+            .read_from_table_or_index(self.snapshot.tx_id, row_id, maybe_index_id)
     }
 
     pub fn close(self) -> Result<()> {
@@ -873,7 +878,7 @@ impl<Clock: LogicalClock + 'static, A: ConcurrentAllocator> MvccLazyCursor<Clock
 
     fn query_btree_version_is_valid(&self, key: &RowKey) -> Result<bool> {
         self.db
-            .query_btree_version_is_valid(self.table_id, key, self.tx_id)
+            .query_btree_version_is_valid(self.table_id, key, self.snapshot.tx_id)
     }
 
     /// Advance MVCC iterator and return next visible row key in the direction that the iterator was initialized in.
@@ -1382,7 +1387,7 @@ impl<Clock: LogicalClock + 'static, A: ConcurrentAllocator> CursorTrait
             MvccCursorType::Table => match self.db.get_last_table_rowid(
                 self.table_id,
                 &mut self.table_iterator,
-                self.tx_id,
+                self.snapshot.tx_id,
             ) {
                 Some(k) => {
                     tracing::trace!("last: mvcc_key: {:?}", k);
@@ -1397,7 +1402,7 @@ impl<Clock: LogicalClock + 'static, A: ConcurrentAllocator> CursorTrait
             },
             MvccCursorType::Index(_) => match self.db.get_last_index_rowid(
                 self.table_id,
-                self.tx_id,
+                self.snapshot.tx_id,
                 &mut self.index_iterator,
             )? {
                 Some(k) => {
@@ -1701,7 +1706,7 @@ impl<Clock: LogicalClock + 'static, A: ConcurrentAllocator> CursorTrait
         if self.get_null_flag() {
             return Ok(IOResult::Done(None));
         }
-        if self.db.tx_should_abort(self.tx_id) {
+        if self.transaction.should_abort() {
             return Err(LimboError::CommitDependencyAborted.into());
         }
         match &self.current_pos {
@@ -1713,7 +1718,7 @@ impl<Clock: LogicalClock + 'static, A: ConcurrentAllocator> CursorTrait
                         .filter(|row| row.id == *row_id)
                         .cloned()
                 });
-                if self.payload_row.is_none() && self.db.tx_should_abort(self.tx_id) {
+                if self.payload_row.is_none() && self.transaction.should_abort() {
                     return Err(LimboError::CommitDependencyAborted.into());
                 }
                 Ok(IOResult::Done(self.payload_row.as_ref().map(Row::payload)))
@@ -1783,7 +1788,7 @@ impl<Clock: LogicalClock + 'static, A: ConcurrentAllocator> CursorTrait
                         self.query_btree_version_is_valid(&row_id.row_id)?
                     } else {
                         self.db
-                            .read_from_table_or_index(self.tx_id, row_id, maybe_index_id)?
+                            .read_from_table_or_index(self.snapshot.tx_id, row_id, maybe_index_id)?
                             .is_some()
                     };
                     if visible {
@@ -2121,12 +2126,12 @@ impl<Clock: LogicalClock + 'static, A: ConcurrentAllocator> CursorTrait
         // FIXME: set btree to somewhere close to this rowid?
         if self
             .db
-            .read_from_table_or_index(self.tx_id, &row.id, maybe_index_id)?
+            .read_from_table_or_index(self.snapshot.tx_id, &row.id, maybe_index_id)?
             .is_some()
         {
             let updated = self
                 .db
-                .update_to_table_or_index(self.tx_id, row, maybe_index_id)
+                .update_to_table_or_index(self.snapshot.tx_id, row, maybe_index_id)
                 .inspect_err(|_| {
                     self.current_pos = CursorPosition::BeforeFirst;
                 })?;
@@ -2138,13 +2143,13 @@ impl<Clock: LogicalClock + 'static, A: ConcurrentAllocator> CursorTrait
             // The row exists in B-tree but not in MvStore - mark it as B-tree resident
             // so that checkpoint knows to write deletes to the B-tree file.
             self.db
-                .insert_btree_resident_to_table_or_index(self.tx_id, row, maybe_index_id)
+                .insert_btree_resident_to_table_or_index(self.snapshot.tx_id, row, maybe_index_id)
                 .inspect_err(|_| {
                     self.current_pos = CursorPosition::BeforeFirst;
                 })?;
         } else {
             self.db
-                .insert_to_table_or_index(self.tx_id, row, maybe_index_id)
+                .insert_to_table_or_index(self.snapshot.tx_id, row, maybe_index_id)
                 .inspect_err(|_| {
                     self.current_pos = CursorPosition::BeforeFirst;
                 })?;
@@ -2187,7 +2192,7 @@ impl<Clock: LogicalClock + 'static, A: ConcurrentAllocator> CursorTrait
             None
         };
         self.db.delete_from_table_or_index(
-            self.tx_id,
+            self.snapshot.tx_id,
             rowid,
             maybe_index_id,
             btree_record.as_ref(),
@@ -2354,7 +2359,7 @@ impl<Clock: LogicalClock + 'static, A: ConcurrentAllocator> CursorTrait
             match state {
                 None => {
                     self.set_null_flag(false);
-                    let generation = self.db.write_generation(self.tx_id)?;
+                    let generation = self.db.write_generation(self.snapshot.tx_id)?;
                     let start = RowID::new(self.table_id, RowKey::Int(i64::MIN));
                     let end = RowID::new(self.table_id, RowKey::Int(i64::MAX));
                     self.count_state = Some(
@@ -2373,13 +2378,13 @@ impl<Clock: LogicalClock + 'static, A: ConcurrentAllocator> CursorTrait
                     }
                 }
                 Some(CountState::Physical { generation }) => {
-                    if self.db.write_generation(self.tx_id)? != generation {
+                    if self.db.write_generation(self.snapshot.tx_id)? != generation {
                         self.btree_cursor.invalidate_btree_cache();
                         self.count_state = Some(CountState::Rewind);
                         continue;
                     }
                     let count = return_if_io!(self.btree_cursor.count());
-                    if self.db.write_generation(self.tx_id)? != generation {
+                    if self.db.write_generation(self.snapshot.tx_id)? != generation {
                         self.btree_cursor.invalidate_btree_cache();
                         self.count_state = Some(CountState::Rewind);
                         continue;
@@ -2580,7 +2585,7 @@ impl<Clock: LogicalClock, A: ConcurrentAllocator> Debug for MvccLazyCursor<Clock
         f.debug_struct("MvccLazyCursor")
             .field("current_pos", &self.current_pos)
             .field("table_id", &self.table_id)
-            .field("tx_id", &self.tx_id)
+            .field("tx_id", &self.snapshot.tx_id)
             .field("reusable_immutable_record", &self.reusable_immutable_record)
             .field("btree_cursor", &())
             .finish()
