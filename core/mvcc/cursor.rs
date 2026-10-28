@@ -1764,14 +1764,28 @@ impl<Clock: LogicalClock + 'static, A: ConcurrentAllocator> CursorTrait
         match &self.current_pos {
             CursorPosition::Loaded { in_btree: true, .. } => self.btree_cursor.record_payload(),
             CursorPosition::Loaded { row_id, .. } => {
-                self.payload_row = self.read_mvcc_current_row()?.or_else(|| {
-                    self.eq_seek_row
+                let generation = self.transaction.write_generation();
+                let read_at_this_position = self.transaction.payload_generation == generation
+                    && !self.transaction.is_removed()
+                    && self
+                        .payload_row
                         .as_ref()
-                        .filter(|row| row.id == *row_id)
-                        .cloned()
-                });
-                if self.payload_row.is_none() && self.transaction.should_abort() {
-                    return Err(LimboError::CommitDependencyAborted.into());
+                        .is_some_and(|row| row.id == *row_id);
+                if !read_at_this_position {
+                    #[cfg(test)]
+                    self.db
+                        .cursor_chain_payload_reads
+                        .fetch_add(1, crate::sync::atomic::Ordering::Relaxed);
+                    self.payload_row = self.read_mvcc_current_row()?.or_else(|| {
+                        self.eq_seek_row
+                            .as_ref()
+                            .filter(|row| row.id == *row_id)
+                            .cloned()
+                    });
+                    self.transaction.payload_generation = generation;
+                    if self.payload_row.is_none() && self.transaction.should_abort() {
+                        return Err(LimboError::CommitDependencyAborted.into());
+                    }
                 }
                 Ok(IOResult::Done(self.payload_row.as_ref().map(Row::payload)))
             }
@@ -1844,6 +1858,7 @@ impl<Clock: LogicalClock + 'static, A: ConcurrentAllocator> CursorTrait
                             .is_some()
                     };
                     if visible {
+                        self.invalidate_record();
                         // We need to clear the null flag for the table cursor before seeking,
                         // because it might have been set to false by an unmatched left-join row
                         // during the previous iteration on the outer loop.
@@ -2452,7 +2467,6 @@ impl<Clock: LogicalClock + 'static, A: ConcurrentAllocator> CursorTrait
                     };
                     self.table_iterator = None;
                     self.eq_seek_row = None;
-                    self.payload_row = None;
                     self.range_position = TableRangePosition::Untracked;
                     self.state = None;
                     self.count_state = None;
@@ -2613,6 +2627,7 @@ impl<Clock: LogicalClock + 'static, A: ConcurrentAllocator> CursorTrait
         if let Some(record) = self.reusable_immutable_record.as_mut() {
             record.invalidate();
         }
+        self.payload_row = None;
     }
 
     fn has_rowid(&self) -> bool {

@@ -8819,6 +8819,183 @@ fn setup_lazy_shadowed_physical_rows() -> (MvccTestDbNoConn, Arc<Connection>) {
 }
 
 #[test]
+fn test_lazy_cursor_chain_payload_read_once_per_position() {
+    let mut reads = Vec::new();
+    for shadowed in [false, true] {
+        for backwards in [false, true] {
+            let (db, conn) = if shadowed {
+                setup_lazy_shadowed_physical_rows()
+            } else {
+                setup_lazy_write_scan(false)
+            };
+            let store = db.get_mvcc_store();
+            let mut cursor = open_lazy_payload_cursor(&db, &conn);
+            if backwards {
+                drive_lazy_payload_io(&conn, || cursor.last());
+            } else {
+                drive_lazy_payload_io(&conn, || cursor.rewind());
+            }
+            store.cursor_chain_payload_reads.store(0, Ordering::Relaxed);
+            let mut rows = 0;
+            while drive_lazy_payload_io(&conn, || cursor.rowid()).is_some() {
+                let first = lazy_payload_bytes(&conn, &mut cursor);
+                assert!(first.is_some());
+                for _ in 0..2 {
+                    assert_eq!(lazy_payload_bytes(&conn, &mut cursor), first);
+                }
+                rows += 1;
+                drive_lazy_payload_io(&conn, || {
+                    if backwards {
+                        cursor.prev()
+                    } else {
+                        cursor.next()
+                    }
+                });
+            }
+            let chain_reads = store.cursor_chain_payload_reads.load(Ordering::Relaxed);
+            reads.push((shadowed, backwards, rows, chain_reads));
+            conn.execute("ROLLBACK").unwrap();
+        }
+    }
+    assert_eq!(
+        reads,
+        [
+            (false, false, 4, 4),
+            (false, true, 4, 4),
+            (true, false, 4, 2),
+            (true, true, 4, 2),
+        ]
+    );
+}
+
+#[test]
+fn test_lazy_cursor_chain_payload_follows_transaction_writes() {
+    let (db, conn) = setup_lazy_write_scan(false);
+    let store = db.get_mvcc_store();
+    let mut cursor = open_lazy_payload_cursor(&db, &conn);
+    drive_lazy_payload_io(&conn, || cursor.rewind());
+    drive_lazy_payload_io(&conn, || cursor.next());
+    assert_eq!(drive_lazy_payload_io(&conn, || cursor.rowid()), Some(2));
+    assert_eq!(
+        lazy_payload_text(&conn, &mut cursor).as_deref(),
+        Some("two")
+    );
+    conn.execute("SAVEPOINT s").unwrap();
+    conn.execute("UPDATE t SET v = 'changed' WHERE id = 2")
+        .unwrap();
+    assert_eq!(
+        lazy_payload_text(&conn, &mut cursor).as_deref(),
+        Some("changed")
+    );
+    conn.execute("ROLLBACK TO s").unwrap();
+    assert_eq!(
+        lazy_payload_text(&conn, &mut cursor).as_deref(),
+        Some("two")
+    );
+    store.cursor_chain_payload_reads.store(0, Ordering::Relaxed);
+    assert!(conn
+        .execute("INSERT INTO t VALUES (3, 'three'), (4, 'duplicate')")
+        .is_err());
+    assert_eq!(
+        lazy_payload_text(&conn, &mut cursor).as_deref(),
+        Some("two")
+    );
+    assert_eq!(store.cursor_chain_payload_reads.load(Ordering::Relaxed), 1);
+    conn.execute("ROLLBACK").unwrap();
+}
+
+#[test]
+fn test_lazy_cursor_chain_payload_rereads_after_movement() {
+    let (db, conn) = setup_lazy_write_scan(false);
+    let store = db.get_mvcc_store();
+    let mut cursor = open_lazy_payload_cursor(&db, &conn);
+    assert_eq!(
+        drive_lazy_payload_io(&conn, || cursor
+            .seek(SeekKey::TableRowId(2), SeekOp::GE { eq_only: true })),
+        SeekResult::Found
+    );
+    assert_eq!(
+        lazy_payload_text(&conn, &mut cursor).as_deref(),
+        Some("two")
+    );
+    let mut observed = Vec::new();
+    for movement in ["prev", "next", "seek_same_row", "seek_four"] {
+        store.cursor_chain_payload_reads.store(0, Ordering::Relaxed);
+        match movement {
+            "prev" => drive_lazy_payload_io(&conn, || cursor.prev()),
+            "next" => drive_lazy_payload_io(&conn, || cursor.next()),
+            _ => {
+                let rowid = if movement == "seek_four" { 4 } else { 2 };
+                assert_eq!(
+                    drive_lazy_payload_io(&conn, || cursor
+                        .seek(SeekKey::TableRowId(rowid), SeekOp::GE { eq_only: true })),
+                    SeekResult::Found
+                );
+            }
+        }
+        let first = lazy_payload_text(&conn, &mut cursor);
+        assert_eq!(lazy_payload_text(&conn, &mut cursor), first);
+        observed.push((
+            movement,
+            first,
+            store.cursor_chain_payload_reads.load(Ordering::Relaxed),
+        ));
+    }
+    assert_eq!(
+        observed,
+        [
+            ("prev", Some("one".to_string()), 1),
+            ("next", Some("two".to_string()), 1),
+            ("seek_same_row", Some("two".to_string()), 1),
+            ("seek_four", Some("four".to_string()), 1),
+        ]
+    );
+
+    let tx_id = conn.get_mv_tx_id().unwrap();
+    let tx = store.txs.get(&tx_id).unwrap();
+    tx.value().abort_now.store(true, Ordering::Release);
+    assert!(matches!(
+        *cursor.record_payload().unwrap_err(),
+        LimboError::CommitDependencyAborted
+    ));
+    tx.value().abort_now.store(false, Ordering::Release);
+    drop(tx);
+    assert_eq!(
+        lazy_payload_text(&conn, &mut cursor).as_deref(),
+        Some("four")
+    );
+
+    drive_lazy_payload_io(&conn, || cursor.next());
+    drive_lazy_payload_io(&conn, || cursor.next());
+    assert_eq!(drive_lazy_payload_io(&conn, || cursor.rowid()), None);
+    assert_eq!(lazy_payload_text(&conn, &mut cursor), None);
+
+    drive_lazy_payload_io(&conn, || cursor.last());
+    assert_eq!(
+        lazy_payload_text(&conn, &mut cursor).as_deref(),
+        Some("five")
+    );
+    conn.execute("ROLLBACK").unwrap();
+    store.cursor_chain_payload_reads.store(0, Ordering::Relaxed);
+    let uncached = cursor
+        .read_mvcc_current_row()
+        .map(|row| row.map(|row| row.payload().to_vec()));
+    let payload = cursor.record_payload().map(|result| match result {
+        IOResult::Done(payload) => payload.map(<[u8]>::to_vec),
+        IOResult::IO(_) => panic!("a chain row payload needs no I/O"),
+    });
+    assert_eq!(format!("{payload:?}"), format!("{uncached:?}"));
+    assert_eq!(store.cursor_chain_payload_reads.load(Ordering::Relaxed), 1);
+}
+
+fn lazy_payload_text(
+    conn: &Arc<Connection>,
+    cursor: &mut MvccLazyCursor<MvccClock, crate::alloc::DynAllocator>,
+) -> Option<String> {
+    lazy_payload_bytes(conn, cursor).map(|payload| payload_text(&payload))
+}
+
+#[test]
 fn test_lazy_cursor_transaction_abort_mid_scan() {
     for checkpoint in [false, true] {
         let db = MvccTestDbNoConn::new();
