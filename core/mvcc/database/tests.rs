@@ -9559,7 +9559,7 @@ fn test_lazy_cursor_forward_steps_match_the_merge_path() {
                 || setup_lazy_step_table(columns, updated, deleted, inserted),
                 |db, conn| {
                     let mut cursor = open_lazy_payload_cursor(db, conn);
-                    scan_lazy_payloads(conn, &mut cursor)
+                    scan_lazy_payloads(conn, &mut cursor, false)
                 },
             );
             let expected = 40 - deleted.len() + inserted.len();
@@ -9594,7 +9594,7 @@ fn test_lazy_cursor_forward_steps_keep_the_snapshot_across_foreign_commits() {
             || setup_lazy_step_table(3, &[], &[], &[5]),
             |db, conn| {
                 let mut snapshot_cursor = open_lazy_payload_cursor(db, conn);
-                let snapshot = scan_lazy_payloads(conn, &mut snapshot_cursor);
+                let snapshot = scan_lazy_payloads(conn, &mut snapshot_cursor, false);
                 let other = db.connect();
                 let mut cursor = open_lazy_payload_cursor(db, conn);
                 drive_lazy_payload_io(conn, || cursor.rewind());
@@ -9603,7 +9603,7 @@ fn test_lazy_cursor_forward_steps_keep_the_snapshot_across_foreign_commits() {
                     lazy_payload_bytes(conn, &mut cursor).unwrap(),
                 )];
                 other.execute(change).unwrap();
-                rows.extend(continue_lazy_payload_scan(conn, &mut cursor));
+                rows.extend(continue_lazy_payload_scan(conn, &mut cursor, false));
                 assert_eq!(rows, snapshot, "{change}");
                 rows
             },
@@ -9628,7 +9628,7 @@ fn test_lazy_cursor_forward_steps_skip_invisible_version_rows() {
                 .unwrap();
             let mut rows = vec![drive_lazy_payload_io(conn, || cursor.rowid()).unwrap()];
             rows.extend(
-                continue_lazy_payload_scan(conn, &mut cursor)
+                continue_lazy_payload_scan(conn, &mut cursor, false)
                     .into_iter()
                     .map(|(rowid, _)| rowid),
             );
@@ -9654,7 +9654,7 @@ fn test_lazy_cursor_forward_steps_across_checkpoint_and_gc() {
         },
         |db, conn| {
             let mut snapshot_cursor = open_lazy_payload_cursor(db, conn);
-            let snapshot = scan_lazy_payloads(conn, &mut snapshot_cursor);
+            let snapshot = scan_lazy_payloads(conn, &mut snapshot_cursor, false);
             let mut cursor = open_lazy_payload_cursor(db, conn);
             drive_lazy_payload_io(conn, || cursor.rewind());
             let mut rows = vec![(
@@ -9671,7 +9671,7 @@ fn test_lazy_cursor_forward_steps_across_checkpoint_and_gc() {
             other.execute("PRAGMA wal_checkpoint(PASSIVE)").unwrap();
             let after = store.debug_gc_snapshot();
             assert_ne!(before, after, "the checkpoint and GC changed nothing");
-            rows.extend(continue_lazy_payload_scan(conn, &mut cursor));
+            rows.extend(continue_lazy_payload_scan(conn, &mut cursor, false));
             assert_eq!(rows, snapshot);
             rows
         },
@@ -9736,7 +9736,7 @@ fn test_lazy_cursor_forward_steps_after_own_changes() {
                 ));
                 conn.execute(change).unwrap();
                 rows.extend(
-                    continue_lazy_payload_scan(conn, &mut cursor)
+                    continue_lazy_payload_scan(conn, &mut cursor, false)
                         .into_iter()
                         .map(|(rowid, payload)| (rowid, payload_text(&payload))),
                 );
@@ -9876,7 +9876,7 @@ fn test_lazy_cursor_forward_steps_then_count() {
         || setup_lazy_step_table(3, &[10], &[12], &[5]),
         |db, conn| {
             let mut cursor = open_lazy_payload_cursor(db, conn);
-            let rows = scan_lazy_payloads(conn, &mut cursor).len();
+            let rows = scan_lazy_payloads(conn, &mut cursor, false).len();
             (rows, drive_lazy_payload_io(conn, || cursor.count()))
         },
     );
@@ -9933,7 +9933,7 @@ fn test_lazy_cursor_forward_steps_across_rollback_to() {
         || setup_lazy_step_table(3, &[30], &[], &[]),
         |db, conn| {
             let mut snapshot_cursor = open_lazy_payload_cursor(db, conn);
-            let snapshot = scan_lazy_payloads(conn, &mut snapshot_cursor);
+            let snapshot = scan_lazy_payloads(conn, &mut snapshot_cursor, false);
             conn.execute("SAVEPOINT s").unwrap();
             conn.execute("UPDATE t SET c1 = 'changed' WHERE id = 10")
                 .unwrap();
@@ -9945,7 +9945,7 @@ fn test_lazy_cursor_forward_steps_across_rollback_to() {
                 lazy_payload_bytes(conn, &mut cursor).unwrap(),
             )];
             conn.execute("ROLLBACK TO s").unwrap();
-            rows.extend(continue_lazy_payload_scan(conn, &mut cursor));
+            rows.extend(continue_lazy_payload_scan(conn, &mut cursor, false));
             assert_eq!(rows, snapshot);
             rows
         },
@@ -9984,7 +9984,7 @@ fn test_lazy_cursor_forward_steps_keep_the_yield_sequence() {
             });
             let mut cursor = open_lazy_payload_cursor(db, conn);
             conn.set_yield_injector(Some(recorder.clone()));
-            let rows = scan_lazy_payloads(conn, &mut cursor);
+            let rows = scan_lazy_payloads(conn, &mut cursor, false);
             conn.set_yield_injector(None);
             assert_eq!(rows.len(), 41);
             let points = recorder.points.lock().clone();
@@ -9992,6 +9992,440 @@ fn test_lazy_cursor_forward_steps_keep_the_yield_sequence() {
         },
     );
     assert!(sequence.contains(&CursorYieldPoint::AdvanceBtreeForwardProgress.point()));
+}
+
+#[test]
+fn test_lazy_cursor_backward_steps_skip_peek_reconciliation() {
+    let (db, conn) = setup_lazy_walk_table(&(1..=20).collect::<Vec<_>>(), &[]);
+    conn.execute("BEGIN CONCURRENT").unwrap();
+    let store = db.get_mvcc_store();
+    let mut cursor = open_lazy_payload_cursor(&db, &conn);
+    store
+        .cursor_peek_reconciliations
+        .store(0, Ordering::Relaxed);
+    assert_eq!(
+        scan_lazy_rowids(&conn, &mut cursor, true, || {}),
+        (1..=20).rev().collect::<Vec<_>>()
+    );
+    assert_eq!(store.cursor_peek_reconciliations.load(Ordering::Relaxed), 2);
+    conn.execute("ROLLBACK").unwrap();
+}
+
+#[test]
+fn test_lazy_cursor_backward_steps_match_the_merge_path() {
+    let no_rows: Vec<i64> = Vec::new();
+    let fixtures = [
+        ("no chains", no_rows.clone(), no_rows.clone(), no_rows),
+        (
+            "10% chains",
+            (1..=4).map(|i| i * 20).collect(),
+            vec![],
+            vec![],
+        ),
+        (
+            "100% chains",
+            (1..=40).map(|i| i * 2).collect(),
+            vec![],
+            vec![],
+        ),
+        ("version-only rows", vec![], vec![], vec![5, 15, 41, 99]),
+        ("tombstones", vec![], vec![4, 20, 80], vec![]),
+        ("mixed", vec![6, 30], vec![8], vec![9, 81]),
+    ];
+    for columns in [3, 101] {
+        for (name, updated, deleted, inserted) in &fixtures {
+            let (rows, [merge_counts, step_counts]) = scan_with_and_without_table_steps(
+                || setup_lazy_step_table(columns, updated, deleted, inserted),
+                |db, conn| {
+                    let mut cursor = open_lazy_payload_cursor(db, conn);
+                    scan_lazy_payloads(conn, &mut cursor, true)
+                },
+            );
+            let expected = 40 - deleted.len() + inserted.len();
+            assert_eq!(rows.len(), expected, "columns={columns} fixture={name}");
+            if *name == "100% chains" {
+                assert_eq!(
+                    step_counts.0, merge_counts.0,
+                    "columns={columns} fixture={name}"
+                );
+            } else {
+                assert!(
+                    step_counts.0 < merge_counts.0,
+                    "columns={columns} fixture={name} {step_counts:?} {merge_counts:?}"
+                );
+            }
+            assert_eq!(
+                step_counts.1, merge_counts.1,
+                "columns={columns} fixture={name}"
+            );
+        }
+    }
+}
+
+#[test]
+fn test_lazy_cursor_backward_steps_with_injected_yields() {
+    let mut expected: Vec<i64> = (1..=40).map(|i| i * 2).filter(|id| *id != 74).collect();
+    expected.push(73);
+    expected.sort_unstable();
+    expected.reverse();
+    for point in [
+        CursorYieldPoint::PrevBtreeAdvance,
+        CursorYieldPoint::AdvanceBtreeBackwardProgress,
+    ] {
+        let mut fired = false;
+        for occurrence in 0..12 {
+            for abandon in [false, true] {
+                let ((point_fired, _), _) = scan_with_and_without_table_steps(
+                    || setup_lazy_step_table(3, &[76], &[74], &[73]),
+                    |db, conn| {
+                        let mut cursor = open_lazy_payload_cursor(db, conn);
+                        drive_lazy_payload_io(conn, || cursor.last());
+                        let injector = NthYieldInjector::new(point.point(), occurrence);
+                        conn.set_yield_injector(Some(injector.clone()));
+                        let mut rowids =
+                            vec![drive_lazy_payload_io(conn, || cursor.rowid()).unwrap()];
+                        loop {
+                            match cursor.prev().unwrap() {
+                                IOResult::Done(()) => {
+                                    let Some(rowid) =
+                                        drive_lazy_payload_io(conn, || cursor.rowid())
+                                    else {
+                                        break;
+                                    };
+                                    rowids.push(rowid);
+                                }
+                                IOResult::IO(io) => {
+                                    if io.is_explicit_yield() && abandon {
+                                        conn.set_yield_injector(None);
+                                        return (injector.fired(), rowids);
+                                    }
+                                    io.wait(conn.db.io.as_ref()).unwrap();
+                                }
+                            }
+                        }
+                        conn.set_yield_injector(None);
+                        assert_eq!(rowids, expected, "{point:?} {occurrence}");
+                        (injector.fired(), rowids)
+                    },
+                );
+                if occurrence == 0 {
+                    assert!(point_fired, "{point:?} never fired");
+                }
+                fired |= point_fired;
+            }
+        }
+        assert!(fired, "{point:?} never fired");
+    }
+}
+
+#[test]
+fn test_lazy_cursor_backward_steps_after_positioning() {
+    let moves: [(&str, &[&str]); 4] = [
+        ("seek", &["prev", "prev", "prev", "next", "next"]),
+        ("last", &["prev", "prev", "prev"]),
+        ("rewind", &["prev"]),
+        ("rewind", &["next", "next", "next", "prev", "prev"]),
+    ];
+    let mut results = Vec::new();
+    for (start, steps) in moves {
+        let (rows, [merge_counts, step_counts]) = scan_with_and_without_table_steps(
+            || setup_lazy_step_table(3, &[30], &[], &[]),
+            |db, conn| {
+                let mut cursor = open_lazy_payload_cursor(db, conn);
+                match start {
+                    "seek" => {
+                        assert_eq!(
+                            drive_lazy_payload_io(conn, || cursor
+                                .seek(SeekKey::TableRowId(20), SeekOp::GE { eq_only: true })),
+                            SeekResult::Found
+                        );
+                    }
+                    "last" => drive_lazy_payload_io(conn, || cursor.last()),
+                    _ => drive_lazy_payload_io(conn, || cursor.rewind()),
+                }
+                let mut rows = vec![drive_lazy_payload_io(conn, || cursor.rowid())];
+                for step in steps {
+                    if *step == "prev" {
+                        drive_lazy_payload_io(conn, || cursor.prev());
+                    } else {
+                        drive_lazy_payload_io(conn, || cursor.next());
+                    }
+                    rows.push(drive_lazy_payload_io(conn, || cursor.rowid()));
+                }
+                rows
+            },
+        );
+        if start == "last" {
+            assert!(step_counts.0 < merge_counts.0, "{start}");
+        }
+        results.push(rows);
+    }
+    assert_eq!(results[0], [20, 18, 16, 14, 16, 18].map(Some).to_vec());
+    assert_eq!(results[1], [80, 78, 76, 74].map(Some).to_vec());
+}
+
+#[test]
+fn test_lazy_cursor_backward_steps_then_count() {
+    let (counts, [merge_counts, step_counts]) = scan_with_and_without_table_steps(
+        || setup_lazy_step_table(3, &[10], &[12], &[5]),
+        |db, conn| {
+            let mut cursor = open_lazy_payload_cursor(db, conn);
+            let rows = scan_lazy_payloads(conn, &mut cursor, true).len();
+            (rows, drive_lazy_payload_io(conn, || cursor.count()))
+        },
+    );
+    assert!(step_counts.0 < merge_counts.0);
+    assert_eq!(counts, (40, 40));
+}
+
+#[test]
+fn test_lazy_cursor_backward_steps_after_own_changes() {
+    let physical: Vec<i64> = (1..=40).map(|i| i * 2).rev().collect();
+    for change in [
+        "INSERT INTO t VALUES (77, 'ahead', 'ahead')",
+        "INSERT INTO t VALUES (81, 'behind', 'behind')",
+        "DELETE FROM t WHERE id = 76",
+        "UPDATE t SET c1 = 'changed' WHERE id = 76",
+    ] {
+        let (rows, [merge_counts, step_counts]) = scan_with_and_without_table_steps(
+            || setup_lazy_step_table(3, &[], &[], &[]),
+            |db, conn| {
+                let mut cursor = open_lazy_payload_cursor(db, conn);
+                drive_lazy_payload_io(conn, || cursor.last());
+                drive_lazy_payload_io(conn, || cursor.prev());
+                let mut rows = vec![(80, String::new())];
+                rows.push((
+                    drive_lazy_payload_io(conn, || cursor.rowid()).unwrap(),
+                    String::new(),
+                ));
+                conn.execute(change).unwrap();
+                rows.extend(
+                    continue_lazy_payload_scan(conn, &mut cursor, true)
+                        .into_iter()
+                        .map(|(rowid, payload)| (rowid, payload_text(&payload))),
+                );
+                rows
+            },
+        );
+        assert!(step_counts.0 < merge_counts.0, "{change}");
+        let rowids: Vec<i64> = rows.iter().map(|(rowid, _)| *rowid).collect();
+        let mut expected = physical.clone();
+        if change.contains("(77,") {
+            expected.push(77);
+            expected.sort_unstable();
+            expected.reverse();
+        }
+        if change.starts_with("DELETE") {
+            expected.retain(|id| *id != 76);
+        }
+        assert_eq!(rowids, expected, "{change}");
+        if change.starts_with("UPDATE") {
+            assert!(rows.contains(&(76, "changed".to_string())), "{change}");
+        }
+    }
+}
+
+#[test]
+fn test_lazy_cursor_backward_steps_keep_the_snapshot_across_foreign_commits() {
+    for change in [
+        "DELETE FROM t WHERE id = 70",
+        "UPDATE t SET c1 = 'later' WHERE id = 72",
+        "INSERT INTO t VALUES (71, 'later', 'later')",
+    ] {
+        let (_, [merge_counts, step_counts]) = scan_with_and_without_table_steps(
+            || setup_lazy_step_table(3, &[], &[], &[75]),
+            |db, conn| {
+                let mut snapshot_cursor = open_lazy_payload_cursor(db, conn);
+                let snapshot = scan_lazy_payloads(conn, &mut snapshot_cursor, true);
+                let other = db.connect();
+                let mut cursor = open_lazy_payload_cursor(db, conn);
+                drive_lazy_payload_io(conn, || cursor.last());
+                let mut rows = vec![(
+                    drive_lazy_payload_io(conn, || cursor.rowid()).unwrap(),
+                    lazy_payload_bytes(conn, &mut cursor).unwrap(),
+                )];
+                other.execute(change).unwrap();
+                rows.extend(continue_lazy_payload_scan(conn, &mut cursor, true));
+                assert_eq!(rows, snapshot, "{change}");
+                rows
+            },
+        );
+        assert!(step_counts.0 < merge_counts.0, "{change}");
+    }
+}
+
+#[test]
+fn test_lazy_cursor_backward_steps_at_rowid_limits_and_tiny_tables() {
+    for (physical, chain_only) in [
+        (vec![i64::MIN, -5, 0, 7, i64::MAX], vec![-3]),
+        (vec![i64::MIN, -5, 0, 7, i64::MAX], vec![]),
+        (vec![42], vec![]),
+        (vec![], vec![]),
+    ] {
+        let (rowids, _) = scan_with_and_without_table_steps(
+            || {
+                let (db, conn) = setup_lazy_walk_table(&physical, &chain_only);
+                conn.execute("BEGIN CONCURRENT").unwrap();
+                (db, conn)
+            },
+            |db, conn| {
+                let mut cursor = open_lazy_payload_cursor(db, conn);
+                scan_lazy_rowids(conn, &mut cursor, true, || {})
+            },
+        );
+        let expected = walk_order(physical.iter().chain(&chain_only).copied().collect(), true);
+        assert_eq!(rowids, expected, "{physical:?} {chain_only:?}");
+    }
+}
+
+#[test]
+fn test_lazy_cursor_backward_steps_keep_the_yield_sequence() {
+    let (sequence, [merge_counts, step_counts]) = scan_with_and_without_table_steps(
+        || setup_lazy_step_table(3, &[6, 30], &[8], &[9, 81]),
+        |db, conn| {
+            let recorder = Arc::new(RecordingYieldInjector {
+                points: Mutex::new(Vec::new()),
+            });
+            let mut cursor = open_lazy_payload_cursor(db, conn);
+            conn.set_yield_injector(Some(recorder.clone()));
+            let rows = scan_lazy_payloads(conn, &mut cursor, true);
+            conn.set_yield_injector(None);
+            assert_eq!(rows.len(), 41);
+            let points = recorder.points.lock().clone();
+            points
+        },
+    );
+    assert!(step_counts.0 < merge_counts.0);
+    assert!(sequence.contains(&CursorYieldPoint::AdvanceBtreeBackwardProgress.point()));
+    assert!(sequence.contains(&CursorYieldPoint::PrevBtreeAdvance.point()));
+}
+
+#[test]
+fn test_lazy_cursor_backward_steps_across_rollback_to() {
+    let (_, [merge_counts, step_counts]) = scan_with_and_without_table_steps(
+        || setup_lazy_step_table(3, &[30], &[], &[]),
+        |db, conn| {
+            let mut snapshot_cursor = open_lazy_payload_cursor(db, conn);
+            let snapshot = scan_lazy_payloads(conn, &mut snapshot_cursor, true);
+            conn.execute("SAVEPOINT s").unwrap();
+            conn.execute("UPDATE t SET c1 = 'changed' WHERE id = 70")
+                .unwrap();
+            conn.execute("DELETE FROM t WHERE id = 60").unwrap();
+            let mut cursor = open_lazy_payload_cursor(db, conn);
+            drive_lazy_payload_io(conn, || cursor.last());
+            let mut rows = vec![(
+                drive_lazy_payload_io(conn, || cursor.rowid()).unwrap(),
+                lazy_payload_bytes(conn, &mut cursor).unwrap(),
+            )];
+            conn.execute("ROLLBACK TO s").unwrap();
+            rows.extend(continue_lazy_payload_scan(conn, &mut cursor, true));
+            assert_eq!(rows, snapshot);
+            rows
+        },
+    );
+    assert!(step_counts.0 < merge_counts.0);
+}
+
+#[test]
+fn test_lazy_cursor_backward_steps_across_checkpoint_and_gc() {
+    let (_, [merge_counts, step_counts]) = scan_with_and_without_table_steps(
+        || {
+            let db = MvccTestDbNoConn::new_with_random_db_passive();
+            let conn = db.connect();
+            fill_lazy_step_table(&conn, 3, &[20], &[], &[]);
+            conn.execute("BEGIN CONCURRENT").unwrap();
+            (db, conn)
+        },
+        |db, conn| {
+            let mut snapshot_cursor = open_lazy_payload_cursor(db, conn);
+            let snapshot = scan_lazy_payloads(conn, &mut snapshot_cursor, true);
+            let mut cursor = open_lazy_payload_cursor(db, conn);
+            drive_lazy_payload_io(conn, || cursor.last());
+            let mut rows = vec![(
+                drive_lazy_payload_io(conn, || cursor.rowid()).unwrap(),
+                lazy_payload_bytes(conn, &mut cursor).unwrap(),
+            )];
+            let other = db.connect();
+            other
+                .execute("UPDATE t SET c1 = 'later' WHERE id = 66")
+                .unwrap();
+            let store = db.get_mvcc_store();
+            let before = store.debug_gc_snapshot();
+            store.drop_unused_row_versions();
+            other.execute("PRAGMA wal_checkpoint(PASSIVE)").unwrap();
+            let after = store.debug_gc_snapshot();
+            assert_ne!(before, after, "the checkpoint and GC changed nothing");
+            rows.extend(continue_lazy_payload_scan(conn, &mut cursor, true));
+            assert_eq!(rows, snapshot);
+            rows
+        },
+    );
+    assert!(step_counts.0 < merge_counts.0);
+}
+
+#[test]
+fn test_lazy_cursor_backward_steps_skip_invisible_version_rows() {
+    let (rows, [merge_counts, step_counts]) = scan_with_and_without_table_steps(
+        || setup_lazy_step_table(3, &[], &[], &[75]),
+        |db, conn| {
+            let uncommitted = db.connect();
+            uncommitted.execute("BEGIN CONCURRENT").unwrap();
+            uncommitted
+                .execute("INSERT INTO t VALUES (73, 'hidden', 'hidden')")
+                .unwrap();
+            let mut cursor = open_lazy_payload_cursor(db, conn);
+            drive_lazy_payload_io(conn, || cursor.last());
+            db.connect()
+                .execute("INSERT INTO t VALUES (71, 'later', 'later')")
+                .unwrap();
+            let mut rows = vec![drive_lazy_payload_io(conn, || cursor.rowid()).unwrap()];
+            rows.extend(
+                continue_lazy_payload_scan(conn, &mut cursor, true)
+                    .into_iter()
+                    .map(|(rowid, _)| rowid),
+            );
+            uncommitted.execute("ROLLBACK").unwrap();
+            rows
+        },
+    );
+    assert!(step_counts.0 < merge_counts.0);
+    let mut expected: Vec<i64> = (1..=40).map(|i| i * 2).collect();
+    expected.push(75);
+    expected.sort_unstable();
+    expected.reverse();
+    assert_eq!(rows, expected);
+}
+
+#[test]
+fn test_lazy_cursor_backward_steps_after_range_seek() {
+    for (op, start, expected) in [
+        (
+            SeekOp::LE { eq_only: false },
+            41,
+            vec![40, 38, 36, 34, 33, 32, 30],
+        ),
+        (SeekOp::LT, 40, vec![38, 36, 34, 33]),
+    ] {
+        let (rows, [merge_counts, step_counts]) = scan_with_and_without_table_steps(
+            || setup_lazy_step_table(3, &[30], &[], &[33]),
+            |db, conn| {
+                let mut cursor = open_lazy_payload_cursor(db, conn);
+                drive_lazy_payload_io(conn, || cursor.seek(SeekKey::TableRowId(start), op));
+                let mut rows = vec![drive_lazy_payload_io(conn, || cursor.rowid())];
+                for _ in 1..expected.len() {
+                    drive_lazy_payload_io(conn, || cursor.prev());
+                    rows.push(drive_lazy_payload_io(conn, || cursor.rowid()));
+                }
+                rows
+            },
+        );
+        assert!(step_counts.0 < merge_counts.0, "{op:?}");
+        assert_eq!(
+            rows,
+            expected.iter().copied().map(Some).collect::<Vec<_>>(),
+            "{op:?}"
+        );
+    }
 }
 
 fn scan_with_and_without_table_steps<T: PartialEq + std::fmt::Debug>(
@@ -10016,10 +10450,7 @@ fn scan_with_and_without_table_steps<T: PartialEq + std::fmt::Debug>(
             );
             (result, counts)
         });
-    assert_eq!(
-        step_path, merge_path,
-        "forward table steps changed the result"
-    );
+    assert_eq!(step_path, merge_path, "table steps changed the result");
     (step_path, [merge_counts, step_counts])
 }
 
@@ -10087,12 +10518,19 @@ fn fill_lazy_step_table(
 fn scan_lazy_payloads(
     conn: &Arc<Connection>,
     cursor: &mut MvccLazyCursor<MvccClock, crate::alloc::DynAllocator>,
+    backwards: bool,
 ) -> Vec<(i64, Vec<u8>)> {
-    drive_lazy_payload_io(conn, || cursor.rewind());
+    drive_lazy_payload_io(conn, || {
+        if backwards {
+            cursor.last()
+        } else {
+            cursor.rewind()
+        }
+    });
     let mut rows = Vec::new();
     if let Some(rowid) = drive_lazy_payload_io(conn, || cursor.rowid()) {
         rows.push((rowid, lazy_payload_bytes(conn, cursor).unwrap()));
-        rows.extend(continue_lazy_payload_scan(conn, cursor));
+        rows.extend(continue_lazy_payload_scan(conn, cursor, backwards));
     }
     rows
 }
@@ -10100,10 +10538,17 @@ fn scan_lazy_payloads(
 fn continue_lazy_payload_scan(
     conn: &Arc<Connection>,
     cursor: &mut MvccLazyCursor<MvccClock, crate::alloc::DynAllocator>,
+    backwards: bool,
 ) -> Vec<(i64, Vec<u8>)> {
     let mut rows = Vec::new();
     loop {
-        drive_lazy_payload_io(conn, || cursor.next());
+        drive_lazy_payload_io(conn, || {
+            if backwards {
+                cursor.prev()
+            } else {
+                cursor.next()
+            }
+        });
         let Some(rowid) = drive_lazy_payload_io(conn, || cursor.rowid()) else {
             return rows;
         };

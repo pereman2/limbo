@@ -1111,7 +1111,7 @@ impl<Clock: LogicalClock + 'static, A: ConcurrentAllocator> MvccLazyCursor<Clock
                 }
                 Some(AdvanceBtreeState::NextCheckBtreeKey) => {
                     let key = self.get_btree_current_key()?;
-                    if self.peek_btree_key_forward(key)? {
+                    if self.peek_btree_key::<true>(key)? {
                         return Ok(IOResult::Done(()));
                     }
                 }
@@ -1196,24 +1196,8 @@ impl<Clock: LogicalClock + 'static, A: ConcurrentAllocator> MvccLazyCursor<Clock
                 }
                 Some(AdvanceBtreeState::NextCheckBtreeKey) => {
                     let key = self.get_btree_current_key()?;
-                    match key {
-                        Some(k) if self.btree_row_is_valid_backward(&k)? => {
-                            self.dual_peek.btree_peek = CursorPeek::Row {
-                                key: k,
-                                versions: None,
-                            };
-                            self.btree_advance_state = None;
-                            return Ok(IOResult::Done(()));
-                        }
-                        Some(_) => {
-                            // shadowed by MVCC, continue to prev
-                            self.btree_advance_state = Some(AdvanceBtreeState::NextBtree);
-                        }
-                        None => {
-                            self.dual_peek.btree_peek = CursorPeek::Exhausted;
-                            self.btree_advance_state = None;
-                            return Ok(IOResult::Done(()));
-                        }
+                    if self.peek_btree_key::<false>(key)? {
+                        return Ok(IOResult::Done(()));
                     }
                 }
             }
@@ -1596,8 +1580,8 @@ impl<Clock: LogicalClock + 'static, A: ConcurrentAllocator> CursorTrait
             self.state.as_ref().expect("next state is not initialized"),
             MvccLazyCursorState::Next(NextState::CheckNeedsAdvance)
         ) {
-            if self.can_step_table_row_forward() {
-                return self.step_table_row_forward();
+            if self.can_step_table_row::<true>() {
+                return self.step_table_row::<true>();
             }
             // Determine which cursor(s) need to be advanced based on current position
             let (need_advance_mvcc, need_advance_btree) = match &self.current_pos {
@@ -1648,7 +1632,7 @@ impl<Clock: LogicalClock + 'static, A: ConcurrentAllocator> CursorTrait
             return_if_io!(self.advance_btree_forward());
         }
 
-        self.finish_forward_step()
+        self.finish_table_step::<true>()
     }
 
     /// Move the cursor to the previous row. Returns true if the cursor moved, false if at the beginning.
@@ -1720,6 +1704,9 @@ impl<Clock: LogicalClock + 'static, A: ConcurrentAllocator> CursorTrait
             self.state.as_ref().expect("prev state is not initialized"),
             MvccLazyCursorState::Prev(PrevState::CheckNeedsAdvance)
         ) {
+            if self.can_step_table_row::<false>() {
+                return self.step_table_row::<false>();
+            }
             // Determine which cursor(s) need to be advanced based on current position
             let (need_advance_mvcc, need_advance_btree) = match &self.current_pos {
                 CursorPosition::End => {
@@ -1768,11 +1755,7 @@ impl<Clock: LogicalClock + 'static, A: ConcurrentAllocator> CursorTrait
         ) {
             return_if_io!(self.advance_btree_backward());
         }
-        self.refresh_current_position(IterationDirection::Backwards);
-        self.invalidate_record();
-        self.state = None;
-
-        Ok(IOResult::Done(()))
+        self.finish_table_step::<false>()
     }
 
     fn rowid(&mut self) -> IOResultOr<Option<i64>> {
@@ -2685,10 +2668,7 @@ impl<Clock: LogicalClock + 'static, A: ConcurrentAllocator> CursorTrait
     }
 
     fn invalidate_record(&mut self) {
-        if let Some(record) = self.reusable_immutable_record.as_mut() {
-            record.invalidate();
-        }
-        self.payload_row = None;
+        self.clear_row_caches();
     }
 
     fn has_rowid(&self) -> bool {
@@ -2725,7 +2705,7 @@ impl<Clock: LogicalClock, A: ConcurrentAllocator> Debug for MvccLazyCursor<Clock
 }
 
 impl<Clock: LogicalClock + 'static, A: ConcurrentAllocator> MvccLazyCursor<Clock, A> {
-    fn can_step_table_row_forward(&self) -> bool {
+    fn can_step_table_row<const FORWARD: bool>(&self) -> bool {
         #[cfg(test)]
         if self
             .db
@@ -2753,15 +2733,25 @@ impl<Clock: LogicalClock + 'static, A: ConcurrentAllocator> MvccLazyCursor<Clock
                 .transaction
                 .table_walk
                 .as_deref()
-                .is_some_and(|walk| walk.continues(rowid, IterationDirection::Forwards))
+                .is_some_and(|walk| walk.continues(rowid, Self::direction::<FORWARD>()))
     }
 
-    fn step_table_row_forward(&mut self) -> IOResultOr<()> {
-        self.state
-            .replace(MvccLazyCursorState::Next(NextState::Advance));
-        inject_io_yield!(self, CursorYieldPoint::NextBtreeAdvance);
+    fn step_table_row<const FORWARD: bool>(&mut self) -> IOResultOr<()> {
+        if FORWARD {
+            self.state
+                .replace(MvccLazyCursorState::Next(NextState::Advance));
+            inject_io_yield!(self, CursorYieldPoint::NextBtreeAdvance);
+        } else {
+            self.state
+                .replace(MvccLazyCursorState::Prev(PrevState::Advance));
+            inject_io_yield!(self, CursorYieldPoint::PrevBtreeAdvance);
+        }
         self.btree_advance_state = Some(AdvanceBtreeState::NextBtree);
-        inject_io_yield!(self, CursorYieldPoint::AdvanceBtreeForwardProgress);
+        if FORWARD {
+            inject_io_yield!(self, CursorYieldPoint::AdvanceBtreeForwardProgress);
+        } else {
+            inject_io_yield!(self, CursorYieldPoint::AdvanceBtreeBackwardProgress);
+        }
         #[cfg(test)]
         if self
             .db
@@ -2773,14 +2763,22 @@ impl<Clock: LogicalClock + 'static, A: ConcurrentAllocator> MvccLazyCursor<Clock
                 .cursor_physical_advances
                 .fetch_add(1, crate::sync::atomic::Ordering::Relaxed);
         }
-        return_if_io!(self.btree_cursor.next());
+        if FORWARD {
+            return_if_io!(self.btree_cursor.next());
+        } else {
+            return_if_io!(self.btree_cursor.prev());
+        }
         if !self.btree_cursor.has_record() {
             self.dual_peek.btree_peek = CursorPeek::Exhausted;
             self.btree_advance_state = None;
-            return self.finish_forward_step();
+            return self.finish_table_step::<FORWARD>();
         }
         self.btree_advance_state = Some(AdvanceBtreeState::NextCheckBtreeKey);
-        inject_io_yield!(self, CursorYieldPoint::AdvanceBtreeForwardProgress);
+        if FORWARD {
+            inject_io_yield!(self, CursorYieldPoint::AdvanceBtreeForwardProgress);
+        } else {
+            inject_io_yield!(self, CursorYieldPoint::AdvanceBtreeBackwardProgress);
+        }
         #[cfg(test)]
         self.db
             .cursor_btree_rowid_reads
@@ -2792,20 +2790,21 @@ impl<Clock: LogicalClock + 'static, A: ConcurrentAllocator> MvccLazyCursor<Clock
             }
         };
         let Some(rowid) = rowid else {
-            return self.finish_step_on_old_path(None);
+            return self.finish_step_on_old_path::<FORWARD>(None);
         };
         let at_chain = self
             .transaction
             .table_walk
             .as_deref_mut()
-            .expect("a forward step needs the table chain walk")
-            .advance_to(self.table_id, rowid, IterationDirection::Forwards);
-        let version_row_first = matches!(
-            self.dual_peek.mvcc_peek.get_row_key(),
-            Some(RowKey::Int(key)) if *key <= rowid
-        );
+            .expect("a table step needs the table chain walk")
+            .advance_to(self.table_id, rowid, Self::direction::<FORWARD>());
+        let version_row_first = match self.dual_peek.mvcc_peek.get_row_key() {
+            Some(RowKey::Int(key)) if FORWARD => *key <= rowid,
+            Some(RowKey::Int(key)) => *key >= rowid,
+            _ => false,
+        };
         if at_chain || version_row_first {
-            return self.finish_step_on_old_path(Some(RowKey::Int(rowid)));
+            return self.finish_step_on_old_path::<FORWARD>(Some(RowKey::Int(rowid)));
         }
         self.record_table_row_check(rowid, true);
         self.set_btree_peek(RowKey::Int(rowid));
@@ -2814,33 +2813,53 @@ impl<Clock: LogicalClock + 'static, A: ConcurrentAllocator> MvccLazyCursor<Clock
             in_btree: true,
             versions: None,
         };
-        self.invalidate_record();
+        self.clear_row_caches();
         self.state = None;
         Ok(IOResult::Done(()))
     }
 
-    fn finish_step_on_old_path(&mut self, key: Option<RowKey>) -> IOResultOr<()> {
-        if !self.peek_btree_key_forward(key)? {
-            return_if_io!(self.advance_btree_forward());
+    fn finish_step_on_old_path<const FORWARD: bool>(
+        &mut self,
+        key: Option<RowKey>,
+    ) -> IOResultOr<()> {
+        if !self.peek_btree_key::<FORWARD>(key)? {
+            if FORWARD {
+                return_if_io!(self.advance_btree_forward());
+            } else {
+                return_if_io!(self.advance_btree_backward());
+            }
         }
-        self.finish_forward_step()
+        self.finish_table_step::<FORWARD>()
     }
 
-    fn finish_forward_step(&mut self) -> IOResultOr<()> {
-        self.refresh_current_position(IterationDirection::Forwards);
+    fn finish_table_step<const FORWARD: bool>(&mut self) -> IOResultOr<()> {
+        self.refresh_current_position(Self::direction::<FORWARD>());
         self.invalidate_record();
         self.state = None;
         Ok(IOResult::Done(()))
     }
 
-    fn peek_btree_key_forward(&mut self, key: Option<RowKey>) -> Result<bool> {
+    fn direction<const FORWARD: bool>() -> IterationDirection {
+        if FORWARD {
+            IterationDirection::Forwards
+        } else {
+            IterationDirection::Backwards
+        }
+    }
+
+    fn peek_btree_key<const FORWARD: bool>(&mut self, key: Option<RowKey>) -> Result<bool> {
         if let Some(key) = key {
-            if self.btree_row_is_valid_forward(&key)? {
+            let valid = if FORWARD {
+                self.btree_row_is_valid_forward(&key)?
+            } else {
+                self.btree_row_is_valid_backward(&key)?
+            };
+            if valid {
                 self.set_btree_peek(key);
                 return Ok(true);
             }
-            // Row is shadowed by MVCC, continue to next
-            // FIXME: do we want to iterate over all shadowed rows? If every row is shadowed by MVCC, we will iterate the whole btree in a single `next` call
+            // Row is shadowed by MVCC, continue scanning
+            // FIXME: do we want to iterate over all shadowed rows? If every row is shadowed by MVCC, we will iterate the whole btree in a single `next`/`prev` call
             self.btree_advance_state = Some(AdvanceBtreeState::NextBtree);
             Ok(false)
         } else {
@@ -2850,12 +2869,21 @@ impl<Clock: LogicalClock + 'static, A: ConcurrentAllocator> MvccLazyCursor<Clock
         }
     }
 
+    #[inline(always)]
     fn set_btree_peek(&mut self, key: RowKey) {
         self.dual_peek.btree_peek = CursorPeek::Row {
             key,
             versions: None,
         };
         self.btree_advance_state = None;
+    }
+
+    #[inline(always)]
+    fn clear_row_caches(&mut self) {
+        if let Some(record) = self.reusable_immutable_record.as_mut() {
+            record.invalidate();
+        }
+        self.payload_row = None;
     }
 
     #[cfg_attr(not(debug_assertions), allow(unused_variables))]
