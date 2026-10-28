@@ -3,7 +3,7 @@ use crate::alloc::{
     TursoTryWithCapacityExt, TursoVecInExt, ALLOC_ERR_MSG,
 };
 use crate::mvcc::clock::LogicalClock;
-use crate::mvcc::cursor::{static_iterator_hack, MvccIterator, TableScan};
+use crate::mvcc::cursor::{static_iterator_hack, MvccIterator, TableChainWalk, TableScan};
 #[cfg(any(test, injected_yields))]
 use crate::mvcc::yield_hooks::{ProvidesYieldContext, YieldContext, YieldPointMarker};
 use crate::mvcc::yield_points::{inject_transition_failure, inject_transition_yield};
@@ -4455,6 +4455,10 @@ pub struct MvStore<Clock: LogicalClock, A: ConcurrentAllocator = TursoAllocator>
     pub(crate) btree_validity_tx_lookups: AtomicU64,
     #[cfg(test)]
     pub(crate) cursor_chain_payload_reads: AtomicU64,
+    #[cfg(test)]
+    pub(crate) cursor_point_validity_lookups: AtomicU64,
+    #[cfg(test)]
+    pub(crate) cursor_table_walk_starts: AtomicU64,
     /// Final state for removed transactions. Readers may still race with stale TxID
     /// references in row versions after a transaction is removed from `txs`.
     finalized_tx_states: SkipMap<TxID, TransactionState, BasicComparator, A>,
@@ -4704,6 +4708,10 @@ impl<Clock: LogicalClock, A: ConcurrentAllocator> MvStore<Clock, A> {
             btree_validity_tx_lookups: AtomicU64::new(0),
             #[cfg(test)]
             cursor_chain_payload_reads: AtomicU64::new(0),
+            #[cfg(test)]
+            cursor_point_validity_lookups: AtomicU64::new(0),
+            #[cfg(test)]
+            cursor_table_walk_starts: AtomicU64::new(0),
             finalized_tx_states: SkipMap::new_in(alloc.clone()),
             checkpoint_dirty_table_keys: SkipMap::new_in(alloc.clone()),
             checkpoint_dirty_index_keys: SkipMap::new_in(alloc.clone()),
@@ -6169,11 +6177,21 @@ impl<Clock: LogicalClock, A: ConcurrentAllocator> MvStore<Clock, A> {
         tx_id: TxID,
     ) -> Result<bool> {
         self.with_btree_row_chain(table_id, row_id, |versions| {
-            let tx = cursor_transaction
-                .live_transaction()
-                .ok_or_else(|| LimboError::NoSuchTransactionID(tx_id.to_string()))?;
-            Ok(self.transaction_leaves_btree_row_valid(tx, table_id, versions))
+            self.cursor_chain_leaves_btree_row_valid(cursor_transaction, table_id, versions, tx_id)
         })
+    }
+
+    pub(crate) fn cursor_chain_leaves_btree_row_valid(
+        &self,
+        cursor_transaction: &CursorTransaction<Clock, A>,
+        table_id: MVTableId,
+        versions: &[RowVersion],
+        tx_id: TxID,
+    ) -> Result<bool> {
+        let tx = cursor_transaction
+            .live_transaction()
+            .ok_or_else(|| LimboError::NoSuchTransactionID(tx_id.to_string()))?;
+        Ok(self.transaction_leaves_btree_row_valid(tx, table_id, versions))
     }
 
     fn with_btree_row_chain(
@@ -6367,6 +6385,20 @@ impl<Clock: LogicalClock, A: ConcurrentAllocator> MvStore<Clock, A> {
         } else {
             Bound::Excluded(start)
         };
+        *table_iterator = Some(self.table_rows_iterator(start, direction));
+
+        let mv_store_iterator = table_iterator
+            .as_mut()
+            .expect("table_iterator was assigned above if it was None");
+
+        self.find_next_visible_table_row(snapshot, mv_store_iterator, table_id, take_payload)
+    }
+
+    pub(crate) fn table_rows_iterator(
+        &self,
+        start: Bound<RowID>,
+        direction: IterationDirection,
+    ) -> MvccIterator<'static, RowID, A> {
         let range = create_seek_range(start, direction);
         let iter_box = match direction {
             IterationDirection::Forwards => {
@@ -6376,13 +6408,7 @@ impl<Clock: LogicalClock, A: ConcurrentAllocator> MvStore<Clock, A> {
                 Box::new(self.rows.range(range).rev()) as TableRowIterator<'_, A>
             }
         };
-        *table_iterator = Some(static_iterator_hack!(iter_box, RowID, A));
-
-        let mv_store_iterator = table_iterator
-            .as_mut()
-            .expect("table_iterator was assigned above if it was None");
-
-        self.find_next_visible_table_row(snapshot, mv_store_iterator, table_id, take_payload)
+        static_iterator_hack!(iter_box, RowID, A)
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -10694,6 +10720,7 @@ impl<Clock: LogicalClock, A: ConcurrentAllocator> MvStore<Clock, A> {
             unsafe { std::mem::transmute::<TxEntry<'_, A>, TxEntry<'static, A>>(entry) };
         Ok(Box::new(CursorTransaction {
             transaction,
+            table_walk: None,
             _store: self.clone(),
             table_scan: TableScan::new(generation),
             payload_generation: 0,
@@ -11376,6 +11403,7 @@ pub(crate) struct CursorTransaction<
     A: ConcurrentAllocator = TursoAllocator,
 > {
     transaction: TxEntry<'static, A>,
+    pub(crate) table_walk: Option<Box<TableChainWalk<A>>>,
     _store: Arc<MvStore<Clock, A>>,
     pub(crate) table_scan: TableScan,
     pub(crate) payload_generation: u64,
