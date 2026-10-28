@@ -3,7 +3,7 @@ use crate::alloc::{
     TursoTryWithCapacityExt, TursoVecInExt, ALLOC_ERR_MSG,
 };
 use crate::mvcc::clock::LogicalClock;
-use crate::mvcc::cursor::{static_iterator_hack, MvccIterator};
+use crate::mvcc::cursor::{static_iterator_hack, MvccIterator, TableScan};
 #[cfg(any(test, injected_yields))]
 use crate::mvcc::yield_hooks::{ProvidesYieldContext, YieldContext, YieldPointMarker};
 use crate::mvcc::yield_points::{inject_transition_failure, inject_transition_yield};
@@ -951,6 +951,7 @@ struct WriteSet<A: RowVersionAllocator = TursoAllocator> {
     /// reused by cloning the [Arc]. It would be nice to encode this in the type system, but I'm
     /// not sure how.
     seen: HashSet<usize>,
+    table_generations: HashMap<MVTableId, u64>,
 }
 
 impl<A: RowVersionAllocator> Default for WriteSet<A> {
@@ -958,6 +959,7 @@ impl<A: RowVersionAllocator> Default for WriteSet<A> {
         Self {
             entries: Vec::new(),
             seen: HashSet::default(),
+            table_generations: HashMap::default(),
         }
     }
 }
@@ -1103,16 +1105,22 @@ impl<A: RowVersionAllocator> Transaction<A> {
                 .newly_added_to_write_set
                 .push((id.clone(), row_versions.clone()));
         }
-        self.write_set.lock().insert(id, row_versions);
-        if self
-            .write_generation
-            .fetch_update(Ordering::Release, Ordering::Relaxed, |generation| {
-                generation.checked_add(1)
-            })
-            .is_err()
-        {
-            self.abort_now.store(true, Ordering::Release);
-            panic!("transaction write generation overflow");
+        let table_id = matches!(id.row_id, RowKey::Int(_)).then_some(id.table_id);
+        let mut write_set = self.write_set.lock();
+        write_set.insert(id, row_versions);
+        let generation = match self.write_generation.fetch_update(
+            Ordering::Release,
+            Ordering::Relaxed,
+            |generation| generation.checked_add(1),
+        ) {
+            Ok(previous) => previous + 1,
+            Err(_) => {
+                self.abort_now.store(true, Ordering::Release);
+                panic!("transaction write generation overflow");
+            }
+        };
+        if let Some(table_id) = table_id {
+            write_set.table_generations.insert(table_id, generation);
         }
     }
 
@@ -4435,6 +4443,14 @@ pub struct MvStore<Clock: LogicalClock, A: ConcurrentAllocator = TursoAllocator>
     txs: SkipMap<TxID, Transaction<A>, BasicComparator, A>,
     #[cfg(test)]
     tx_abort_lookups: AtomicU64,
+    #[cfg(test)]
+    pub(crate) cursor_count_table: AtomicI64,
+    #[cfg(test)]
+    pub(crate) cursor_physical_visits: AtomicU64,
+    #[cfg(test)]
+    pub(crate) cursor_physical_advances: AtomicU64,
+    #[cfg(test)]
+    pub(crate) cursor_table_generation_reads: AtomicU64,
     /// Final state for removed transactions. Readers may still race with stale TxID
     /// references in row versions after a transaction is removed from `txs`.
     finalized_tx_states: SkipMap<TxID, TransactionState, BasicComparator, A>,
@@ -4672,6 +4688,14 @@ impl<Clock: LogicalClock, A: ConcurrentAllocator> MvStore<Clock, A> {
             txs: SkipMap::new_in(alloc.clone()),
             #[cfg(test)]
             tx_abort_lookups: AtomicU64::new(0),
+            #[cfg(test)]
+            cursor_count_table: AtomicI64::new(0),
+            #[cfg(test)]
+            cursor_physical_visits: AtomicU64::new(0),
+            #[cfg(test)]
+            cursor_physical_advances: AtomicU64::new(0),
+            #[cfg(test)]
+            cursor_table_generation_reads: AtomicU64::new(0),
             finalized_tx_states: SkipMap::new_in(alloc.clone()),
             checkpoint_dirty_table_keys: SkipMap::new_in(alloc.clone()),
             checkpoint_dirty_index_keys: SkipMap::new_in(alloc.clone()),
@@ -7449,16 +7473,35 @@ impl<Clock: LogicalClock, A: ConcurrentAllocator> MvStore<Clock, A> {
 
     fn rollback_savepoint_changes(&self, tx_id: TxID, savepoint: Savepoint<A>) {
         let tx = self.txs.get(&tx_id).unwrap();
-        if tx
-            .value()
-            .write_generation
-            .fetch_update(Ordering::Release, Ordering::Relaxed, |generation| {
-                generation.checked_add(1)
-            })
-            .is_err()
+        let generation = match tx.value().write_generation.fetch_update(
+            Ordering::Release,
+            Ordering::Relaxed,
+            |generation| generation.checked_add(1),
+        ) {
+            Ok(previous) => previous + 1,
+            Err(_) => {
+                tx.value().abort_now.store(true, Ordering::Release);
+                panic!("transaction write generation overflow");
+            }
+        };
         {
-            tx.value().abort_now.store(true, Ordering::Release);
-            panic!("transaction write generation overflow");
+            let mut write_set = tx.value().write_set.lock();
+            for (rowid, _) in savepoint
+                .created_table_versions
+                .iter()
+                .chain(savepoint.deleted_table_versions.iter())
+            {
+                write_set
+                    .table_generations
+                    .insert(rowid.table_id, generation);
+            }
+            for (rowid, _) in &savepoint.newly_added_to_write_set {
+                if matches!(rowid.row_id, RowKey::Int(_)) {
+                    write_set
+                        .table_generations
+                        .insert(rowid.table_id, generation);
+                }
+            }
         }
         drop(tx);
         let Savepoint {
@@ -10601,11 +10644,13 @@ impl<Clock: LogicalClock, A: ConcurrentAllocator> MvStore<Clock, A> {
             .txs
             .get(&tx_id)
             .ok_or_else(|| LimboError::NoSuchTransactionID(tx_id.to_string()))?;
+        let generation = entry.value().write_generation.load(Ordering::Acquire);
         let transaction =
             unsafe { std::mem::transmute::<TxEntry<'_, A>, TxEntry<'static, A>>(entry) };
         Ok(Box::new(CursorTransaction {
             transaction,
             _store: self.clone(),
+            table_scan: TableScan::new(generation),
         }))
     }
 }
@@ -11279,16 +11324,46 @@ impl Ord for RowID {
     }
 }
 
+#[repr(C)]
 pub(crate) struct CursorTransaction<
     Clock: LogicalClock + 'static,
     A: ConcurrentAllocator = TursoAllocator,
 > {
     transaction: TxEntry<'static, A>,
     _store: Arc<MvStore<Clock, A>>,
+    pub(crate) table_scan: TableScan,
 }
 
 impl<Clock: LogicalClock, A: ConcurrentAllocator> CursorTransaction<Clock, A> {
     pub(crate) fn should_abort(&self) -> bool {
         !self.transaction.is_removed() && self.transaction.value().abort_now.load(Ordering::Acquire)
+    }
+}
+
+impl<Clock: LogicalClock, A: ConcurrentAllocator> CursorTransaction<Clock, A> {
+    pub(crate) fn write_generation(&self) -> u64 {
+        self.transaction
+            .value()
+            .write_generation
+            .load(Ordering::Acquire)
+    }
+
+    pub(crate) fn table_write_generation(&self, table_id: MVTableId) -> u64 {
+        #[cfg(test)]
+        self._store
+            .cursor_table_generation_reads
+            .fetch_add(1, Ordering::Relaxed);
+        self.transaction
+            .value()
+            .write_set
+            .lock()
+            .table_generations
+            .get(&table_id)
+            .copied()
+            .unwrap_or(0)
+    }
+
+    pub(crate) fn is_removed(&self) -> bool {
+        self.transaction.is_removed()
     }
 }

@@ -877,6 +877,17 @@ impl<Clock: LogicalClock + 'static, A: ConcurrentAllocator> MvccLazyCursor<Clock
     }
 
     fn query_btree_version_is_valid(&self, key: &RowKey) -> Result<bool> {
+        #[cfg(test)]
+        if self
+            .db
+            .cursor_count_table
+            .load(crate::sync::atomic::Ordering::Relaxed)
+            == i64::from(self.table_id)
+        {
+            self.db
+                .cursor_physical_visits
+                .fetch_add(1, crate::sync::atomic::Ordering::Relaxed);
+        }
         self.db
             .query_btree_version_is_valid(self.table_id, key, self.snapshot.tx_id)
     }
@@ -1007,6 +1018,17 @@ impl<Clock: LogicalClock + 'static, A: ConcurrentAllocator> MvccLazyCursor<Clock
                 }
                 Some(AdvanceBtreeState::NextBtree) => {
                     let peek = &mut self.dual_peek;
+                    #[cfg(test)]
+                    if self
+                        .db
+                        .cursor_count_table
+                        .load(crate::sync::atomic::Ordering::Relaxed)
+                        == i64::from(self.table_id)
+                    {
+                        self.db
+                            .cursor_physical_advances
+                            .fetch_add(1, crate::sync::atomic::Ordering::Relaxed);
+                    }
                     return_if_io!(self.btree_cursor.next());
                     let found = self.btree_cursor.has_record();
                     if !found {
@@ -1094,6 +1116,17 @@ impl<Clock: LogicalClock + 'static, A: ConcurrentAllocator> MvccLazyCursor<Clock
                     }
                 }
                 Some(AdvanceBtreeState::NextBtree) => {
+                    #[cfg(test)]
+                    if self
+                        .db
+                        .cursor_count_table
+                        .load(crate::sync::atomic::Ordering::Relaxed)
+                        == i64::from(self.table_id)
+                    {
+                        self.db
+                            .cursor_physical_advances
+                            .fetch_add(1, crate::sync::atomic::Ordering::Relaxed);
+                    }
                     return_if_io!(self.btree_cursor.prev());
                     let peek = &mut self.dual_peek;
                     let found = self.btree_cursor.has_record();
@@ -1358,6 +1391,7 @@ impl<Clock: LogicalClock + 'static, A: ConcurrentAllocator> CursorTrait
         self.set_null_flag(false);
         let state = self.state.clone();
         if state.is_none() {
+            self.reset_table_scan();
             let _ = self.table_iterator.take();
             let _ = self.index_iterator.take();
             self.reset_dual_peek();
@@ -1430,6 +1464,10 @@ impl<Clock: LogicalClock + 'static, A: ConcurrentAllocator> CursorTrait
             self.range_position,
             TableRangePosition::Backwards | TableRangePosition::Point
         ) {
+            if self.transaction.table_scan.generation != self.transaction.write_generation() {
+                return self.resume_table_scan_after_write(IterationDirection::Forwards);
+            }
+
             let result = match &self.current_pos {
                 CursorPosition::Loaded {
                     row_id:
@@ -1475,6 +1513,9 @@ impl<Clock: LogicalClock + 'static, A: ConcurrentAllocator> CursorTrait
                     .replace(MvccLazyCursorState::Next(NextState::CheckNeedsAdvance));
                 inject_io_yield!(self, CursorYieldPoint::NextStart);
             }
+        }
+        if self.transaction.table_scan.generation != self.transaction.write_generation() {
+            return self.resume_table_scan_after_write(IterationDirection::Forwards);
         }
         // If it was uninitialized, we need to advance the btree first
         if matches!(
@@ -1552,6 +1593,10 @@ impl<Clock: LogicalClock + 'static, A: ConcurrentAllocator> CursorTrait
             self.range_position,
             TableRangePosition::Forwards | TableRangePosition::Point
         ) {
+            if self.transaction.table_scan.generation != self.transaction.write_generation() {
+                return self.resume_table_scan_after_write(IterationDirection::Backwards);
+            }
+
             let result = match &self.current_pos {
                 CursorPosition::Loaded {
                     row_id:
@@ -1594,6 +1639,9 @@ impl<Clock: LogicalClock + 'static, A: ConcurrentAllocator> CursorTrait
             }
         }
 
+        if self.transaction.table_scan.generation != self.transaction.write_generation() {
+            return self.resume_table_scan_after_write(IterationDirection::Backwards);
+        }
         if matches!(
             self.state.as_ref().expect("prev state is not initialized"),
             MvccLazyCursorState::Prev(PrevState::AdvanceUnitialized)
@@ -1806,6 +1854,7 @@ impl<Clock: LogicalClock + 'static, A: ConcurrentAllocator> CursorTrait
             let state = self.state.clone();
             match state {
                 None => {
+                    self.reset_table_scan();
                     // Initial state: Reset and do MVCC seek
                     let _ = self.table_iterator.take();
                     let _ = self.index_iterator.take();
@@ -2114,6 +2163,7 @@ impl<Clock: LogicalClock + 'static, A: ConcurrentAllocator> CursorTrait
             _ => false,
         };
 
+        self.save_table_write_frontier();
         self.current_pos = CursorPosition::Loaded {
             row_id: row.id.clone(),
             in_btree: was_btree_resident,
@@ -2211,6 +2261,7 @@ impl<Clock: LogicalClock + 'static, A: ConcurrentAllocator> CursorTrait
 
     fn exists(&mut self, key: &Value) -> IOResultOr<bool> {
         if self.state.is_none() {
+            self.reset_table_scan();
             let _ = self.table_iterator.take();
             let _ = self.index_iterator.take();
             self.reset_dual_peek();
@@ -2457,6 +2508,7 @@ impl<Clock: LogicalClock + 'static, A: ConcurrentAllocator> CursorTrait
         self.set_null_flag(false);
         let state = self.state.clone();
         if state.is_none() {
+            self.reset_table_scan();
             let _ = self.table_iterator.take();
             let _ = self.index_iterator.take();
             self.reset_dual_peek();
@@ -2590,4 +2642,194 @@ impl<Clock: LogicalClock, A: ConcurrentAllocator> Debug for MvccLazyCursor<Clock
             .field("btree_cursor", &())
             .finish()
     }
+}
+
+impl<Clock: LogicalClock + 'static, A: ConcurrentAllocator> MvccLazyCursor<Clock, A> {
+    #[cold]
+    fn resume_table_scan_after_write(&mut self, direction: IterationDirection) -> IOResultOr<()> {
+        let observed = self.transaction.write_generation();
+        if !matches!(self.mv_cursor_type, MvccCursorType::Table) || self.transaction.is_removed() {
+            self.transaction.table_scan.generation = observed;
+            return match direction {
+                IterationDirection::Forwards => self.next(),
+                IterationDirection::Backwards => self.prev(),
+            };
+        }
+        let table_generation = self.transaction.table_write_generation(self.table_id);
+        if self.transaction.table_scan.resume.is_none()
+            && table_generation <= self.transaction.table_scan.generation
+        {
+            self.transaction.table_scan.generation = observed;
+            return match direction {
+                IterationDirection::Forwards => self.next(),
+                IterationDirection::Backwards => self.prev(),
+            };
+        }
+        let cached = self.transaction.table_scan.generation;
+        let movement_pending = self.btree_advance_state.is_some()
+            || matches!(
+                self.state,
+                Some(
+                    MvccLazyCursorState::Seek(..)
+                        | MvccLazyCursorState::Rewind(..)
+                        | MvccLazyCursorState::Exists(..)
+                        | MvccLazyCursorState::Next(NextState::AdvanceUnitialized)
+                        | MvccLazyCursorState::Prev(PrevState::AdvanceUnitialized)
+                )
+            );
+        if self.transaction.table_scan.resume.is_none() && !movement_pending {
+            self.state = None;
+        }
+        let mut resume = match self.transaction.table_scan.resume {
+            Some(resume) => resume,
+            None => TableScanResume {
+                frontier: self
+                    .transaction
+                    .table_scan
+                    .write_frontier
+                    .unwrap_or_else(|| self.table_scan_frontier()),
+                phase: if movement_pending {
+                    TableScanPhase::Drain
+                } else {
+                    TableScanPhase::Seek
+                },
+                table_generation,
+            },
+        };
+        loop {
+            let generation = self.transaction.write_generation();
+            self.transaction.table_scan.generation = generation;
+            let result = match resume.phase {
+                TableScanPhase::Drain => {
+                    self.current_pos = match resume.frontier {
+                        TableScanFrontier::BeforeFirst => CursorPosition::BeforeFirst,
+                        TableScanFrontier::At { rowid, in_btree } => CursorPosition::Loaded {
+                            row_id: RowID::new(self.table_id, RowKey::Int(rowid)),
+                            in_btree,
+                            versions: None,
+                        },
+                        TableScanFrontier::End => CursorPosition::End,
+                    };
+                    match direction {
+                        IterationDirection::Forwards => self.next(),
+                        IterationDirection::Backwards => self.prev(),
+                    }
+                }
+                TableScanPhase::Seek => match (resume.frontier, direction) {
+                    (TableScanFrontier::At { rowid, .. }, IterationDirection::Forwards) => self
+                        .seek(SeekKey::TableRowId(rowid), SeekOp::GT)
+                        .map(|r| r.map(|_| ())),
+                    (TableScanFrontier::At { rowid, .. }, IterationDirection::Backwards) => self
+                        .seek(SeekKey::TableRowId(rowid), SeekOp::LT)
+                        .map(|r| r.map(|_| ())),
+                    (TableScanFrontier::BeforeFirst, IterationDirection::Forwards) => self.rewind(),
+                    (TableScanFrontier::End, IterationDirection::Backwards) => self.last(),
+                    (TableScanFrontier::BeforeFirst, IterationDirection::Backwards) => {
+                        self.current_pos = CursorPosition::BeforeFirst;
+                        Ok(IOResult::Done(()))
+                    }
+                    (TableScanFrontier::End, IterationDirection::Forwards) => {
+                        self.current_pos = CursorPosition::End;
+                        Ok(IOResult::Done(()))
+                    }
+                },
+            };
+            self.transaction.table_scan.generation = cached;
+            match result? {
+                IOResult::IO(io) => {
+                    self.transaction.table_scan.resume = Some(resume);
+                    return Ok(IOResult::IO(io));
+                }
+                IOResult::Done(()) => match resume.phase {
+                    TableScanPhase::Drain => {
+                        resume.phase = TableScanPhase::Seek;
+                        resume.table_generation =
+                            self.transaction.table_write_generation(self.table_id);
+                    }
+                    TableScanPhase::Seek => {
+                        let current = self.transaction.table_write_generation(self.table_id);
+                        if current != resume.table_generation {
+                            resume.table_generation = current;
+                            continue;
+                        }
+                        self.transaction.table_scan = TableScan {
+                            generation: self.transaction.write_generation(),
+                            ..TableScan::default()
+                        };
+                        self.range_position = match direction {
+                            IterationDirection::Forwards => TableRangePosition::Forwards,
+                            IterationDirection::Backwards => TableRangePosition::Backwards,
+                        };
+                        return Ok(IOResult::Done(()));
+                    }
+                },
+            }
+        }
+    }
+
+    fn save_table_write_frontier(&mut self) {
+        if matches!(self.mv_cursor_type, MvccCursorType::Table)
+            && !self.dual_peek.both_uninitialized()
+            && self.transaction.table_scan.write_frontier.is_none()
+            && self.transaction.table_scan.resume.is_none()
+        {
+            self.transaction.table_scan.write_frontier = Some(self.table_scan_frontier());
+        }
+    }
+
+    fn reset_table_scan(&mut self) {
+        if !matches!(self.mv_cursor_type, MvccCursorType::Table) {
+            return;
+        }
+        self.transaction.table_scan = TableScan::new(self.transaction.write_generation());
+    }
+
+    fn table_scan_frontier(&self) -> TableScanFrontier {
+        match &self.current_pos {
+            CursorPosition::BeforeFirst => TableScanFrontier::BeforeFirst,
+            CursorPosition::End => TableScanFrontier::End,
+            CursorPosition::Loaded {
+                row_id, in_btree, ..
+            } => TableScanFrontier::At {
+                rowid: row_id.row_id.to_int_or_panic(),
+                in_btree: *in_btree,
+            },
+        }
+    }
+}
+
+#[derive(Default)]
+pub(crate) struct TableScan {
+    generation: u64,
+    write_frontier: Option<TableScanFrontier>,
+    resume: Option<TableScanResume>,
+}
+
+impl TableScan {
+    pub(crate) fn new(generation: u64) -> Self {
+        Self {
+            generation,
+            ..Self::default()
+        }
+    }
+}
+
+#[derive(Clone, Copy)]
+enum TableScanFrontier {
+    BeforeFirst,
+    At { rowid: i64, in_btree: bool },
+    End,
+}
+
+#[derive(Clone, Copy)]
+struct TableScanResume {
+    frontier: TableScanFrontier,
+    phase: TableScanPhase,
+    table_generation: u64,
+}
+
+#[derive(Clone, Copy)]
+enum TableScanPhase {
+    Drain,
+    Seek,
 }

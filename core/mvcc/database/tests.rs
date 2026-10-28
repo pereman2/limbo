@@ -7683,6 +7683,1046 @@ fn test_sequence_watermark_reader_never_skips_committed_rows_fuzz() {
 }
 
 #[test]
+fn test_lazy_cursor_positioning_does_not_read_table_generation() {
+    let mut measurements = Vec::new();
+    for checkpoint in [false, true] {
+        let (db, conn) = setup_lazy_write_scan(checkpoint);
+        let store = db.get_mvcc_store();
+        store
+            .cursor_table_generation_reads
+            .store(0, Ordering::Relaxed);
+        let mut cursor = open_lazy_payload_cursor(&db, &conn);
+        measurements.push((
+            checkpoint,
+            "open",
+            store.cursor_table_generation_reads.load(Ordering::Relaxed),
+        ));
+        for (operation, expected, payload) in [
+            ("seek_two", 2, "two"),
+            ("seek_four", 4, "four"),
+            ("exists_two", 2, "two"),
+            ("exists_four", 4, "four"),
+            ("rewind", 1, "one"),
+            ("last", 5, "five"),
+        ] {
+            store
+                .cursor_table_generation_reads
+                .store(0, Ordering::Relaxed);
+            if operation.starts_with("seek_") {
+                assert_eq!(
+                    drive_lazy_payload_io(&conn, || cursor
+                        .seek(SeekKey::TableRowId(expected), SeekOp::GE { eq_only: true })),
+                    SeekResult::Found
+                );
+            } else if operation.starts_with("exists_") {
+                assert!(drive_lazy_payload_io(&conn, || cursor.exists(&Value::from_i64(expected))));
+            } else if operation == "rewind" {
+                drive_lazy_payload_io(&conn, || cursor.rewind());
+            } else {
+                drive_lazy_payload_io(&conn, || cursor.last());
+            }
+            measurements.push((
+                checkpoint,
+                operation,
+                store.cursor_table_generation_reads.load(Ordering::Relaxed),
+            ));
+            assert_eq!(
+                drive_lazy_payload_io(&conn, || cursor.rowid()),
+                Some(expected)
+            );
+            assert_eq!(
+                payload_text(&lazy_payload_bytes(&conn, &mut cursor).unwrap()),
+                payload
+            );
+        }
+        assert_eq!(
+            store
+                .write_generation(conn.get_mv_tx_id().unwrap())
+                .unwrap(),
+            0
+        );
+        conn.execute("ROLLBACK").unwrap();
+    }
+    println!("table-generation lock and map reads: {measurements:?}");
+    assert!(
+        measurements.iter().all(|(_, _, reads)| *reads == 0),
+        "fresh positioning must not lock the write set or read its table map: {measurements:?}"
+    );
+}
+
+#[test]
+fn test_lazy_cursor_positioning_refreshes_after_table_write() {
+    for checkpoint in [false, true] {
+        for backwards in [false, true] {
+            for operation in ["open", "seek", "range", "exists", "rewind", "last"] {
+                if (operation == "open" || operation == "rewind") && backwards
+                    || operation == "last" && !backwards
+                {
+                    continue;
+                }
+                let (db, conn) = setup_lazy_write_scan(checkpoint);
+                conn.execute("CREATE TABLE other(id INTEGER PRIMARY KEY)")
+                    .unwrap();
+                conn.execute("UPDATE t SET v='before' WHERE id=4").unwrap();
+                conn.execute("INSERT INTO other VALUES (0)").unwrap();
+                let mut cursor = open_lazy_payload_cursor(&db, &conn);
+                position_lazy_write_scan(&conn, &mut cursor, operation, backwards);
+                assert_eq!(
+                    drive_lazy_payload_io(&conn, || cursor.rowid()),
+                    Some(if backwards { 5 } else { 1 })
+                );
+                conn.execute("INSERT INTO t VALUES (3,'three')").unwrap();
+                drive_lazy_payload_io(&conn, || {
+                    if backwards {
+                        cursor.prev()
+                    } else {
+                        cursor.next()
+                    }
+                });
+                let expected = if backwards {
+                    vec![(4, "before"), (3, "three"), (2, "two"), (1, "one")]
+                } else {
+                    vec![(2, "two"), (3, "three"), (4, "before"), (5, "five")]
+                };
+                assert_eq!(
+                    collect_lazy_write_scan(&conn, &mut cursor, backwards),
+                    expected
+                        .into_iter()
+                        .map(|(id, v)| (id, v.to_string()))
+                        .collect::<Vec<_>>(),
+                    "checkpoint={checkpoint} backwards={backwards} operation={operation}"
+                );
+                conn.execute("ROLLBACK").unwrap();
+            }
+        }
+    }
+}
+
+#[test]
+fn test_lazy_cursor_positioning_keeps_sources_after_unrelated_write() {
+    for backwards in [false, true] {
+        for operation in ["open", "seek", "range", "exists", "rewind", "last"] {
+            if (operation == "open" || operation == "rewind") && backwards
+                || operation == "last" && !backwards
+            {
+                continue;
+            }
+            let (db, conn) = setup_lazy_write_scan(true);
+            conn.execute("CREATE TABLE other(id INTEGER PRIMARY KEY)")
+                .unwrap();
+            conn.execute("UPDATE t SET v='updated' || id").unwrap();
+            conn.execute("INSERT INTO other VALUES (0)").unwrap();
+            let mut cursor = open_lazy_payload_cursor(&db, &conn);
+            position_lazy_write_scan(&conn, &mut cursor, operation, backwards);
+            if operation == "seek" || operation == "exists" {
+                drive_lazy_payload_io(&conn, || {
+                    if backwards {
+                        cursor.prev()
+                    } else {
+                        cursor.next()
+                    }
+                });
+            }
+            let frontier = drive_lazy_payload_io(&conn, || cursor.rowid()).unwrap();
+            let store = db.get_mvcc_store();
+            let root = get_rows(&conn, "SELECT rootpage FROM sqlite_schema WHERE name='t'")[0][0]
+                .as_int()
+                .unwrap();
+            store.cursor_count_table.store(
+                i64::from(store.get_table_id_from_root_page(root)),
+                Ordering::Relaxed,
+            );
+            conn.execute("INSERT INTO other VALUES (1)").unwrap();
+            store.cursor_physical_visits.store(0, Ordering::Relaxed);
+            drive_lazy_payload_io(&conn, || {
+                if backwards {
+                    cursor.prev()
+                } else {
+                    cursor.next()
+                }
+            });
+            let rows = collect_lazy_write_scan(&conn, &mut cursor, backwards);
+            let mut expected: Vec<_> = [1, 2, 4, 5]
+                .into_iter()
+                .filter(|id| {
+                    if backwards {
+                        *id < frontier
+                    } else {
+                        *id > frontier
+                    }
+                })
+                .map(|id| (id, format!("updated{id}")))
+                .collect();
+            if backwards {
+                expected.reverse();
+            }
+            assert_eq!(
+                rows, expected,
+                "backwards={backwards} operation={operation}"
+            );
+            assert_eq!(store.cursor_physical_visits.load(Ordering::Relaxed),0,"unrelated writes must not revisit the hidden physical source: backwards={backwards} operation={operation}");
+            conn.execute("ROLLBACK").unwrap();
+        }
+    }
+}
+
+fn position_lazy_write_scan(
+    conn: &Arc<Connection>,
+    cursor: &mut MvccLazyCursor<MvccClock, crate::alloc::DynAllocator>,
+    operation: &str,
+    backwards: bool,
+) {
+    match operation {
+        "open" => drive_lazy_payload_io(conn, || cursor.next()),
+        "seek" | "range" => assert_eq!(
+            drive_lazy_payload_io(conn, || cursor.seek(
+                SeekKey::TableRowId(if backwards { 5 } else { 1 }),
+                if backwards {
+                    SeekOp::LE {
+                        eq_only: operation == "seek",
+                    }
+                } else {
+                    SeekOp::GE {
+                        eq_only: operation == "seek",
+                    }
+                }
+            )),
+            SeekResult::Found
+        ),
+        "exists" => assert!(drive_lazy_payload_io(conn, || cursor
+            .exists(&Value::from_i64(if backwards { 5 } else { 1 })))),
+        "rewind" => drive_lazy_payload_io(conn, || cursor.rewind()),
+        "last" => drive_lazy_payload_io(conn, || cursor.last()),
+        _ => unreachable!(),
+    }
+}
+
+#[test]
+fn test_lazy_cursor_write_scan_bounds_hidden_physical_visits() {
+    let mut measurements = Vec::new();
+    for n in [16, 32] {
+        for backwards in [false, true] {
+            for indexes in [false, true] {
+                let db = MvccTestDbNoConn::new();
+                let conn = db.connect();
+                conn.execute("PRAGMA mvcc_checkpoint_threshold=-1").unwrap();
+                conn.execute("CREATE TABLE t(id INTEGER PRIMARY KEY,v TEXT)")
+                    .unwrap();
+                conn.execute("CREATE TABLE other(id INTEGER PRIMARY KEY)")
+                    .unwrap();
+                conn.execute(format!("WITH RECURSIVE ids(id) AS (VALUES(1) UNION ALL SELECT id+1 FROM ids WHERE id<{n}) INSERT INTO t SELECT id,'old' FROM ids")).unwrap();
+                conn.execute("PRAGMA wal_checkpoint(TRUNCATE)").unwrap();
+                conn.execute("UPDATE t SET v = 'updated' || id").unwrap();
+                conn.execute("BEGIN CONCURRENT").unwrap();
+                let mut cursor = open_lazy_payload_cursor(&db, &conn);
+                let store = db.get_mvcc_store();
+                let root = get_rows(&conn, "SELECT rootpage FROM sqlite_schema WHERE name='t'")[0]
+                    [0]
+                .as_int()
+                .unwrap();
+                store.cursor_count_table.store(
+                    i64::from(store.get_table_id_from_root_page(root)),
+                    Ordering::Relaxed,
+                );
+                store.cursor_physical_visits.store(0, Ordering::Relaxed);
+                drive_lazy_payload_io(&conn, || {
+                    if backwards {
+                        cursor.last()
+                    } else {
+                        cursor.rewind()
+                    }
+                });
+                let mut visits = store.cursor_physical_visits.load(Ordering::Relaxed);
+                let mut rows = Vec::new();
+                while let Some(id) = drive_lazy_payload_io(&conn, || cursor.rowid()) {
+                    rows.push((
+                        id,
+                        payload_text(&lazy_payload_bytes(&conn, &mut cursor).unwrap()),
+                    ));
+                    if indexes {
+                        conn.execute(format!("CREATE INDEX i{id} ON t(v)")).unwrap();
+                    } else {
+                        conn.execute(format!("INSERT INTO other VALUES ({id})"))
+                            .unwrap();
+                    }
+                    store.cursor_physical_visits.store(0, Ordering::Relaxed);
+                    drive_lazy_payload_io(&conn, || {
+                        if backwards {
+                            cursor.prev()
+                        } else {
+                            cursor.next()
+                        }
+                    });
+                    visits += store.cursor_physical_visits.load(Ordering::Relaxed);
+                }
+                let mut expected: Vec<_> = (1..=n).map(|id| (id, format!("updated{id}"))).collect();
+                if backwards {
+                    expected.reverse();
+                }
+                assert_eq!(rows, expected);
+                println!("n={n} backwards={backwards} indexes={indexes}: physical visits={visits}");
+                measurements.push((n, backwards, indexes, visits));
+                conn.execute("ROLLBACK").unwrap();
+            }
+        }
+    }
+    assert!(
+        measurements
+            .iter()
+            .all(|(n, _, _, visits)| *visits <= 2 * *n as u64),
+        "physical validation visits must stay linear: {measurements:?}"
+    );
+}
+
+#[test]
+fn test_lazy_cursor_write_scan_refresh_skips_unstarted_movement() {
+    let mut measurements = Vec::new();
+    for backwards in [false, true] {
+        let (db, conn) = setup_lazy_write_scan(true);
+        let mut cursor = open_lazy_payload_cursor(&db, &conn);
+        let mut reference = open_lazy_payload_cursor(&db, &conn);
+        for c in [&mut cursor, &mut reference] {
+            drive_lazy_payload_io(&conn, || if backwards { c.last() } else { c.rewind() });
+        }
+        let store = db.get_mvcc_store();
+        let root = get_rows(&conn, "SELECT rootpage FROM sqlite_schema WHERE name='t'")[0][0]
+            .as_int()
+            .unwrap();
+        store.cursor_count_table.store(
+            i64::from(store.get_table_id_from_root_page(root)),
+            Ordering::Relaxed,
+        );
+        conn.execute("INSERT INTO t VALUES (3,'three')").unwrap();
+        store.cursor_physical_advances.store(0, Ordering::Relaxed);
+        assert_eq!(
+            drive_lazy_payload_io(&conn, || reference.seek(
+                SeekKey::TableRowId(if backwards { 5 } else { 1 }),
+                if backwards { SeekOp::LT } else { SeekOp::GT }
+            )),
+            SeekResult::Found
+        );
+        let required = store.cursor_physical_advances.load(Ordering::Relaxed);
+        store.cursor_physical_advances.store(0, Ordering::Relaxed);
+        drive_lazy_payload_io(&conn, || {
+            if backwards {
+                cursor.prev()
+            } else {
+                cursor.next()
+            }
+        });
+        let actual = store.cursor_physical_advances.load(Ordering::Relaxed);
+        println!("backwards={backwards}: required advances={required}, actual={actual}");
+        measurements.push((backwards, required, actual));
+        let expected = if backwards {
+            vec![(4, "four"), (3, "three"), (2, "two"), (1, "one")]
+        } else {
+            vec![(2, "two"), (3, "three"), (4, "four"), (5, "five")]
+        };
+        assert_eq!(
+            collect_lazy_write_scan(&conn, &mut cursor, backwards),
+            expected
+                .into_iter()
+                .map(|(id, v)| (id, v.to_string()))
+                .collect::<Vec<_>>()
+        );
+        conn.execute("ROLLBACK").unwrap();
+    }
+    assert!(
+        measurements
+            .iter()
+            .all(|(_, required, actual)| required == actual),
+        "a completed movement must not be advanced before refreshing: {measurements:?}"
+    );
+}
+
+#[test]
+fn test_lazy_cursor_write_scan_refresh_keeps_snapshot_during_checkpoint() {
+    for backwards in [false, true] {
+        for abandon in [false, true] {
+            let db = MvccTestDbNoConn::new_with_random_db_passive();
+            let conn = db.connect();
+            conn.execute("PRAGMA mvcc_checkpoint_threshold=-1").unwrap();
+            conn.execute("CREATE TABLE t(id INTEGER PRIMARY KEY,v TEXT)")
+                .unwrap();
+            conn.execute("CREATE TABLE other(id INTEGER PRIMARY KEY)")
+                .unwrap();
+            conn.execute("INSERT INTO t VALUES (1,'one'),(2,'two'),(4,'four'),(5,'five')")
+                .unwrap();
+            conn.execute("PRAGMA wal_checkpoint(TRUNCATE)").unwrap();
+            conn.execute("BEGIN CONCURRENT").unwrap();
+            let mut cursor = open_lazy_payload_cursor(&db, &conn);
+            drive_lazy_payload_io(&conn, || {
+                if backwards {
+                    cursor.last()
+                } else {
+                    cursor.rewind()
+                }
+            });
+            conn.execute("INSERT INTO t VALUES (3,'three')").unwrap();
+            let injector = FixedYieldInjector::new([CursorYieldPoint::SeekBtreeProgress.point()]);
+            conn.set_yield_injector(Some(injector.clone()));
+            let IOResult::IO(pending) = (if backwards {
+                cursor.prev()
+            } else {
+                cursor.next()
+            })
+            .unwrap() else {
+                panic!("refresh must yield during physical seek");
+            };
+            assert!(pending.is_explicit_yield());
+            assert!(injector.is_empty());
+            conn.set_yield_injector(None);
+            let writer = db.connect();
+            writer
+                .execute("PRAGMA mvcc_checkpoint_threshold=-1")
+                .unwrap();
+            writer.execute("BEGIN CONCURRENT").unwrap();
+            writer
+                .execute("UPDATE t SET v='foreign' WHERE id=2")
+                .unwrap();
+            writer.execute("DELETE FROM t WHERE id=4").unwrap();
+            writer.execute("INSERT INTO t VALUES (6,'six')").unwrap();
+            writer.execute("COMMIT").unwrap();
+            writer.execute("PRAGMA wal_checkpoint(PASSIVE)").unwrap();
+            let store = db.get_mvcc_store();
+            store.gc_incremental(usize::MAX);
+            store.drop_unused_row_versions();
+            pending.wait(conn.db.io.as_ref()).unwrap();
+            if abandon {
+                drop(cursor);
+                cursor = open_lazy_payload_cursor(&db, &conn);
+                assert_eq!(
+                    drive_lazy_payload_io(&conn, || cursor.seek(
+                        SeekKey::TableRowId(if backwards { 5 } else { 1 }),
+                        if backwards { SeekOp::LT } else { SeekOp::GT }
+                    )),
+                    SeekResult::Found
+                );
+            } else {
+                drive_lazy_payload_io(&conn, || {
+                    if backwards {
+                        cursor.prev()
+                    } else {
+                        cursor.next()
+                    }
+                });
+            }
+            let mut rows = Vec::new();
+            while let Some(id) = drive_lazy_payload_io(&conn, || cursor.rowid()) {
+                rows.push((
+                    id,
+                    payload_text(&lazy_payload_bytes(&conn, &mut cursor).unwrap()),
+                ));
+                conn.execute(format!("INSERT INTO other VALUES ({id})"))
+                    .unwrap();
+                drive_lazy_payload_io(&conn, || {
+                    if backwards {
+                        cursor.prev()
+                    } else {
+                        cursor.next()
+                    }
+                });
+            }
+            let expected = if backwards {
+                vec![(4, "four"), (3, "three"), (2, "two"), (1, "one")]
+            } else {
+                vec![(2, "two"), (3, "three"), (4, "four"), (5, "five")]
+            };
+            assert_eq!(
+                rows,
+                expected
+                    .into_iter()
+                    .map(|(id, v)| (id, v.to_string()))
+                    .collect::<Vec<_>>(),
+                "backwards={backwards} abandon={abandon}"
+            );
+            drop(cursor);
+            conn.execute("ROLLBACK").unwrap();
+            conn.execute("INSERT INTO t VALUES (3,'fresh')").unwrap();
+            assert_eq!(
+                get_rows(&conn, "SELECT id,v FROM t ORDER BY id"),
+                [
+                    (1, "one"),
+                    (2, "foreign"),
+                    (3, "fresh"),
+                    (5, "five"),
+                    (6, "six")
+                ]
+                .into_iter()
+                .map(|(id, v)| vec![Value::from_i64(id), Value::build_text(v)])
+                .collect::<Vec<_>>()
+            );
+        }
+    }
+}
+
+#[test]
+fn test_lazy_cursor_write_scan_switches_direction_after_refresh() {
+    for backwards in [false, true] {
+        let (db, conn) = setup_lazy_write_scan(true);
+        conn.execute("CREATE TABLE other(id INTEGER PRIMARY KEY)")
+            .unwrap();
+        let mut cursor = open_lazy_payload_cursor(&db, &conn);
+        drive_lazy_payload_io(&conn, || {
+            if backwards {
+                cursor.last()
+            } else {
+                cursor.rewind()
+            }
+        });
+        conn.execute("INSERT INTO t VALUES (3,'three')").unwrap();
+        drive_lazy_payload_io(&conn, || {
+            if backwards {
+                cursor.prev()
+            } else {
+                cursor.next()
+            }
+        });
+        assert_eq!(
+            drive_lazy_payload_io(&conn, || cursor.rowid()),
+            Some(if backwards { 4 } else { 2 })
+        );
+        assert_eq!(
+            payload_text(&lazy_payload_bytes(&conn, &mut cursor).unwrap()),
+            if backwards { "four" } else { "two" }
+        );
+        conn.execute("INSERT INTO other VALUES (1)").unwrap();
+        drive_lazy_payload_io(&conn, || {
+            if backwards {
+                cursor.next()
+            } else {
+                cursor.prev()
+            }
+        });
+        assert_eq!(
+            drive_lazy_payload_io(&conn, || cursor.rowid()),
+            Some(if backwards { 5 } else { 1 })
+        );
+        assert_eq!(
+            payload_text(&lazy_payload_bytes(&conn, &mut cursor).unwrap()),
+            if backwards { "five" } else { "one" }
+        );
+        drive_lazy_payload_io(&conn, || {
+            if backwards {
+                cursor.prev()
+            } else {
+                cursor.next()
+            }
+        });
+        assert_eq!(
+            drive_lazy_payload_io(&conn, || cursor.rowid()),
+            Some(if backwards { 4 } else { 2 })
+        );
+        conn.execute("ROLLBACK").unwrap();
+    }
+}
+
+#[test]
+fn test_lazy_cursor_write_scan_sees_insert_after_checkpoint() {
+    let db = MvccTestDbNoConn::new();
+    let conn = db.connect();
+    conn.execute("CREATE TABLE t(id INTEGER PRIMARY KEY, v TEXT)")
+        .unwrap();
+    conn.execute("INSERT INTO t VALUES (1, 'first'), (2, 'second')")
+        .unwrap();
+    conn.execute("PRAGMA wal_checkpoint(TRUNCATE)").unwrap();
+    conn.execute("BEGIN CONCURRENT").unwrap();
+    let rows = scan_with_write_after_rows(
+        &conn,
+        "SELECT id, v FROM t ORDER BY id",
+        1,
+        &conn,
+        "INSERT INTO t VALUES (3, 'own')",
+    );
+    assert_eq!(rows, "1|first,2|second,3|own");
+    conn.execute("ROLLBACK").unwrap();
+}
+
+#[test]
+fn test_lazy_cursor_write_scan_keeps_frontier_after_insert() {
+    for checkpoint in [false, true] {
+        for backwards in [false, true] {
+            for probe in [false, true] {
+                let (db, conn) = setup_lazy_write_scan(checkpoint);
+                let mut cursor = open_lazy_payload_cursor(&db, &conn);
+                drive_lazy_payload_io(&conn, || {
+                    if backwards {
+                        cursor.last()
+                    } else {
+                        cursor.rewind()
+                    }
+                });
+                assert_eq!(
+                    drive_lazy_payload_io(&conn, || cursor.rowid()),
+                    Some(if backwards { 5 } else { 1 })
+                );
+                let record =
+                    ImmutableRecord::from_values(&[Value::Null, Value::build_text("three")], 2)
+                        .unwrap();
+                drive_lazy_payload_io(&conn, || {
+                    cursor.insert(&BTreeKey::new_table_rowid(3, Some(&record)))
+                });
+                assert_eq!(drive_lazy_payload_io(&conn, || cursor.rowid()), Some(3));
+                assert_eq!(
+                    payload_text(&lazy_payload_bytes(&conn, &mut cursor).unwrap()),
+                    "three"
+                );
+                if probe {
+                    assert_eq!(
+                        drive_lazy_payload_io(&conn, || cursor
+                            .seek(SeekKey::TableRowId(3), SeekOp::GE { eq_only: true })),
+                        SeekResult::Found
+                    );
+                }
+                drive_lazy_payload_io(&conn, || {
+                    if backwards {
+                        cursor.prev()
+                    } else {
+                        cursor.next()
+                    }
+                });
+                let rows = collect_lazy_write_scan(&conn, &mut cursor, backwards);
+                let expected = if backwards {
+                    vec![(4, "four"), (3, "three"), (2, "two"), (1, "one")]
+                } else {
+                    vec![(2, "two"), (3, "three"), (4, "four"), (5, "five")]
+                };
+                assert_eq!(
+                    rows,
+                    expected
+                        .into_iter()
+                        .map(|(id, v)| (id, v.to_string()))
+                        .collect::<Vec<_>>(),
+                    "checkpoint={checkpoint} backwards={backwards} probe={probe}"
+                );
+                conn.execute("ROLLBACK").unwrap();
+            }
+        }
+    }
+}
+
+#[test]
+fn test_lazy_cursor_write_scan_refreshes_writes_and_undo() {
+    for checkpoint in [false, true] {
+        for backwards in [false, true] {
+            for change in [
+                "delete",
+                "update",
+                "undo_insert",
+                "undo_delete",
+                "undo_update",
+            ] {
+                let (db, conn) = setup_lazy_write_scan(checkpoint);
+                let mut cursor = open_lazy_payload_cursor(&db, &conn);
+                drive_lazy_payload_io(&conn, || {
+                    if backwards {
+                        cursor.last()
+                    } else {
+                        cursor.rewind()
+                    }
+                });
+                let target = if backwards { 4 } else { 2 };
+                conn.execute("SAVEPOINT s").unwrap();
+                match change {
+                    "delete" | "undo_delete" => conn
+                        .execute(format!("DELETE FROM t WHERE id = {target}"))
+                        .unwrap(),
+                    "update" | "undo_update" => conn
+                        .execute(format!("UPDATE t SET v = 'changed' WHERE id = {target}"))
+                        .unwrap(),
+                    "undo_insert" => conn.execute("INSERT INTO t VALUES (3, 'three')").unwrap(),
+                    _ => unreachable!(),
+                };
+                if change.starts_with("undo_") {
+                    conn.execute("ROLLBACK TO s").unwrap();
+                }
+                drive_lazy_payload_io(&conn, || {
+                    if backwards {
+                        cursor.prev()
+                    } else {
+                        cursor.next()
+                    }
+                });
+                let rows = collect_lazy_write_scan(&conn, &mut cursor, backwards);
+                let mut expected: Vec<_> = [(1, "one"), (2, "two"), (4, "four"), (5, "five")]
+                    .into_iter()
+                    .map(|(id, v)| (id, v.to_string()))
+                    .collect();
+                expected.retain(|(id, _)| *id != if backwards { 5 } else { 1 });
+                if change == "delete" {
+                    expected.retain(|(id, _)| *id != target);
+                }
+                if change == "update" {
+                    expected.iter_mut().find(|(id, _)| *id == target).unwrap().1 =
+                        "changed".to_string();
+                }
+                if backwards {
+                    expected.reverse();
+                }
+                assert_eq!(
+                    rows, expected,
+                    "checkpoint={checkpoint} backwards={backwards} change={change}"
+                );
+                conn.execute("ROLLBACK").unwrap();
+            }
+        }
+    }
+}
+
+#[test]
+fn test_lazy_cursor_write_scan_keeps_frontier_after_rollback() {
+    for backwards in [false, true] {
+        let (db, conn) = setup_lazy_write_scan(true);
+        let mut cursor = open_lazy_payload_cursor(&db, &conn);
+        drive_lazy_payload_io(&conn, || {
+            if backwards {
+                cursor.last()
+            } else {
+                cursor.rewind()
+            }
+        });
+        conn.execute("SAVEPOINT s").unwrap();
+        let record =
+            ImmutableRecord::from_values(&[Value::Null, Value::build_text("three")], 2).unwrap();
+        drive_lazy_payload_io(&conn, || {
+            cursor.insert(&BTreeKey::new_table_rowid(3, Some(&record)))
+        });
+        conn.execute("ROLLBACK TO s").unwrap();
+        drive_lazy_payload_io(&conn, || {
+            if backwards {
+                cursor.prev()
+            } else {
+                cursor.next()
+            }
+        });
+        let expected = if backwards {
+            vec![(4, "four"), (2, "two"), (1, "one")]
+        } else {
+            vec![(2, "two"), (4, "four"), (5, "five")]
+        };
+        assert_eq!(
+            collect_lazy_write_scan(&conn, &mut cursor, backwards),
+            expected
+                .into_iter()
+                .map(|(id, v)| (id, v.to_string()))
+                .collect::<Vec<_>>()
+        );
+        conn.execute("ROLLBACK").unwrap();
+    }
+}
+
+#[test]
+fn test_lazy_cursor_write_scan_resumes_and_abandons_refresh() {
+    for backwards in [false, true] {
+        for abandon in [false, true] {
+            let (db, conn) = setup_lazy_write_scan(true);
+            let mut cursor = open_lazy_payload_cursor(&db, &conn);
+            drive_lazy_payload_io(&conn, || {
+                if backwards {
+                    cursor.last()
+                } else {
+                    cursor.rewind()
+                }
+            });
+            let point = if backwards {
+                CursorYieldPoint::PrevBtreeAdvance
+            } else {
+                CursorYieldPoint::NextBtreeAdvance
+            };
+            let injector = FixedYieldInjector::new([point.point()]);
+            conn.set_yield_injector(Some(injector.clone()));
+            let IOResult::IO(pending) = (if backwards {
+                cursor.prev()
+            } else {
+                cursor.next()
+            })
+            .unwrap() else {
+                panic!("movement must yield");
+            };
+            assert!(pending.is_explicit_yield());
+            assert!(injector.is_empty());
+            conn.set_yield_injector(None);
+            conn.execute("INSERT INTO t VALUES (3, 'three')").unwrap();
+            pending.wait(conn.db.io.as_ref()).unwrap();
+            let injector = FixedYieldInjector::new([CursorYieldPoint::SeekBtreeProgress.point()]);
+            conn.set_yield_injector(Some(injector.clone()));
+            let IOResult::IO(pending) = (if backwards {
+                cursor.prev()
+            } else {
+                cursor.next()
+            })
+            .unwrap() else {
+                panic!("refresh seek must yield");
+            };
+            assert!(pending.is_explicit_yield());
+            assert!(injector.is_empty());
+            conn.set_yield_injector(None);
+            conn.execute(format!(
+                "UPDATE t SET v = 'changed' WHERE id = {}",
+                if backwards { 4 } else { 2 }
+            ))
+            .unwrap();
+            pending.wait(conn.db.io.as_ref()).unwrap();
+            if abandon {
+                drop(cursor);
+            } else {
+                drive_lazy_payload_io(&conn, || {
+                    if backwards {
+                        cursor.prev()
+                    } else {
+                        cursor.next()
+                    }
+                });
+                let expected = if backwards {
+                    vec![(4, "changed"), (3, "three"), (2, "two"), (1, "one")]
+                } else {
+                    vec![(2, "changed"), (3, "three"), (4, "four"), (5, "five")]
+                };
+                assert_eq!(
+                    collect_lazy_write_scan(&conn, &mut cursor, backwards),
+                    expected
+                        .into_iter()
+                        .map(|(id, v)| (id, v.to_string()))
+                        .collect::<Vec<_>>()
+                );
+                drop(cursor);
+            }
+            conn.execute("ROLLBACK").unwrap();
+            conn.execute("INSERT INTO t VALUES (3, 'fresh')").unwrap();
+            assert_eq!(
+                get_rows(&conn, "SELECT v FROM t WHERE id = 3"),
+                vec![vec![Value::build_text("fresh")]]
+            );
+        }
+    }
+}
+
+#[test]
+fn test_lazy_cursor_write_scan_continues_after_independent_point() {
+    for backwards in [false, true] {
+        let (db, conn) = setup_lazy_write_scan(true);
+        conn.execute("INSERT INTO t VALUES (3, 'three')").unwrap();
+        let mut cursor = open_lazy_payload_cursor(&db, &conn);
+        let op = if backwards {
+            SeekOp::LE { eq_only: true }
+        } else {
+            SeekOp::GE { eq_only: true }
+        };
+        assert_eq!(
+            drive_lazy_payload_io(&conn, || cursor.seek(SeekKey::TableRowId(3), op)),
+            SeekResult::Found
+        );
+        conn.execute(if backwards {
+            "INSERT INTO t VALUES (0, 'zero')"
+        } else {
+            "INSERT INTO t VALUES (6, 'six')"
+        })
+        .unwrap();
+        drive_lazy_payload_io(&conn, || {
+            if backwards {
+                cursor.prev()
+            } else {
+                cursor.next()
+            }
+        });
+        let expected = if backwards {
+            vec![(2, "two"), (1, "one"), (0, "zero")]
+        } else {
+            vec![(4, "four"), (5, "five"), (6, "six")]
+        };
+        assert_eq!(
+            collect_lazy_write_scan(&conn, &mut cursor, backwards),
+            expected
+                .into_iter()
+                .map(|(id, v)| (id, v.to_string()))
+                .collect::<Vec<_>>()
+        );
+        conn.execute("ROLLBACK").unwrap();
+    }
+}
+
+#[test]
+fn test_lazy_cursor_write_scan_abandons_statement_refresh() {
+    let (_db, conn) = setup_lazy_write_scan(true);
+    let mut statement = conn.prepare("SELECT id,v FROM t ORDER BY id").unwrap();
+    loop {
+        match statement.step().unwrap() {
+            StepResult::Row => break,
+            StepResult::IO | StepResult::Yield => statement._io().step().unwrap(),
+            other => panic!("first row expected: {other:?}"),
+        }
+    }
+    assert_eq!(statement.row().unwrap().get_value(0), &Value::from_i64(1));
+    conn.execute("INSERT INTO t VALUES (3,'three')").unwrap();
+    let injector = FixedYieldInjector::new([CursorYieldPoint::SeekBtreeProgress.point()]);
+    conn.set_yield_injector(Some(injector.clone()));
+    loop {
+        let result = statement.step().unwrap();
+        if injector.is_empty() {
+            assert!(matches!(result, StepResult::Yield));
+            break;
+        }
+        match result {
+            StepResult::IO | StepResult::Yield => statement._io().step().unwrap(),
+            other => panic!("refresh must yield before another row: {other:?}"),
+        }
+    }
+    drop(statement);
+    conn.set_yield_injector(None);
+    conn.execute("ROLLBACK").unwrap();
+    conn.execute("INSERT INTO t VALUES (3,'fresh')").unwrap();
+    assert_eq!(
+        get_rows(&conn, "SELECT v FROM t WHERE id=3"),
+        vec![vec![Value::build_text("fresh")]]
+    );
+}
+
+#[test]
+fn test_lazy_cursor_write_scan_resets_frontier_on_positioning() {
+    for operation in ["seek", "exists", "rewind", "last"] {
+        let (db, conn) = setup_lazy_write_scan(true);
+        let mut cursor = open_lazy_payload_cursor(&db, &conn);
+        drive_lazy_payload_io(&conn, || cursor.rewind());
+        let record =
+            ImmutableRecord::from_values(&[Value::Null, Value::build_text("three")], 2).unwrap();
+        drive_lazy_payload_io(&conn, || {
+            cursor.insert(&BTreeKey::new_table_rowid(3, Some(&record)))
+        });
+        match operation {
+            "seek" => assert_eq!(
+                drive_lazy_payload_io(&conn, || cursor
+                    .seek(SeekKey::TableRowId(4), SeekOp::GE { eq_only: true })),
+                SeekResult::Found
+            ),
+            "exists" => {
+                assert!(drive_lazy_payload_io(&conn, || cursor.exists(&Value::from_i64(4))))
+            }
+            "rewind" => drive_lazy_payload_io(&conn, || cursor.rewind()),
+            "last" => drive_lazy_payload_io(&conn, || cursor.last()),
+            _ => unreachable!(),
+        }
+        let backwards = operation == "last";
+        drive_lazy_payload_io(&conn, || {
+            if backwards {
+                cursor.prev()
+            } else {
+                cursor.next()
+            }
+        });
+        let expected = match operation {
+            "seek" | "exists" => vec![(5, "five")],
+            "rewind" => vec![(2, "two"), (3, "three"), (4, "four"), (5, "five")],
+            "last" => vec![(4, "four"), (3, "three"), (2, "two"), (1, "one")],
+            _ => unreachable!(),
+        };
+        assert_eq!(
+            collect_lazy_write_scan(&conn, &mut cursor, backwards),
+            expected
+                .into_iter()
+                .map(|(id, v)| (id, v.to_string()))
+                .collect::<Vec<_>>(),
+            "{operation}"
+        );
+        conn.execute("ROLLBACK").unwrap();
+    }
+}
+
+#[cfg(feature = "io_memory_yield")]
+#[test]
+fn test_lazy_cursor_write_scan_refreshes_after_page_io() {
+    let temp_dir = tempfile::TempDir::new().unwrap();
+    let path = temp_dir.path().join("scan.db");
+    let database = Database::open_file(
+        Arc::new(crate::MemoryYieldIO::new()),
+        path.to_str().unwrap(),
+        Arc::new(SqliteDialect),
+    )
+    .unwrap();
+    let conn = database.connect(ConnectOpts::new()).unwrap();
+    conn.execute("PRAGMA journal_mode='mvcc'").unwrap();
+    let db = MvccTestDbNoConn {
+        db: Some(database),
+        path: Some(path.to_str().unwrap().to_string()),
+        opts: DatabaseOpts::new(),
+        enc_opts: None,
+        _temp_dir: Some(temp_dir),
+    };
+    conn.execute("CREATE TABLE t(id INTEGER PRIMARY KEY,v TEXT)")
+        .unwrap();
+    let wide = "x".repeat(3000);
+    for id in [10, 20, 40, 50] {
+        conn.execute(format!("INSERT INTO t VALUES ({id},'{wide}')"))
+            .unwrap();
+    }
+    conn.execute("PRAGMA wal_checkpoint(TRUNCATE)").unwrap();
+    conn.execute("BEGIN CONCURRENT").unwrap();
+    conn.pager.load().clear_page_cache(false);
+    let mut cursor = open_lazy_payload_cursor(&db, &conn);
+    drive_lazy_payload_io(&conn, || cursor.rewind());
+    let mut frontier = drive_lazy_payload_io(&conn, || cursor.rowid()).unwrap();
+    let pending = loop {
+        match cursor.next().unwrap() {
+            IOResult::IO(io) => {
+                assert!(!io.is_explicit_yield());
+                assert!(!io.finished());
+                break io;
+            }
+            IOResult::Done(()) => {
+                frontier = drive_lazy_payload_io(&conn, || cursor.rowid())
+                    .expect("scan must wait on a later leaf");
+            }
+        }
+    };
+    let inserted = frontier + 1;
+    conn.execute(format!("INSERT INTO t VALUES ({inserted},'new')"))
+        .unwrap();
+    pending.wait(conn.db.io.as_ref()).unwrap();
+    drive_lazy_payload_io(&conn, || cursor.next());
+    let mut expected: Vec<_> = [10, 20, 40, 50]
+        .into_iter()
+        .filter(|id| *id > frontier)
+        .map(|id| (id, wide.clone()))
+        .collect();
+    expected.push((inserted, "new".to_string()));
+    expected.sort_by_key(|(id, _)| *id);
+    assert_eq!(collect_lazy_write_scan(&conn, &mut cursor, false), expected);
+    conn.execute("ROLLBACK").unwrap();
+}
+
+fn setup_lazy_write_scan(checkpoint: bool) -> (MvccTestDbNoConn, Arc<Connection>) {
+    let db = MvccTestDbNoConn::new();
+    let conn = db.connect();
+    conn.execute("CREATE TABLE t(id INTEGER PRIMARY KEY,v TEXT)")
+        .unwrap();
+    conn.execute("INSERT INTO t VALUES (1,'one'),(2,'two'),(4,'four'),(5,'five')")
+        .unwrap();
+    if checkpoint {
+        conn.execute("PRAGMA wal_checkpoint(TRUNCATE)").unwrap();
+    }
+    conn.execute("BEGIN CONCURRENT").unwrap();
+    (db, conn)
+}
+
+fn collect_lazy_write_scan(
+    conn: &Arc<Connection>,
+    cursor: &mut MvccLazyCursor<MvccClock, crate::alloc::DynAllocator>,
+    backwards: bool,
+) -> Vec<(i64, String)> {
+    let mut rows = Vec::new();
+    while let Some(id) = drive_lazy_payload_io(conn, || cursor.rowid()) {
+        rows.push((id, payload_text(&lazy_payload_bytes(conn, cursor).unwrap())));
+        drive_lazy_payload_io(conn, || {
+            if backwards {
+                cursor.prev()
+            } else {
+                cursor.next()
+            }
+        });
+    }
+    rows
+}
+
+#[test]
 fn test_lazy_cursor_transaction_reads_without_abort_lookup() {
     let mut lookups = Vec::new();
     for checkpoint in [false, true] {
