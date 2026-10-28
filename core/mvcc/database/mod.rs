@@ -5579,6 +5579,7 @@ impl<Clock: LogicalClock, A: ConcurrentAllocator> MvStore<Clock, A> {
     /// This is used when updating a row that exists in B-tree but hasn't been
     /// modified in MVCC yet. The btree_resident flag helps the checkpoint logic
     /// determine if subsequent deletes should be checkpointed to the B-tree file.
+    #[inline(never)]
     pub fn insert_btree_resident_to_table_or_index(
         &self,
         tx_id: TxID,

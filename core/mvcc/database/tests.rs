@@ -9564,17 +9564,10 @@ fn test_lazy_cursor_forward_steps_match_the_merge_path() {
             );
             let expected = 40 - deleted.len() + inserted.len();
             assert_eq!(rows.len(), expected, "columns={columns} fixture={name}");
-            if *name == "100% chains" {
-                assert_eq!(
-                    step_counts.0, merge_counts.0,
-                    "columns={columns} fixture={name}"
-                );
-            } else {
-                assert!(
-                    step_counts.0 < merge_counts.0,
-                    "columns={columns} fixture={name} {step_counts:?} {merge_counts:?}"
-                );
-            }
+            assert!(
+                step_counts.0 < merge_counts.0,
+                "columns={columns} fixture={name} {step_counts:?} {merge_counts:?}"
+            );
             assert_eq!(
                 step_counts.1, merge_counts.1,
                 "columns={columns} fixture={name}"
@@ -10043,17 +10036,10 @@ fn test_lazy_cursor_backward_steps_match_the_merge_path() {
             );
             let expected = 40 - deleted.len() + inserted.len();
             assert_eq!(rows.len(), expected, "columns={columns} fixture={name}");
-            if *name == "100% chains" {
-                assert_eq!(
-                    step_counts.0, merge_counts.0,
-                    "columns={columns} fixture={name}"
-                );
-            } else {
-                assert!(
-                    step_counts.0 < merge_counts.0,
-                    "columns={columns} fixture={name} {step_counts:?} {merge_counts:?}"
-                );
-            }
+            assert!(
+                step_counts.0 < merge_counts.0,
+                "columns={columns} fixture={name} {step_counts:?} {merge_counts:?}"
+            );
             assert_eq!(
                 step_counts.1, merge_counts.1,
                 "columns={columns} fixture={name}"
@@ -10426,6 +10412,405 @@ fn test_lazy_cursor_backward_steps_after_range_seek() {
             "{op:?}"
         );
     }
+}
+
+#[test]
+fn test_lazy_cursor_version_row_steps_skip_peek_reconciliation() {
+    for backwards in [false, true] {
+        let (rowids, [merge_counts, step_counts]) = scan_with_and_without_table_steps(
+            || {
+                let (db, conn) = setup_lazy_walk_table(&[], &(1..=20).collect::<Vec<_>>());
+                conn.execute("BEGIN CONCURRENT").unwrap();
+                (db, conn)
+            },
+            |db, conn| {
+                let mut cursor = open_lazy_payload_cursor(db, conn);
+                let store = db.get_mvcc_store();
+                store
+                    .cursor_peek_reconciliations
+                    .store(0, Ordering::Relaxed);
+                store.cursor_btree_rowid_reads.store(0, Ordering::Relaxed);
+                scan_lazy_rows(conn, &mut cursor, backwards, || {})
+            },
+        );
+        let expected: Vec<(i64, String)> = walk_order((1..=20).collect(), backwards)
+            .into_iter()
+            .map(|id| (id, format!("c{id}")))
+            .collect();
+        assert_eq!(rowids, expected, "backwards={backwards}");
+        assert_eq!(merge_counts.0, 21, "backwards={backwards}");
+        assert_eq!(step_counts.0, 2, "backwards={backwards}");
+    }
+}
+
+#[test]
+fn test_lazy_cursor_version_row_steps_after_changes() {
+    for backwards in [false, true] {
+        for change in [
+            "insert ahead",
+            "delete next",
+            "update next",
+            "rollback to",
+            "gc",
+            "later commit",
+            "abort",
+            "removed transaction",
+        ] {
+            scan_with_and_without_table_steps(
+                || {
+                    let (db, conn) = setup_lazy_walk_table(&[], &[2, 4, 6, 8, 10, 12]);
+                    conn.execute("BEGIN CONCURRENT").unwrap();
+                    (db, conn)
+                },
+                |db, conn| {
+                    let store = db.get_mvcc_store();
+                    if change == "rollback to" {
+                        conn.execute("SAVEPOINT s").unwrap();
+                        conn.execute("DELETE FROM t WHERE id = 6").unwrap();
+                    }
+                    let mut cursor = open_lazy_payload_cursor(db, conn);
+                    drive_lazy_payload_io(conn, || {
+                        if backwards {
+                            cursor.last()
+                        } else {
+                            cursor.rewind()
+                        }
+                    });
+                    let (ahead, next) = if backwards { (9, 10) } else { (3, 4) };
+                    match change {
+                        "insert ahead" => {
+                            conn.execute(format!("INSERT INTO t VALUES ({ahead}, 'new')"))
+                                .unwrap();
+                        }
+                        "delete next" => {
+                            conn.execute(format!("DELETE FROM t WHERE id = {next}"))
+                                .unwrap();
+                        }
+                        "update next" => {
+                            conn.execute(format!("UPDATE t SET v = 'changed' WHERE id = {next}"))
+                                .unwrap();
+                        }
+                        "rollback to" => conn.execute("ROLLBACK TO s").unwrap(),
+                        "gc" => {
+                            store.drop_unused_row_versions();
+                        }
+                        "later commit" => {
+                            db.connect()
+                                .execute(format!("DELETE FROM t WHERE id = {next}"))
+                                .unwrap();
+                        }
+                        "abort" => {
+                            let tx_id = conn.get_mv_tx_id().unwrap();
+                            let tx = store.txs.get(&tx_id).unwrap();
+                            tx.value().abort_now.store(true, Ordering::Release);
+                        }
+                        _ => conn.execute("ROLLBACK").unwrap(),
+                    }
+                    let mut outcomes = Vec::new();
+                    for _ in 0..8 {
+                        let moved = loop {
+                            let result = if backwards {
+                                cursor.prev()
+                            } else {
+                                cursor.next()
+                            };
+                            match result {
+                                Ok(IOResult::Done(())) => break Ok(()),
+                                Ok(IOResult::IO(io)) => io.wait(conn.db.io.as_ref()).unwrap(),
+                                Err(err) => break Err(format!("{err:?}")),
+                            }
+                        };
+                        let rowid = drive_lazy_payload_io(conn, || cursor.rowid());
+                        let payload = cursor
+                            .record_payload()
+                            .map(|result| match result {
+                                IOResult::Done(payload) => payload.map(<[u8]>::to_vec),
+                                IOResult::IO(_) => panic!("a version-store payload needs no I/O"),
+                            })
+                            .map_err(|err| format!("{err:?}"));
+                        outcomes.push((moved, rowid, payload));
+                    }
+                    if change != "removed transaction" {
+                        conn.execute("ROLLBACK").unwrap();
+                    }
+                    outcomes
+                },
+            );
+        }
+    }
+}
+
+#[test]
+fn test_lazy_cursor_version_row_steps_with_passive_checkpoint_where_coverage_is_false() {
+    for backwards in [false, true] {
+        scan_with_and_without_table_steps(
+            || {
+                let db = MvccTestDbNoConn::new_with_random_db_passive();
+                let conn = db.connect();
+                fill_lazy_step_table(
+                    &conn,
+                    3,
+                    &(1..=40).map(|i| i * 2).collect::<Vec<_>>(),
+                    &[],
+                    &[],
+                );
+                conn.execute("BEGIN CONCURRENT").unwrap();
+                (db, conn)
+            },
+            |db, conn| {
+                let mut snapshot_cursor = open_lazy_payload_cursor(db, conn);
+                let snapshot = scan_lazy_payloads(conn, &mut snapshot_cursor, backwards);
+                let mut cursor = open_lazy_payload_cursor(db, conn);
+                drive_lazy_payload_io(conn, || {
+                    if backwards {
+                        cursor.last()
+                    } else {
+                        cursor.rewind()
+                    }
+                });
+                let mut rows = vec![(
+                    drive_lazy_payload_io(conn, || cursor.rowid()).unwrap(),
+                    lazy_payload_bytes(conn, &mut cursor).unwrap(),
+                )];
+                let other = db.connect();
+                other
+                    .execute("UPDATE t SET c1 = 'later' WHERE id = 40")
+                    .unwrap();
+                other.execute("PRAGMA wal_checkpoint(PASSIVE)").unwrap();
+                rows.extend(continue_lazy_payload_scan(conn, &mut cursor, backwards));
+                assert_eq!(rows, snapshot, "backwards={backwards}");
+                rows
+            },
+        );
+    }
+}
+
+#[test]
+fn test_lazy_cursor_version_row_steps_with_injected_yields() {
+    let inserted = [3, 5, 7, 9, 11, 13];
+    for backwards in [false, true] {
+        let points = if backwards {
+            vec![
+                CursorYieldPoint::PrevBtreeAdvance,
+                CursorYieldPoint::AdvanceBtreeBackwardProgress,
+            ]
+        } else {
+            vec![
+                CursorYieldPoint::NextStart,
+                CursorYieldPoint::NextBtreeAdvance,
+                CursorYieldPoint::AdvanceBtreeForwardProgress,
+            ]
+        };
+        for point in points {
+            let mut fired = false;
+            for occurrence in 0..12 {
+                for abandon in [false, true] {
+                    let ((point_fired, _), _) = scan_with_and_without_table_steps(
+                        || setup_lazy_step_table(3, &[20], &[], &inserted),
+                        |db, conn| {
+                            let mut cursor = open_lazy_payload_cursor(db, conn);
+                            drive_lazy_payload_io(conn, || {
+                                if backwards {
+                                    cursor.last()
+                                } else {
+                                    cursor.rewind()
+                                }
+                            });
+                            let injector = NthYieldInjector::new(point.point(), occurrence);
+                            conn.set_yield_injector(Some(injector.clone()));
+                            let mut rowids =
+                                vec![drive_lazy_payload_io(conn, || cursor.rowid()).unwrap()];
+                            loop {
+                                let result = if backwards {
+                                    cursor.prev()
+                                } else {
+                                    cursor.next()
+                                };
+                                match result.unwrap() {
+                                    IOResult::Done(()) => {
+                                        let Some(rowid) =
+                                            drive_lazy_payload_io(conn, || cursor.rowid())
+                                        else {
+                                            break;
+                                        };
+                                        rowids.push(rowid);
+                                    }
+                                    IOResult::IO(io) => {
+                                        if io.is_explicit_yield() && abandon {
+                                            conn.set_yield_injector(None);
+                                            return (injector.fired(), rowids);
+                                        }
+                                        io.wait(conn.db.io.as_ref()).unwrap();
+                                    }
+                                }
+                            }
+                            conn.set_yield_injector(None);
+                            let expected = walk_order(
+                                (1..=40).map(|i| i * 2).chain(inserted).collect(),
+                                backwards,
+                            );
+                            assert_eq!(rowids, expected, "{point:?} {occurrence}");
+                            (injector.fired(), rowids)
+                        },
+                    );
+                    if occurrence == 0 {
+                        assert!(point_fired, "{point:?} never fired");
+                    }
+                    fired |= point_fired;
+                }
+            }
+            assert!(fired, "{point:?} never fired");
+        }
+        let (sequence, [merge_counts, step_counts]) = scan_with_and_without_table_steps(
+            || setup_lazy_step_table(3, &[20], &[], &inserted),
+            |db, conn| {
+                let recorder = Arc::new(RecordingYieldInjector {
+                    points: Mutex::new(Vec::new()),
+                });
+                let mut cursor = open_lazy_payload_cursor(db, conn);
+                conn.set_yield_injector(Some(recorder.clone()));
+                let rows = scan_lazy_payloads(conn, &mut cursor, backwards);
+                conn.set_yield_injector(None);
+                assert_eq!(rows.len(), 46);
+                let points = recorder.points.lock().clone();
+                points
+            },
+        );
+        assert!(!sequence.is_empty());
+        assert!(step_counts.0 < merge_counts.0, "backwards={backwards}");
+    }
+}
+
+#[test]
+fn test_lazy_cursor_version_row_steps_match_the_merge_when_coverage_is_forced_on_by_hand() {
+    for backwards in [false, true] {
+        let (rows, _) = scan_with_and_without_table_steps(
+            || {
+                let (db, conn) = setup_lazy_walk_table(&[1, 2, 3], &[]);
+                let updated = if backwards { "2, 3" } else { "1, 2" };
+                conn.execute(format!(
+                    "UPDATE t SET v = v || '-u' WHERE id IN ({updated})"
+                ))
+                .unwrap();
+                conn.execute("BEGIN CONCURRENT").unwrap();
+                (db, conn)
+            },
+            |db, conn| {
+                let store = db.get_mvcc_store();
+                let root = get_rows(conn, "SELECT rootpage FROM sqlite_schema WHERE name = 't'")[0]
+                    [0]
+                .as_int()
+                .unwrap();
+                let table_id = store.get_table_id_from_root_page(root);
+                let snapshot = store.read_snapshot(conn.get_mv_tx_id().unwrap()).unwrap();
+                let versions = store
+                    .rows
+                    .get(&RowID::new(table_id, RowKey::Int(2)))
+                    .unwrap()
+                    .value()
+                    .clone();
+                {
+                    let mut chain = versions.write();
+                    chain.retain(|version| version.end().is_none());
+                    assert_eq!(chain.len(), 1);
+                    chain[0].set_materialized_at(snapshot.read_mark);
+                }
+                let old_max = store
+                    .durable_txid_max
+                    .swap(snapshot.begin_ts, Ordering::SeqCst);
+                store.checkpoint_in_progress.store(true, Ordering::Release);
+                assert!(!store.btree_covers_chain_for_snapshot(
+                    snapshot,
+                    table_id,
+                    &versions.read()
+                ));
+                let mut cursor = open_lazy_payload_cursor(db, conn);
+                drive_lazy_payload_io(conn, || {
+                    if backwards {
+                        cursor.last()
+                    } else {
+                        cursor.rewind()
+                    }
+                });
+                let mut rows = vec![drive_lazy_payload_io(conn, || cursor.rowid())];
+                store.checkpoint_in_progress.store(false, Ordering::Release);
+                assert!(store.btree_covers_chain_for_snapshot(
+                    snapshot,
+                    table_id,
+                    &versions.read()
+                ));
+                for _ in 0..3 {
+                    drive_lazy_payload_io(conn, || {
+                        if backwards {
+                            cursor.prev()
+                        } else {
+                            cursor.next()
+                        }
+                    });
+                    rows.push(drive_lazy_payload_io(conn, || cursor.rowid()));
+                }
+                conn.execute("ROLLBACK").unwrap();
+                store.durable_txid_max.store(old_max, Ordering::SeqCst);
+                rows
+            },
+        );
+        let expected = if backwards {
+            [Some(3), Some(1), None, None]
+        } else {
+            [Some(1), Some(3), None, None]
+        };
+        assert_eq!(
+            rows, expected,
+            "backwards={backwards}: both paths skip row 2 when coverage is forced on by hand"
+        );
+    }
+}
+
+#[test]
+fn test_lazy_cursor_version_row_steps_change_direction() {
+    let ((moves, seek, after_seek), [merge_counts, step_counts]) =
+        scan_with_and_without_table_steps(
+            || {
+                let (db, conn) = setup_lazy_walk_table(&[], &(1..=5).collect::<Vec<_>>());
+                conn.execute("BEGIN CONCURRENT").unwrap();
+                (db, conn)
+            },
+            |db, conn| {
+                let mut cursor = open_lazy_payload_cursor(db, conn);
+                drive_lazy_payload_io(conn, || cursor.rewind());
+                let mut moves = vec![drive_lazy_payload_io(conn, || cursor.rowid())];
+                for forward in [true, true, false, false, true] {
+                    drive_lazy_payload_io(conn, || {
+                        if forward {
+                            cursor.next()
+                        } else {
+                            cursor.prev()
+                        }
+                    });
+                    moves.push(drive_lazy_payload_io(conn, || cursor.rowid()));
+                }
+                let seek = drive_lazy_payload_io(conn, || {
+                    cursor.seek(SeekKey::TableRowId(3), SeekOp::GE { eq_only: true })
+                });
+                let mut after_seek = Vec::new();
+                for forward in [true, false] {
+                    drive_lazy_payload_io(conn, || {
+                        if forward {
+                            cursor.next()
+                        } else {
+                            cursor.prev()
+                        }
+                    });
+                    after_seek.push(drive_lazy_payload_io(conn, || cursor.rowid()));
+                }
+                conn.execute("ROLLBACK").unwrap();
+                (moves, seek, after_seek)
+            },
+        );
+    assert_eq!(moves.len(), 6);
+    assert_eq!(seek, SeekResult::Found);
+    assert_eq!(after_seek.len(), 2);
+    assert!(step_counts.0 < merge_counts.0);
 }
 
 fn scan_with_and_without_table_steps<T: PartialEq + std::fmt::Debug>(

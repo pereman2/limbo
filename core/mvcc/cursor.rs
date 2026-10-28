@@ -1583,6 +1583,9 @@ impl<Clock: LogicalClock + 'static, A: ConcurrentAllocator> CursorTrait
             if self.can_step_table_row::<true>() {
                 return self.step_table_row::<true>();
             }
+            if let Some(result) = self.try_step_version_row::<true>() {
+                return result;
+            }
             // Determine which cursor(s) need to be advanced based on current position
             let (need_advance_mvcc, need_advance_btree) = match &self.current_pos {
                 CursorPosition::BeforeFirst => {
@@ -1706,6 +1709,9 @@ impl<Clock: LogicalClock + 'static, A: ConcurrentAllocator> CursorTrait
         ) {
             if self.can_step_table_row::<false>() {
                 return self.step_table_row::<false>();
+            }
+            if let Some(result) = self.try_step_version_row::<false>() {
+                return result;
             }
             // Determine which cursor(s) need to be advanced based on current position
             let (need_advance_mvcc, need_advance_btree) = match &self.current_pos {
@@ -2824,6 +2830,71 @@ impl<Clock: LogicalClock + 'static, A: ConcurrentAllocator> MvccLazyCursor<Clock
             row_id: RowID::new(self.table_id, RowKey::Int(rowid)),
             in_btree: true,
             versions: None,
+        };
+        self.clear_row_caches();
+        self.state = None;
+        Ok(IOResult::Done(()))
+    }
+
+    #[inline(never)]
+    fn try_step_version_row<const FORWARD: bool>(&mut self) -> Option<IOResultOr<()>> {
+        if !self.can_step_version_row::<FORWARD>() {
+            return None;
+        }
+        Some(self.step_version_row::<FORWARD>())
+    }
+
+    fn can_step_version_row<const FORWARD: bool>(&self) -> bool {
+        #[cfg(test)]
+        if self
+            .db
+            .cursor_table_steps_disabled
+            .load(crate::sync::atomic::Ordering::Relaxed)
+        {
+            return false;
+        }
+        let CursorPosition::Loaded {
+            row_id,
+            in_btree: false,
+            ..
+        } = &self.current_pos
+        else {
+            return false;
+        };
+        matches!(self.mv_cursor_type, MvccCursorType::Table)
+            && !self.dual_peek.mvcc_exhausted()
+            && self.dual_peek.btree_peek.get_row_key() != Some(&row_id.row_id)
+    }
+
+    fn step_version_row<const FORWARD: bool>(&mut self) -> IOResultOr<()> {
+        self.advance_mvcc_iterator();
+        let CursorPeek::Row {
+            key: RowKey::Int(rowid),
+            versions: Some(versions),
+        } = &self.dual_peek.mvcc_peek
+        else {
+            return self.finish_table_step::<FORWARD>();
+        };
+        let btree_first = match self.dual_peek.btree_peek.get_row_key() {
+            Some(RowKey::Int(btree_rowid)) if FORWARD => btree_rowid <= rowid,
+            Some(RowKey::Int(btree_rowid)) => btree_rowid >= rowid,
+            _ => false,
+        };
+        if btree_first {
+            return self.finish_table_step::<FORWARD>();
+        }
+        let falls_through = {
+            let chain = versions.read();
+            self.db
+                .btree_covers_chain_for_snapshot(self.snapshot, self.table_id, &chain)
+        };
+        if falls_through {
+            return self.finish_table_step::<FORWARD>();
+        }
+        self.current_pos = CursorPosition::Loaded {
+            row_id: RowID::new(self.table_id, RowKey::Int(*rowid)),
+            in_btree: false,
+            versions: Some(versions.clone()),
         };
         self.clear_row_caches();
         self.state = None;
