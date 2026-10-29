@@ -4465,6 +4465,8 @@ pub struct MvStore<Clock: LogicalClock, A: ConcurrentAllocator = TursoAllocator>
     pub(crate) cursor_btree_rowid_reads: AtomicU64,
     #[cfg(test)]
     pub(crate) cursor_table_walk_starts: AtomicU64,
+    #[cfg(test)]
+    pub(crate) cursor_scan_refreshes: AtomicU64,
     /// Final state for removed transactions. Readers may still race with stale TxID
     /// references in row versions after a transaction is removed from `txs`.
     finalized_tx_states: SkipMap<TxID, TransactionState, BasicComparator, A>,
@@ -4724,6 +4726,8 @@ impl<Clock: LogicalClock, A: ConcurrentAllocator> MvStore<Clock, A> {
             cursor_btree_rowid_reads: AtomicU64::new(0),
             #[cfg(test)]
             cursor_table_walk_starts: AtomicU64::new(0),
+            #[cfg(test)]
+            cursor_scan_refreshes: AtomicU64::new(0),
             finalized_tx_states: SkipMap::new_in(alloc.clone()),
             checkpoint_dirty_table_keys: SkipMap::new_in(alloc.clone()),
             checkpoint_dirty_index_keys: SkipMap::new_in(alloc.clone()),
