@@ -10698,6 +10698,7 @@ impl<Clock: LogicalClock, A: ConcurrentAllocator> MvStore<Clock, A> {
             .is_some_and(|e| e.value().materialized_at > min_reader_mark)
     }
 
+    #[cfg(test)]
     pub(crate) fn write_generation(&self, tx_id: TxID) -> Result<u64> {
         let tx = self
             .txs

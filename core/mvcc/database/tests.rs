@@ -17822,6 +17822,110 @@ fn reader_errors_instead_of_panicking_after_its_transaction_is_rolled_back() {
     }
 }
 
+#[test]
+fn reader_fails_at_a_row_updated_after_its_transaction_ends() {
+    for foreign_commit in [true, false] {
+        let (db, conn) = setup_rows_for_ended_reader();
+        let other = db.connect();
+        let mut read = start_ended_reader(&conn);
+        if foreign_commit {
+            other.execute("UPDATE t SET v = 'z' WHERE id = 3").unwrap();
+        } else {
+            other.execute("BEGIN CONCURRENT").unwrap();
+            other.execute("UPDATE t SET v = 'z' WHERE id = 3").unwrap();
+        }
+        assert_ended_reader_fails_at_row_three(
+            &mut read,
+            &format!("foreign_commit={foreign_commit}"),
+        );
+    }
+}
+
+#[test]
+fn reader_fails_at_its_own_updated_row_after_its_transaction_ends() {
+    for end_transaction in ["COMMIT", "ROLLBACK"] {
+        let (_db, conn) = setup_rows_for_ended_reader();
+        conn.execute("BEGIN").unwrap();
+        let mut read = conn.prepare("SELECT id FROM t").unwrap();
+        assert!(matches!(read.step().unwrap(), StepResult::Row));
+        assert_eq!(read.row().unwrap().get::<i64>(0).unwrap(), 1);
+        conn.execute("UPDATE t SET v = 'z' WHERE id = 3").unwrap();
+        conn.execute(end_transaction).unwrap();
+        assert_ended_reader_fails_at_row_three(&mut read, end_transaction);
+    }
+}
+
+#[test]
+fn reader_fails_at_an_empty_chain_after_its_transaction_ends() {
+    let (db, conn) = setup_rows_for_ended_reader();
+    let other = db.connect();
+    other.execute("BEGIN CONCURRENT").unwrap();
+    other.execute("UPDATE t SET v = 'z' WHERE id = 3").unwrap();
+    other.execute("ROLLBACK").unwrap();
+    let mut read = start_ended_reader(&conn);
+    assert_ended_reader_fails_at_row_three(&mut read, "empty chain");
+}
+
+#[test]
+fn test_lazy_cursor_count_returns_after_its_transaction_ends() {
+    for end_transaction in ["COMMIT", "ROLLBACK"] {
+        let (db, conn) = setup_lazy_count_db(false);
+        conn.execute("BEGIN CONCURRENT").unwrap();
+        let mut cursor = open_lazy_payload_cursor(&db, &conn);
+        let injector = FixedYieldInjector::new([CursorYieldPoint::CountProgress.point()]);
+        conn.set_yield_injector(Some(injector.clone()));
+        let IOResult::IO(pending) = cursor.count().unwrap() else {
+            panic!("count must yield with a completed physical result");
+        };
+        assert!(pending.is_explicit_yield());
+        conn.set_yield_injector(None);
+        conn.execute(end_transaction).unwrap();
+        pending.wait(conn.db.io.as_ref()).unwrap();
+        assert_eq!(
+            drive_lazy_payload_io(&conn, || cursor.count()),
+            500,
+            "{end_transaction}"
+        );
+    }
+}
+
+fn setup_rows_for_ended_reader() -> (MvccTestDbNoConn, Arc<Connection>) {
+    let db = MvccTestDbNoConn::new();
+    let conn = db.connect();
+    conn.execute("CREATE TABLE t(id INTEGER PRIMARY KEY, v TEXT)")
+        .unwrap();
+    conn.execute("INSERT INTO t VALUES (1, 'a'), (2, 'b'), (3, 'c')")
+        .unwrap();
+    conn.execute("PRAGMA wal_checkpoint(TRUNCATE)").unwrap();
+    (db, conn)
+}
+
+fn start_ended_reader(conn: &Arc<Connection>) -> crate::Statement {
+    conn.execute("BEGIN").unwrap();
+    let mut read = conn.prepare("SELECT id FROM t").unwrap();
+    assert!(matches!(read.step().unwrap(), StepResult::Row));
+    assert_eq!(read.row().unwrap().get::<i64>(0).unwrap(), 1);
+    conn.execute("ROLLBACK").unwrap();
+    read
+}
+
+fn assert_ended_reader_fails_at_row_three(read: &mut crate::Statement, case: &str) {
+    let mut ids = vec![1];
+    let err = loop {
+        match read.step() {
+            Ok(StepResult::Row) => ids.push(read.row().unwrap().get::<i64>(0).unwrap()),
+            Ok(StepResult::IO) => read.get_pager().io.step().unwrap(),
+            Ok(other) => panic!("{case}: expected an error, got {other:?} after {ids:?}"),
+            Err(err) => break err,
+        }
+    };
+    assert!(
+        matches!(err, LimboError::NoSuchTransactionID(_)),
+        "{case}: expected NoSuchTransactionID, got {err:?}"
+    );
+    assert_eq!(ids, vec![1, 2], "{case}");
+}
+
 /// GC trims chains with retain()/clear(), which keeps the Vec's allocation.
 /// After a burst of versions is collected, the chain's capacity must be
 /// released down to a quarter of its previous value (deliberately not to fit)

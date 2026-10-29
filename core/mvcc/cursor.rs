@@ -703,6 +703,16 @@ impl<Clock: LogicalClock + 'static, A: ConcurrentAllocator> MvccLazyCursor<Clock
     }
 
     fn table_row_is_valid(&mut self, rowid: i64, direction: IterationDirection) -> Result<bool> {
+        if self.transaction.is_removed() {
+            let valid = self.db.cursor_btree_row_is_valid(
+                &self.transaction,
+                self.table_id,
+                &RowKey::Int(rowid),
+                self.snapshot.tx_id,
+            )?;
+            self.record_table_row_check(rowid, valid);
+            return Ok(valid);
+        }
         let db = self.db.as_ref();
         let slot = &mut self.transaction.table_walk;
         match slot.as_deref_mut() {
@@ -2491,7 +2501,7 @@ impl<Clock: LogicalClock + 'static, A: ConcurrentAllocator> CursorTrait
             match state {
                 None => {
                     self.set_null_flag(false);
-                    let generation = self.db.write_generation(self.snapshot.tx_id)?;
+                    let generation = self.count_write_generation()?;
                     let start = RowID::new(self.table_id, RowKey::Int(i64::MIN));
                     let end = RowID::new(self.table_id, RowKey::Int(i64::MAX));
                     self.count_state = Some(
@@ -2510,13 +2520,13 @@ impl<Clock: LogicalClock + 'static, A: ConcurrentAllocator> CursorTrait
                     }
                 }
                 Some(CountState::Physical { generation }) => {
-                    if self.db.write_generation(self.snapshot.tx_id)? != generation {
+                    if self.count_write_generation()? != generation {
                         self.btree_cursor.invalidate_btree_cache();
                         self.count_state = Some(CountState::Rewind);
                         continue;
                     }
                     let count = return_if_io!(self.btree_cursor.count());
-                    if self.db.write_generation(self.snapshot.tx_id)? != generation {
+                    if self.count_write_generation()? != generation {
                         self.btree_cursor.invalidate_btree_cache();
                         self.count_state = Some(CountState::Rewind);
                         continue;
@@ -2745,6 +2755,7 @@ impl<Clock: LogicalClock + 'static, A: ConcurrentAllocator> MvccLazyCursor<Clock
         };
         matches!(self.mv_cursor_type, MvccCursorType::Table)
             && self.btree_readable
+            && !self.transaction.is_removed()
             && !self.dual_peek.btree_exhausted()
             && self.dual_peek.mvcc_peek.get_row_key() != Some(&row_id.row_id)
             && self
@@ -2862,6 +2873,7 @@ impl<Clock: LogicalClock + 'static, A: ConcurrentAllocator> MvccLazyCursor<Clock
             return false;
         };
         matches!(self.mv_cursor_type, MvccCursorType::Table)
+            && !self.transaction.is_removed()
             && !self.dual_peek.mvcc_exhausted()
             && self.dual_peek.btree_peek.get_row_key() != Some(&row_id.row_id)
     }
@@ -2974,15 +2986,17 @@ impl<Clock: LogicalClock + 'static, A: ConcurrentAllocator> MvccLazyCursor<Clock
         #[cfg(test)]
         self.count_physical_visit();
         #[cfg(debug_assertions)]
-        if let Ok(expected) = self.db.cursor_btree_row_is_valid(
-            &self.transaction,
-            self.table_id,
-            &RowKey::Int(rowid),
-            self.snapshot.tx_id,
-        ) {
-            debug_assert_eq!(
-                valid, expected,
-                "table chain walk diverged from the point lookup at rowid {rowid}"
+        {
+            let expected = self.db.cursor_btree_row_is_valid(
+                &self.transaction,
+                self.table_id,
+                &RowKey::Int(rowid),
+                self.snapshot.tx_id,
+            );
+            debug_assert!(
+                matches!(expected, Ok(expected) if expected == valid),
+                "table chain walk diverged from the point lookup at rowid {rowid}: \
+                 walk {valid}, point lookup {expected:?}"
             );
         }
     }
@@ -3108,6 +3122,14 @@ impl<Clock: LogicalClock + 'static, A: ConcurrentAllocator> MvccLazyCursor<Clock
                 },
             }
         }
+    }
+
+    fn count_write_generation(&self) -> Result<u64> {
+        let generation = self.transaction.write_generation();
+        if generation == u64::MAX {
+            return Err(LimboError::CommitDependencyAborted);
+        }
+        Ok(generation)
     }
 
     fn save_table_write_frontier(&mut self) {
