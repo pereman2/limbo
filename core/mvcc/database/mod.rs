@@ -1015,6 +1015,7 @@ pub struct Transaction<A: RowVersionAllocator = TursoAllocator> {
     tx_id: u64,
     /// The transaction begin timestamp.
     begin_ts: u64,
+    /// The transaction write set. Only writer is the [Transaction]'s own connection.
     write_set: Mutex<WriteSet<A>>,
     write_generation: AtomicU64,
     /// The transaction header.
@@ -1108,19 +1109,23 @@ impl<A: RowVersionAllocator> Transaction<A> {
         let table_id = matches!(id.row_id, RowKey::Int(_)).then_some(id.table_id);
         let mut write_set = self.write_set.lock();
         write_set.insert(id, row_versions);
-        let generation = match self.write_generation.fetch_update(
+        let generation = self.bump_write_generation();
+        if let Some(table_id) = table_id {
+            write_set.table_generations.insert(table_id, generation);
+        }
+    }
+
+    fn bump_write_generation(&self) -> u64 {
+        match self.write_generation.fetch_update(
             Ordering::Release,
             Ordering::Relaxed,
-            |generation| generation.checked_add(1),
+            |generation| generation.checked_add(1).filter(|next| *next < u64::MAX),
         ) {
             Ok(previous) => previous + 1,
             Err(_) => {
                 self.abort_now.store(true, Ordering::Release);
                 panic!("transaction write generation overflow");
             }
-        };
-        if let Some(table_id) = table_id {
-            write_set.table_generations.insert(table_id, generation);
         }
     }
 
@@ -6938,12 +6943,12 @@ impl<Clock: LogicalClock, A: ConcurrentAllocator> MvStore<Clock, A> {
                 { "tx_id": tx_id }
             );
             self.txs.remove(&tx_id);
-            drop(tx.write_set.lock().take());
-            drop(std::mem::take(&mut *tx.savepoint_stack.write()));
-            drop(std::mem::take(&mut *tx.created_table_ids.lock()));
             if held_checkpoint_read {
                 self.blocking_checkpoint_lock.unlock();
             }
+            drop(tx.write_set.lock().take());
+            drop(std::mem::take(&mut *tx.savepoint_stack.write()));
+            drop(std::mem::take(&mut *tx.created_table_ids.lock()));
             return;
         }
         self.txs.remove(&tx_id);
@@ -7561,34 +7566,24 @@ impl<Clock: LogicalClock, A: ConcurrentAllocator> MvStore<Clock, A> {
 
     fn rollback_savepoint_changes(&self, tx_id: TxID, savepoint: Savepoint<A>) {
         let tx = self.txs.get(&tx_id).unwrap();
-        let generation = match tx.value().write_generation.fetch_update(
-            Ordering::Release,
-            Ordering::Relaxed,
-            |generation| generation.checked_add(1),
-        ) {
-            Ok(previous) => previous + 1,
-            Err(_) => {
-                tx.value().abort_now.store(true, Ordering::Release);
-                panic!("transaction write generation overflow");
-            }
-        };
+        let generation = tx.value().bump_write_generation();
+        let undone_tables: HashSet<MVTableId> = savepoint
+            .created_table_versions
+            .iter()
+            .chain(savepoint.deleted_table_versions.iter())
+            .map(|(rowid, _)| rowid.table_id)
+            .chain(
+                savepoint
+                    .newly_added_to_write_set
+                    .iter()
+                    .filter(|(rowid, _)| matches!(rowid.row_id, RowKey::Int(_)))
+                    .map(|(rowid, _)| rowid.table_id),
+            )
+            .collect();
         {
             let mut write_set = tx.value().write_set.lock();
-            for (rowid, _) in savepoint
-                .created_table_versions
-                .iter()
-                .chain(savepoint.deleted_table_versions.iter())
-            {
-                write_set
-                    .table_generations
-                    .insert(rowid.table_id, generation);
-            }
-            for (rowid, _) in &savepoint.newly_added_to_write_set {
-                if matches!(rowid.row_id, RowKey::Int(_)) {
-                    write_set
-                        .table_generations
-                        .insert(rowid.table_id, generation);
-                }
+            for table_id in undone_tables {
+                write_set.table_generations.insert(table_id, generation);
             }
         }
         drop(tx);
@@ -10734,6 +10729,19 @@ impl<Clock: LogicalClock, A: ConcurrentAllocator> MvStore<Clock, A> {
             .get(&tx_id)
             .ok_or_else(|| LimboError::NoSuchTransactionID(tx_id.to_string()))?;
         let generation = entry.value().write_generation.load(Ordering::Acquire);
+        // SAFETY: only the lifetime changes. The entry really borrows
+        // `self.txs`, and the compiler no longer checks that. It stays valid
+        // because:
+        // - `_store` keeps the store alive, and `transaction` is declared
+        //   before it, so it is dropped first. The order matters: dropping the
+        //   last reference to a node reads `txs` to free it. `txs` is private
+        //   and set only when the store is built, so it is never replaced.
+        // - The entry holds a reference count on the node, so `value()` stays
+        //   readable after COMMIT or ROLLBACK removes the transaction from `txs`.
+        // - `transaction` is private, and every method that reads it ties the
+        //   returned reference to `&self`. Returning a `'static` reference, or
+        //   cloning the entry into something that outlives the cursor
+        //   transaction, is a use-after-free the compiler will not catch.
         let transaction =
             unsafe { std::mem::transmute::<TxEntry<'_, A>, TxEntry<'static, A>>(entry) };
         Ok(Box::new(CursorTransaction {
