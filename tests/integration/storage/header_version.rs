@@ -831,6 +831,56 @@ fn test_autoincrement_watermark_is_committed_when_opening_mvcc_database() {
     );
 }
 
+/// In MVCC mode, a direct write to `sqlite_sequence` (as a dump replay does)
+/// leaves the AUTOINCREMENT watermark behind it. The next open syncs and
+/// commits the watermark, so a read-only open fails until a read-write open
+/// commits it.
+#[test]
+fn test_readonly_open_fails_while_sqlite_sequence_is_ahead_of_mvcc_watermark() {
+    let tmp_dir = TempDir::new().unwrap();
+    let db_path = tmp_dir.path().join("test.db");
+    {
+        let db = open_db(&db_path);
+        let conn = db.connect(ConnectOpts::new()).unwrap();
+        conn.pragma_update("journal_mode", "'mvcc'").unwrap();
+        conn.execute("CREATE TABLE posts (id INTEGER PRIMARY KEY AUTOINCREMENT, title TEXT)")
+            .unwrap();
+        conn.execute("INSERT INTO posts VALUES (3, 'a')").unwrap();
+        conn.execute("INSERT INTO sqlite_sequence VALUES ('posts', 45)")
+            .unwrap();
+    }
+    let open_readonly = || {
+        let db = Database::open_file_with_flags(
+            Arc::new(turso_core::PlatformIO::new().unwrap()),
+            db_path.to_str().unwrap(),
+            OpenFlags::ReadOnly,
+            DatabaseOpts::new(),
+            None,
+            Arc::new(SqliteDialect),
+        )?;
+        db.connect(ConnectOpts::new())
+    };
+
+    let result = open_readonly();
+    assert!(
+        matches!(result, Err(turso_core::LimboError::ReadOnly)),
+        "got: {:?}",
+        result.map(|_| ())
+    );
+
+    {
+        let db = open_db(&db_path);
+        let conn = db.connect(ConnectOpts::new()).unwrap();
+        conn.execute("INSERT INTO posts (title) VALUES ('b')")
+            .unwrap();
+        let ids: Vec<(i64,)> = conn.exec_rows("SELECT id FROM posts ORDER BY id");
+        assert_eq!(ids, vec![(3,), (46,)]);
+    }
+    let conn = open_readonly().expect("the watermark is committed");
+    let ids: Vec<(i64,)> = conn.exec_rows("SELECT id FROM posts ORDER BY id");
+    assert_eq!(ids, vec![(3,), (46,)]);
+}
+
 /// Set the header's read and write versions to 255 (MVCC), as a build that
 /// switched to MVCC without syncing the AUTOINCREMENT watermarks left them.
 /// With the `checksum` feature, page 1 ends in an 8-byte checksum of the rest
