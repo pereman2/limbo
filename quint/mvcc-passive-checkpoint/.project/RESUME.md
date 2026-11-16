@@ -1,5 +1,9 @@
 # Resume (2026-11-16, written by the first coordinator of this project)
 
+## Focus (2026-11-16, Pere)
+
+Only PR #11748 (spec) and PR #11779 (replay harness) are active. All other ledger rows are parked. The old next three actions (issue sweep, D1 options, spec CI workflow) are not started and wait until Pere lifts the focus. No rebase, push to those PR branches, ready mark, comment, merge or ping. Analysis and options for both PRs: `FOCUS.md`. L4 (the #11779 row) and L8 (the #11748 row) are the active rows.
+
 ## Intent
 
 Make the MVCC passive checkpoint backed by a checked Quint spec, run that spec in CI, label every guard needed or removed, and close or model the open passive data-loss issues. See `GOAL.md`.
@@ -41,7 +45,7 @@ Uncommitted files of the old worktree were not copied. Read them from `/home/per
 - Docs in this folder's parent: `DESIGN*.md`, `SIMPLIFY.md`, `HARNESS.md`, `MODEL-GAPS.md`, `SYNC.md`, `README.md`.
 - Skill `quint-modeling` for the method.
 
-## Next three actions (waiting for Pere's OK)
+## Next three actions (parked under the focus, not started)
 
 1. A read-only delegate reads GitHub state of the G4 issues and fills ledger L7. Cost: a few `gh` calls.
 2. Write the D1 option file: 2 or 3 options, each with a Quint trace (ledger L3). A strong-model design thread, one agent, no code changes in `core/`.
